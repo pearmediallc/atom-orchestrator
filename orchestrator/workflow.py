@@ -10,6 +10,7 @@ from typing import Optional, List
 from config import Config
 from inventory import store
 from orchestrator.atom_client import AtomClient
+from domain_assistant import chatgpt, namecheap_check
 
 
 # ---------- Request / Result types ----------
@@ -167,10 +168,54 @@ def run_existing_domain_workflow(
     )
 
 
+def suggest_new_domains(
+    vertical: str,
+    example_domains: List[str],
+    extension: str = '.com',
+    count: int = 10,
+) -> List[dict]:
+    """Path B step 1 — suggest available new-domain names.
+
+    Composes ChatGPT (for naming style) with Namecheap (for availability).
+    Both providers fall back to deterministic stubs when API keys are absent
+    (see domain_assistant/), so this function works end-to-end in local dev
+    without any external credentials.
+
+    Returns a list shaped like:
+      [{'domain': 'foo.com', 'available': True}, ...]
+    sorted with available domains first.
+    """
+    if not vertical:
+        raise ValueError("'vertical' is required")
+    if extension and not extension.startswith('.'):
+        extension = '.' + extension
+
+    suggestions = chatgpt.suggest_domains(
+        vertical=vertical,
+        example_domains=example_domains or [],
+        extension=extension,
+        count=count,
+    )
+    availability = namecheap_check.check_availability(suggestions)
+
+    results = [
+        {'domain': d, 'available': bool(availability.get(d, False))}
+        for d in suggestions
+    ]
+    # Available domains first, otherwise preserve original order.
+    results.sort(key=lambda r: not r['available'])
+    return results
+
+
 def run_new_domain_workflow(req: WorkflowRequest) -> WorkflowResult:
-    """Path B — buy a fresh domain, then deploy the lander. Phase 5."""
+    """Path B — full new-domain workflow (suggest → pick → approve → buy →
+    setup → copy). Phase 5+. The orchestration of these multi-step gates
+    requires Slack interactivity (Phase 2) so it lives there.
+
+    For just the suggestion step, see suggest_new_domains() above.
+    """
     return WorkflowResult(
         status='failed',
-        message='Path B (new domain) workflow not implemented yet — Phase 5.',
+        message='Full Path B workflow not implemented yet — Phase 5+.',
         details={'reason': 'not_implemented'},
     )

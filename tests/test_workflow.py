@@ -11,7 +11,9 @@ import pytest
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
+    suggest_new_domains,
 )
+from config import Config
 
 
 def _ok_setup_response(task_id='abc-task'):
@@ -161,3 +163,61 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
     assert result.details['reason'] == 'copy_files_error'
     # Inventory should NOT be marked complete on a copy failure
     assert tmp_inventory.get_domain('copy-fail.com')['setup_at'] is None
+
+
+# ─── suggest_new_domains (Path B step 1) ──────────────────────────────────
+
+def test_suggest_returns_requested_count(monkeypatch):
+    """Stub path: returns count items, all marked available."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+    monkeypatch.setattr(Config, 'NAMECHEAP_API_USER', '')
+
+    out = suggest_new_domains(
+        vertical='auto-insurance',
+        example_domains=['cheaprates.com'],
+        extension='.com',
+        count=4,
+    )
+    assert len(out) == 4
+    for entry in out:
+        assert 'domain' in entry and 'available' in entry
+        assert entry['available'] is True
+
+
+def test_suggest_sorts_available_first(monkeypatch):
+    """When availability mix is partial, available entries come first."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+
+    # Mix: even-indexed names available, odd-indexed taken
+    def fake_check(domains):
+        return {d: (i % 2 == 0) for i, d in enumerate(domains)}
+    monkeypatch.setattr(
+        'orchestrator.workflow.namecheap_check.check_availability',
+        fake_check,
+    )
+
+    out = suggest_new_domains(
+        vertical='x', example_domains=[], extension='.com', count=6,
+    )
+    available_flags = [r['available'] for r in out]
+    # All Trues should appear before any Falses
+    assert available_flags == sorted(available_flags, reverse=True)
+
+
+def test_suggest_normalises_extension_without_dot(monkeypatch):
+    """User passes 'pro' instead of '.pro' — we still produce .pro names."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+    monkeypatch.setattr(Config, 'NAMECHEAP_API_USER', '')
+
+    out = suggest_new_domains(
+        vertical='x', example_domains=[], extension='pro', count=2,
+    )
+    for r in out:
+        assert r['domain'].endswith('.pro')
+
+
+def test_suggest_rejects_empty_vertical():
+    with pytest.raises(ValueError):
+        suggest_new_domains(
+            vertical='', example_domains=[], extension='.com', count=5,
+        )

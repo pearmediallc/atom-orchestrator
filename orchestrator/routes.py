@@ -9,6 +9,7 @@ from flask import Blueprint, jsonify, request
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
+    suggest_new_domains,
 )
 
 orchestrator_bp = Blueprint('orchestrator', __name__)
@@ -53,3 +54,39 @@ def existing_domain():
         'message': result.message,
         'details': result.details,
     }), code
+
+
+@orchestrator_bp.route('/new-domain/suggest', methods=['POST'])
+def new_domain_suggest():
+    """POST /workflow/new-domain/suggest
+    body: {
+      vertical:        "auto-insurance",   required
+      example_domains: ["a.com", "b.com"], optional seeds for ChatGPT
+      extension:       ".com",             default ".com"
+      count:           10                   default 10
+    }
+
+    Returns suggestion list sorted with available-first:
+      { suggestions: [{domain, available}, ...], count: N }
+
+    Phase 5 — uses ChatGPT + Namecheap stubs when API keys are absent
+    (see domain_assistant/). Drop in OPENAI_API_KEY + NAMECHEAP_* in .env
+    to switch to real calls without changing this code.
+    """
+    body = request.get_json(silent=True) or {}
+
+    vertical = (body.get('vertical') or '').strip()
+    if not vertical:
+        return jsonify({'error': "'vertical' is required"}), 400
+
+    try:
+        results = suggest_new_domains(
+            vertical=vertical,
+            example_domains=body.get('example_domains') or [],
+            extension=body.get('extension') or '.com',
+            count=int(body.get('count') or 10),
+        )
+    except (ValueError, NotImplementedError) as e:
+        return jsonify({'error': str(e)}), 400
+
+    return jsonify({'count': len(results), 'suggestions': results})
