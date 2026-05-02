@@ -7,3 +7,6 @@ slack-bolt>=1.18.0
 
 # Phase 4: OpenAI for domain suggestions
 openai>=1.40.0
+
+# Tests
+pytest>=8.0.0
