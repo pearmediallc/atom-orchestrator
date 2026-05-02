@@ -10,8 +10,7 @@ from config import Config
 from slack_bot.routes import slack_bp
 from inventory.routes import inventory_bp
 from inventory import store as inventory_store
-# Future phases will register more:
-# from orchestrator.routes import orchestrator_bp
+from orchestrator.routes import orchestrator_bp
 
 
 def create_app() -> Flask:
@@ -23,6 +22,7 @@ def create_app() -> Flask:
 
     app.register_blueprint(slack_bp, url_prefix='/slack')
     app.register_blueprint(inventory_bp, url_prefix='/inventory')
+    app.register_blueprint(orchestrator_bp, url_prefix='/workflow')
 
     @app.route('/health')
     def health():

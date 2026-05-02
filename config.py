@@ -11,6 +11,12 @@ class Config:
     PORT = int(os.getenv('PORT', '5600'))
     ATOM_BASE_URL = os.getenv('ATOM_BASE_URL', 'http://localhost:5500')
 
+    # Credentials this orchestrator uses to log into ATOM.
+    # Phase 6 TODO: replace with an ATOM service-account / API token
+    # instead of borrowing a human user's password.
+    ATOM_USERNAME = os.getenv('ATOM_USERNAME', 'sunny')
+    ATOM_PASSWORD = os.getenv('ATOM_PASSWORD', 'test123')
+
     # Phase 2 — Slack
     SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
     SLACK_SIGNING_SECRET = os.getenv('SLACK_SIGNING_SECRET')

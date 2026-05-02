@@ -50,3 +50,18 @@ def logged_in_client(atom_running):
     c = AtomClient(base_url=ATOM_URL)
     c.login(ATOM_TEST_USER, ATOM_TEST_PASS)
     return c
+
+
+@pytest.fixture
+def tmp_inventory(tmp_path, monkeypatch):
+    """Per-test SQLite inventory at a temp path. Tests using this fixture
+    get a freshly initialised, empty store, isolated from each other and
+    from the dev database.
+    """
+    from config import Config
+    from inventory import store
+
+    db_path = str(tmp_path / 'inventory.db')
+    monkeypatch.setattr(Config, 'INVENTORY_DB_PATH', db_path)
+    store.init_db()
+    return store
