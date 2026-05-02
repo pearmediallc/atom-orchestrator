@@ -1,0 +1,9 @@
+Flask==3.0.3
+python-dotenv==1.0.1
+requests>=2.31.0
+
+# Phase 2: Slack
+slack-bolt>=1.18.0
+
+# Phase 4: OpenAI for domain suggestions
+openai>=1.40.0

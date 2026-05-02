@@ -1,0 +1,17 @@
+.env
+.DS_Store
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local databases
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
