@@ -137,15 +137,58 @@ Optional (per phase):
 
 ## Phased delivery
 
-| Phase | Goal | Time |
+| Phase | Goal | Status |
 |---|---|---|
-| 1 | Scaffold + `/health` endpoint (this PR) | ✅ done |
-| 2 | Slack app skeleton + `/new-domain` slash command stub | 3–5 days |
-| 3 | Inventory CRUD (SQLite for now) + `/list-domains` command | 2–3 days |
-| 4 | Path A — existing-domain → ATOM domain setup + file copy | 4–6 days |
-| 5 | Path B — ChatGPT + Namecheap availability + TL approval | 5–7 days |
-| 6 | Polish: error handling, audit log, retries | 3–5 days |
-| | **Total** | **~3 weeks** |
+| 1 | Scaffold + `/health` endpoint | ✅ done |
+| 3 | Inventory CRUD (SQLite) + tests | ✅ done |
+| 4 | Path A — existing-domain → ATOM domain setup + file copy | ✅ done |
+| 5 stub | `/workflow/new-domain/suggest` (ChatGPT+Namecheap stubs) | ✅ done |
+| 2 | Slack app + slash commands + interactive Approve/Reject card | 🔒 needs Slack tokens |
+| 5 full | Path B end-to-end (suggest → pick → DM Utkarsh → setup) | 🔒 needs Slack tokens |
+| 6 | Google Sheets inventory sync + audit log + retries | 🔒 needs Sheet access |
+
+## Confirmed product decisions (per TL, 2026-05-02)
+
+- **TL approval** happens via Slack interactive buttons on a card (Block Kit).
+- **Domain purchase is manual** — bot DMs Utkarsh; he buys on Namecheap and
+  confirms in Slack. (No Namecheap purchase API used — fewer secrets, no
+  real-money risk from a bug.)
+- **Inventory** currently lives in a Google Form / Sheet maintained by
+  Utkarsh. The bot mirrors his sheet into local SQLite for now; full Google
+  Sheets API integration is a Phase 6 follow-up.
+
+## Phase 2 setup — creating the Slack app
+
+Anand creates the Slack app himself (per TL); Deepanshu / Harshit can help
+with anything that gets stuck.
+
+1. Go to https://api.slack.com/apps → **Create New App** → *From scratch*.
+   Name it `atom-orchestrator`. Choose the Pearmedia LLC workspace.
+2. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
+   - `chat:write`           — post messages and ephemeral replies
+   - `commands`             — receive `/new-domain` and `/list-domains`
+   - `im:write`             — DM Utkarsh / TL for purchase request + approval
+   - `users:read`           — resolve Slack user IDs to display names
+3. Under **Slash Commands**, add two:
+   - `/new-domain`   → Request URL: `https://<your-tunnel>/slack/slash/new-domain`
+   - `/list-domains` → Request URL: `https://<your-tunnel>/slack/slash/list-domains`
+4. Under **Interactivity & Shortcuts**, enable Interactivity and set:
+   - Request URL: `https://<your-tunnel>/slack/interactions`
+5. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`)
+   and the **Signing Secret** into `.env` as `SLACK_BOT_TOKEN` and
+   `SLACK_SIGNING_SECRET`.
+6. To expose `localhost:5600` to Slack so the slash-command URLs work,
+   install ngrok:
+   ```bash
+   brew install ngrok
+   ngrok http 5600
+   ```
+   Use the resulting `https://xxxxx.ngrok-free.app` URL in steps 3 and 4
+   above.
+
+When the Slack app is registered and the tokens are in `.env`, Phase 2
+implementation can replace the stubs in `slack_bot/routes.py` with real
+`slack_bolt` handlers.
 
 ## What this is NOT
 
