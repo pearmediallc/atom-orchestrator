@@ -38,3 +38,9 @@ class Config:
         for uid in os.getenv('APPROVER_SLACK_USER_IDS', '').split(',')
         if uid.strip()
     ]
+
+    # Slack user-ID of the person who buys domains on Namecheap (per TL: manual
+    # purchase via Utkarsh, not automated). Bot DMs this user when an MDB picks
+    # a suggested domain. Falls back to DMing the requester themselves so the
+    # flow is self-testable without a second Slack user.
+    UTKARSH_SLACK_USER_ID = os.getenv('UTKARSH_SLACK_USER_ID', '').strip()

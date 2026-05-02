@@ -4,6 +4,11 @@ This module wires Slack to our orchestration logic. Two slash commands:
   • /list-domains  — replies with inventory contents
   • /new-domain    — opens a modal collecting vertical/examples/lander/extension
 
+Plus interactive button handlers:
+  • pick_domain    — MDB clicks "Pick this" on a suggested domain → bot DMs
+                     Utkarsh asking him to buy it on Namecheap manually
+                     (per TL's decision: manual purchase, no Namecheap purchase API)
+
 Every incoming Slack request is verified against the signing secret automatically
 by slack_bolt (refuses requests not actually from Slack).
 
@@ -12,6 +17,7 @@ app config (one per slash command, plus interactivity). Rather than reconfigure
 Slack, each Flask route below forwards to the SAME SlackRequestHandler — bolt
 internally dispatches based on the request body.
 """
+import json
 from flask import Blueprint, jsonify, request
 
 from config import Config
@@ -141,8 +147,10 @@ if _bolt_app is not None:
         available = [s for s in suggestions if s['available']]
         unavailable = [s for s in suggestions if not s['available']]
 
-        # 3. Build the shortlist message. Prefer available; show taken in a
-        # smaller dim section so users can re-roll if nothing's good.
+        # 3. Build the shortlist message as Block Kit blocks with a "Pick this"
+        # button next to each available domain. Per TL, a click on Pick This
+        # routes a manual purchase request to Utkarsh in Slack — no Namecheap
+        # purchase API call.
         if not available:
             client.chat_postMessage(
                 channel=requester,
@@ -151,28 +159,147 @@ if _bolt_app is not None:
             )
             return
 
-        lines = [
-            f':white_check_mark: *{len(available)} available '
-            f'domain{"s" if len(available) != 1 else ""} for '
-            f'`{vertical}`* (extension `{extension}`):',
-            '',
+        # Context that the click handler needs to know what was picked. Encoded
+        # into each button's `value` field (Slack caps button values at ~2k
+        # chars, this fits comfortably).
+        def _button_value(domain: str) -> str:
+            return json.dumps({
+                'domain': domain,
+                'vertical': vertical,
+                'lander': lander,
+                'extension': extension,
+                'requester': requester,
+            })
+
+        blocks = [
+            {
+                'type': 'header',
+                'text': {
+                    'type': 'plain_text',
+                    'text': f'{len(available)} available — pick one to continue',
+                },
+            },
+            {
+                'type': 'context',
+                'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (f'Vertical: *{vertical}*  ·  Extension: `{extension}`'
+                             f'  ·  Lander: {lander}'),
+                }],
+            },
+            {'type': 'divider'},
         ]
-        for i, s in enumerate(available, 1):
-            lines.append(f'  {i}. `{s["domain"]}`')
+        for s in available:
+            blocks.append({
+                'type': 'section',
+                'text': {'type': 'mrkdwn', 'text': f'`{s["domain"]}`'},
+                'accessory': {
+                    'type': 'button',
+                    'action_id': 'pick_domain',
+                    'text': {'type': 'plain_text', 'text': 'Pick this'},
+                    'style': 'primary',
+                    'value': _button_value(s['domain']),
+                },
+            })
 
         if unavailable:
-            lines.append('')
-            lines.append(
-                f'_Already taken ({len(unavailable)}): '
-                + ', '.join(f'`{u["domain"]}`' for u in unavailable) + '_'
-            )
+            blocks.append({'type': 'divider'})
+            taken = ', '.join(f'`{u["domain"]}`' for u in unavailable)
+            blocks.append({
+                'type': 'context',
+                'elements': [{
+                    'type': 'mrkdwn',
+                    'text': f'_Already taken ({len(unavailable)}): {taken}_',
+                }],
+            })
 
-        lines.append('')
-        lines.append(
-            '_Next phase will add Approve/Reject buttons so you can pick one '
-            'and route to the TL for approval._'
+        client.chat_postMessage(
+            channel=requester,
+            blocks=blocks,
+            text=f'{len(available)} available domains for {vertical}',
         )
-        client.chat_postMessage(channel=requester, text='\n'.join(lines))
+
+    @_bolt_app.action('pick_domain')
+    def handle_pick_domain(ack, body, client):
+        """User clicked "Pick this" on a suggested domain.
+
+        Per TL: do NOT auto-purchase via Namecheap API. Instead DM Utkarsh
+        (the human procurer) with the request. He'll buy it on Namecheap
+        and confirm in the thread, at which point Phase 6 will trigger the
+        ATOM domain setup + lander copy.
+        """
+        ack()
+
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        domain = data['domain']
+        vertical = data['vertical']
+        lander = data['lander']
+        extension = data['extension']
+        requester = data['requester']
+
+        # If UTKARSH_SLACK_USER_ID isn't set, fall back to DMing the requester
+        # themselves. Lets a single dev test the whole flow without a second
+        # Slack identity.
+        purchaser = Config.UTKARSH_SLACK_USER_ID or requester
+        purchaser_is_requester = (purchaser == requester)
+
+        # 1. DM Utkarsh (or fallback) with full context so he knows what to buy
+        # and where it'll be deployed.
+        utkarsh_msg = (
+            ':moneybag: *Domain purchase request* :moneybag:\n'
+            f'• Requester: <@{requester}>\n'
+            f'• Domain to buy: `{domain}`\n'
+            f'• Vertical: `{vertical}`\n'
+            f'• Extension: `{extension}`\n'
+            f'• Lander to deploy: {lander}\n\n'
+            ':point_right: Please buy this on Namecheap and reply '
+            ':white_check_mark: in this thread when done. The bot will then '
+            'kick off the ATOM domain setup and copy the lander files.'
+        )
+        client.chat_postMessage(channel=purchaser, text=utkarsh_msg)
+
+        # 2. Update the original suggestion message so the buttons disappear
+        # and the user can see which one they picked.
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Selected: {domain}',
+            blocks=[
+                {
+                    'type': 'header',
+                    'text': {
+                        'type': 'plain_text',
+                        'text': f':white_check_mark: Selected: {domain}',
+                    },
+                },
+                {
+                    'type': 'context',
+                    'elements': [{
+                        'type': 'mrkdwn',
+                        'text': (
+                            'Purchase request sent to '
+                            f'<@{purchaser}>'
+                            + (' (you, since UTKARSH_SLACK_USER_ID isn\'t set)'
+                               if purchaser_is_requester else '')
+                            + '.'
+                        ),
+                    }],
+                },
+            ],
+        )
+
+        # 3. If we DMed someone other than the requester, also confirm to the
+        # requester so they know their click did something.
+        if not purchaser_is_requester:
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':envelope: Sent purchase request for `{domain}` to '
+                      f'<@{purchaser}>. He\'ll confirm here once it\'s bought.'),
+            )
 
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
