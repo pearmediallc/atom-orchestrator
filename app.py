@@ -8,6 +8,8 @@ from config import Config
 
 # Blueprint imports — each phase wires in another one.
 from slack_bot.routes import slack_bp
+from inventory.routes import inventory_bp
+from inventory import store as inventory_store
 # Future phases will register more:
 # from orchestrator.routes import orchestrator_bp
 
@@ -16,7 +18,11 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = Config.FLASK_SECRET_KEY or 'dev-only-not-for-prod'
 
+    # Initialise local storage (idempotent — safe to call every boot).
+    inventory_store.init_db()
+
     app.register_blueprint(slack_bp, url_prefix='/slack')
+    app.register_blueprint(inventory_bp, url_prefix='/inventory')
 
     @app.route('/health')
     def health():
