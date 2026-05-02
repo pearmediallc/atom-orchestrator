@@ -16,6 +16,7 @@ from flask import Blueprint, jsonify, request
 
 from config import Config
 from inventory import store as inventory_store
+from orchestrator.workflow import suggest_new_domains
 
 slack_bp = Blueprint('slack', __name__)
 
@@ -80,30 +81,98 @@ if _bolt_app is not None:
 
     @_bolt_app.view('new_domain_modal')
     def handle_new_domain_submission(ack, body, view, client):
-        """Modal submitted — collect inputs and (Phase 5) kick off the workflow.
+        """Modal submitted — call the suggestion pipeline and reply with the
+        shortlist of available domains.
 
-        For now we just confirm what we collected and DM the requester so they
-        can see we got it. Phase 5 wires the chatgpt-suggest pipeline in here.
+        Pipeline:
+          1. Parse modal inputs
+          2. Acknowledge submission, DM the requester with a "summary received"
+          3. Call suggest_new_domains() (ChatGPT for naming + Namecheap for
+             availability — both fall back to deterministic stubs when API
+             keys are absent)
+          4. DM the requester with the formatted shortlist
+
+        Next phase: add Approve/Reject buttons + the full purchase + setup +
+        copy workflow.
         """
         ack()
         values = view['state']['values']
-        vertical = values['vertical_block']['vertical_input']['value'] or ''
-        examples = values['examples_block']['examples_input']['value'] or ''
-        lander = values['lander_block']['lander_input']['value'] or ''
+        vertical = (values['vertical_block']['vertical_input']['value'] or '').strip()
+        examples_raw = (values['examples_block']['examples_input']['value'] or '').strip()
+        lander = (values['lander_block']['lander_input']['value'] or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
 
+        # Parse comma-separated examples into a list, dropping blanks.
+        example_domains = [
+            e.strip() for e in examples_raw.split(',') if e.strip()
+        ]
+
         requester = body['user']['id']
-        summary = (
+
+        # 1. Confirm receipt up-front so the user knows we're working.
+        receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
             f'• Requested by: <@{requester}>\n'
-            f'• Vertical: `{vertical.strip()}`\n'
-            f"• Example domains: `{examples.strip() or '(none)'}`\n"
-            f'• Lander URL: {lander.strip()}\n'
+            f'• Vertical: `{vertical}`\n'
+            f"• Example domains: `{examples_raw or '(none)'}`\n"
+            f'• Lander URL: {lander}\n'
             f'• Extension: `{extension}`\n'
-            '_Phase 5 will plug this into ChatGPT + Namecheap availability._'
+            ':mag: Generating suggestions and checking Namecheap availability…'
         )
-        # DM the requester with the confirmation
-        client.chat_postMessage(channel=requester, text=summary)
+        client.chat_postMessage(channel=requester, text=receipt)
+
+        # 2. Call the suggestion engine. Stays cheap thanks to the stubs in
+        # domain_assistant/ when API keys aren't set.
+        try:
+            suggestions = suggest_new_domains(
+                vertical=vertical,
+                example_domains=example_domains,
+                extension=extension,
+                count=5,
+            )
+        except Exception as e:
+            client.chat_postMessage(
+                channel=requester,
+                text=(':warning: Could not generate suggestions: '
+                      f'`{type(e).__name__}: {e}`'),
+            )
+            return
+
+        available = [s for s in suggestions if s['available']]
+        unavailable = [s for s in suggestions if not s['available']]
+
+        # 3. Build the shortlist message. Prefer available; show taken in a
+        # smaller dim section so users can re-roll if nothing's good.
+        if not available:
+            client.chat_postMessage(
+                channel=requester,
+                text=(':no_entry: *No available domains found.* '
+                      'Try different example domains or a different extension.'),
+            )
+            return
+
+        lines = [
+            f':white_check_mark: *{len(available)} available '
+            f'domain{"s" if len(available) != 1 else ""} for '
+            f'`{vertical}`* (extension `{extension}`):',
+            '',
+        ]
+        for i, s in enumerate(available, 1):
+            lines.append(f'  {i}. `{s["domain"]}`')
+
+        if unavailable:
+            lines.append('')
+            lines.append(
+                f'_Already taken ({len(unavailable)}): '
+                + ', '.join(f'`{u["domain"]}`' for u in unavailable) + '_'
+            )
+
+        lines.append('')
+        lines.append(
+            '_Next phase will add Approve/Reject buttons so you can pick one '
+            'and route to the TL for approval._'
+        )
+        client.chat_postMessage(channel=requester, text='\n'.join(lines))
 
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────

@@ -41,11 +41,30 @@ def test_chatgpt_stub_respects_extension(monkeypatch):
 
 
 def test_chatgpt_real_path_raises_when_key_present_but_unimplemented(monkeypatch):
-    """Phase 5+ wiring isn't done yet — real path should raise clearly."""
-    monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'sk-fake-key')
+    """Phase 5+ wiring isn't done yet — real path should raise clearly.
+
+    Uses a 40+ char fake key so it passes the _is_real_openai_key heuristic
+    (short keys like 'sk-...' from the .env.example placeholder fall through
+    to the stub instead).
+    """
+    monkeypatch.setattr(
+        Config, 'OPENAI_API_KEY',
+        'sk-fakekey-that-is-clearly-long-enough-to-look-real-12345',
+    )
     with pytest.raises(NotImplementedError):
         chatgpt.suggest_domains(vertical='x', example_domains=[],
                                 extension='.com', count=1)
+
+
+def test_chatgpt_short_placeholder_key_falls_back_to_stub(monkeypatch):
+    """The .env.example placeholder 'sk-...' must NOT be treated as real."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'sk-...')
+    out = chatgpt.suggest_domains(
+        vertical='x', example_domains=[], extension='.com', count=2,
+    )
+    assert len(out) == 2
+    # Returns the stub names — not a NotImplementedError
+    assert all('stub' in name for name in out)
 
 
 # ─── namecheap_check.check_availability ───────────────────────────────────
