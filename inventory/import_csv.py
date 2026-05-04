@@ -17,10 +17,58 @@ the bot stays in sync continuously rather than on-demand.
 """
 import argparse
 import csv
+import re
 import sys
 from typing import Dict, List, Optional
 
 from inventory import store
+
+
+# A "looks like a domain" check: at least one dot, valid chars, ends with
+# a 2+ letter TLD. Catches obvious garbage like notes / parens / numbers.
+_DOMAIN_PATTERN = re.compile(
+    r'^[a-z0-9][a-z0-9\-]*(\.[a-z0-9\-]+)*\.[a-z]{2,}$',
+    re.IGNORECASE,
+)
+
+
+def _is_domain_like(s: str) -> bool:
+    """True if the string looks like a domain name (has a TLD, no spaces)."""
+    if not s or ' ' in s or '\t' in s or '.' not in s:
+        return False
+    return bool(_DOMAIN_PATTERN.match(s))
+
+
+def _split_domain_field(value: str) -> List[str]:
+    """Split a 'domain' cell that may contain multiple domains.
+
+    Some Google Form responses cram multiple domain names into one cell,
+    separated by whitespace, commas, semicolons, or slashes. We split on
+    any of those, normalise each candidate (strip http(s)://, www., paths)
+    and validate it looks like a domain.
+    """
+    if not value:
+        return []
+
+    # Split on whitespace, commas, semicolons, newlines, or vertical bars
+    candidates = re.split(r'[\s,;|]+', value)
+
+    out: List[str] = []
+    seen = set()
+    for raw in candidates:
+        c = raw.strip().lower()
+        # Strip common URL prefixes
+        for prefix in ('https://', 'http://', 'www.'):
+            if c.startswith(prefix):
+                c = c[len(prefix):]
+        # Strip path / fragment / query
+        c = c.split('/')[0].split('?')[0].split('#')[0].rstrip('.').strip()
+        if not c or c in seen:
+            continue
+        if _is_domain_like(c):
+            out.append(c)
+            seen.add(c)
+    return out
 
 
 # When the vertical column says "Other" (or similar catch-all), look up
@@ -121,25 +169,22 @@ def import_csv(path: str, replace: bool = False) -> dict:
     imported = 0
     skipped_no_domain = 0
     skipped_duplicate = 0
+    rows_with_multiple_domains = 0
 
     for row in rows:
-        raw_domain = (row.get(col_map['domain']) or '').strip().lower()
-        # Strip common URL prefixes — sometimes the form captures full URLs
-        for prefix in ('https://', 'http://', 'www.'):
-            if raw_domain.startswith(prefix):
-                raw_domain = raw_domain[len(prefix):]
-        # Trailing slash / path
-        raw_domain = raw_domain.split('/')[0].strip()
+        raw_value = row.get(col_map['domain']) or ''
+        domains_in_row = _split_domain_field(raw_value)
 
-        if not raw_domain:
+        if not domains_in_row:
             skipped_no_domain += 1
             continue
 
-        existing = store.get_domain(raw_domain)
-        if existing and not replace:
-            skipped_duplicate += 1
-            continue
+        if len(domains_in_row) > 1:
+            rows_with_multiple_domains += 1
 
+        # Build kwargs ONCE per row — every domain in that row inherits
+        # the same vertical / requested_by / etc. since they came from
+        # the same form submission.
         kwargs: Dict[str, Optional[str]] = {}
         for field, csv_col in col_map.items():
             if field in ('domain', 'vertical'):
@@ -157,16 +202,20 @@ def import_csv(path: str, replace: bool = False) -> dict:
         if vertical:
             kwargs['vertical'] = vertical
 
-        if existing and replace:
-            # Easiest replace: delete + re-insert (sqlite has no upsert
-            # before 3.24 anyway). Done in one transaction via the store.
-            from inventory.store import _conn
-            with _conn() as c:
-                c.execute('DELETE FROM domains WHERE domain = ?',
-                          (raw_domain,))
+        for domain in domains_in_row:
+            existing = store.get_domain(domain)
+            if existing and not replace:
+                skipped_duplicate += 1
+                continue
 
-        store.add_domain(domain=raw_domain, **kwargs)
-        imported += 1
+            if existing and replace:
+                from inventory.store import _conn
+                with _conn() as c:
+                    c.execute('DELETE FROM domains WHERE domain = ?',
+                              (domain,))
+
+            store.add_domain(domain=domain, **kwargs)
+            imported += 1
 
     unmapped_columns = [h for h in headers if h not in col_map.values()]
 
@@ -174,6 +223,7 @@ def import_csv(path: str, replace: bool = False) -> dict:
         'imported': imported,
         'skipped_no_domain': skipped_no_domain,
         'skipped_duplicate': skipped_duplicate,
+        'rows_with_multiple_domains': rows_with_multiple_domains,
         'columns_mapped': col_map,
         'columns_unmapped': unmapped_columns,
         'total_rows_in_csv': len(rows),
@@ -201,10 +251,11 @@ def main():
         sys.exit(1)
 
     print('=' * 50)
-    print(f'Total CSV rows:        {stats["total_rows_in_csv"]}')
-    print(f'Imported:              {stats["imported"]}')
-    print(f'Skipped (already in DB): {stats["skipped_duplicate"]}')
-    print(f'Skipped (no domain):   {stats["skipped_no_domain"]}')
+    print(f'Total CSV rows:               {stats["total_rows_in_csv"]}')
+    print(f'Imported (domains):           {stats["imported"]}')
+    print(f'Rows with multiple domains:   {stats["rows_with_multiple_domains"]}')
+    print(f'Skipped (already in DB):      {stats["skipped_duplicate"]}')
+    print(f'Skipped (no valid domain):    {stats["skipped_no_domain"]}')
     print()
     print('Columns mapped:')
     for field, csv_col in stats['columns_mapped'].items():
