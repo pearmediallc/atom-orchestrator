@@ -66,7 +66,31 @@ def test_status_eventually_returns_structured_failure(logged_in_client):
       • the AtomClient HTTP wrapper, AND
       • the structured-error feature shipped in the ATOM repo
     work end-to-end together.
+
+    SAFETY: only runs when ATOM has empty AWS creds (i.e. the failure-path
+    test was designed for). If real sandbox or production AWS creds are
+    configured, this test would actually create AWS resources for the
+    test-domain name, leaving orphans behind — so we skip instead.
     """
+    health = logged_in_client.health()
+    # ATOM doesn't expose its env directly via /health, so we make a cheap
+    # bucket-list call: with empty creds this throws an error containing
+    # 'security token' or similar. With real creds it returns a list.
+    try:
+        # /api/buckets/<account_key> uses the configured AWS creds
+        import requests
+        from tests.conftest import ATOM_URL
+        r = requests.get(f'{ATOM_URL}/api/buckets/auto-insurance', timeout=5)
+        if r.status_code == 200 and 'buckets' in r.json():
+            pytest.skip(
+                'ATOM has real AWS creds configured — this destructive '
+                'failure-path test only runs with empty creds. Clear '
+                'AWS_ACCESS_KEY_ID in ATOM/.env to enable, or rely on the '
+                'Phase 6+ moto-mocked tests for failure-path coverage.'
+            )
+    except Exception:
+        pass  # if the check fails, fall through and let the test run
+
     response = logged_in_client.setup_domain('test-failure-pytest.com')
     task_id = response['tasks'][0]['task_id']
 
