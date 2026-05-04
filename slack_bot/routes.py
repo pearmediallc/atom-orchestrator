@@ -55,26 +55,114 @@ if _bolt_app is not None:
 
     @_bolt_app.command('/list-domains')
     def handle_list_domains(ack, respond, command):
-        """Reply with the current owned-domain inventory."""
-        ack()  # acknowledge within 3s — required by Slack
-        rows = inventory_store.list_domains()
-        if not rows:
+        """Reply with the owned-domain inventory as a clickable card.
+
+        Optional argument: substring filter that searches across the
+        domain name, the vertical, AND the requester. Lets you find
+        a specific domain quickly even when there are hundreds.
+
+            /list-domains                → top results across everything
+            /list-domains auto           → matches vertical 'Auto Insurance'
+            /list-domains flashburn      → matches domains like
+                                            'instantflashburn.com'
+            /list-domains anurag         → matches anything by Anurag
+
+        Each domain has a "Deploy lander" button that starts Path A
+        (deploy a lander to that existing owned domain).
+        """
+        ack()
+        filter_text = (command.get('text') or '').strip().lower()
+        all_rows = inventory_store.list_domains()
+        if not all_rows:
             respond({
                 'response_type': 'ephemeral',
-                'text': '*No domains in inventory yet.* Add one with `/new-domain`.',
+                'text': '*No domains in inventory yet.*',
             })
             return
 
-        # Build a Slack-formatted list. Group display by vertical so humans can scan.
-        lines = [f'*Owned domains ({len(rows)} total):*']
-        for r in rows:
+        # Substring filter across domain / vertical / requester. Most
+        # useful columns for "find the domain I'm thinking of".
+        if filter_text:
+            def _matches(r: dict) -> bool:
+                haystacks = (
+                    (r.get('domain') or ''),
+                    (r.get('vertical') or ''),
+                    (r.get('requested_by') or ''),
+                )
+                return any(filter_text in h.lower() for h in haystacks)
+            rows = [r for r in all_rows if _matches(r)]
+        else:
+            rows = all_rows
+
+        if not rows:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (f'*No domains match `{filter_text}`.* Try part of a '
+                         f'domain name, vertical, or owner — or run '
+                         f'`/list-domains` with no filter.'),
+            })
+            return
+
+        # Slack caps blocks at 50 per message. We render at most ~30 domains
+        # per call, leaving room for header/footer/dividers.
+        max_per_message = 30
+        shown = rows[:max_per_message]
+        truncated = len(rows) - len(shown)
+
+        header_text = (
+            f'Owned domains — {len(shown)} of {len(all_rows)}'
+            + (f' (filtered by "{filter_text}")' if filter_text else '')
+        )
+
+        blocks: list = [
+            {'type': 'header',
+             'text': {'type': 'plain_text', 'text': header_text}},
+            {'type': 'context', 'elements': [{
+                'type': 'mrkdwn',
+                'text': ('Click *Deploy lander* to send a redeployment '
+                         'request to Utkarsh. '
+                         'Filter by any text: `/list-domains flashburn` '
+                         '· `/list-domains medicare` · `/list-domains anurag`.'),
+            }]},
+            {'type': 'divider'},
+        ]
+
+        for r in shown:
             vert = r.get('vertical') or '_no vertical_'
-            acct = r.get('aws_account') or '_no account_'
-            stat = '✅' if r.get('setup_at') else '⏳'
-            lines.append(
-                f"  {stat}  `{r['domain']}`  —  *{vert}*  ·  account: `{acct}`"
-            )
-        respond({'response_type': 'ephemeral', 'text': '\n'.join(lines)})
+            requested_by = r.get('requested_by') or '_unknown_'
+            stat_emoji = '✅' if r.get('setup_at') else '⏳'
+            blocks.append({
+                'type': 'section',
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': (f'{stat_emoji} `{r["domain"]}`\n'
+                             f'_{vert}_  ·  by `{requested_by}`'),
+                },
+                'accessory': {
+                    'type': 'button',
+                    'action_id': 'deploy_lander_existing',
+                    'text': {'type': 'plain_text', 'text': 'Deploy lander'},
+                    'value': json.dumps({
+                        'domain': r['domain'],
+                        'vertical': r.get('vertical') or '',
+                        'aws_account': r.get('aws_account') or '',
+                    }),
+                },
+            })
+
+        if truncated > 0:
+            blocks.append({'type': 'divider'})
+            blocks.append({'type': 'context', 'elements': [{
+                'type': 'mrkdwn',
+                'text': (f'_…and {truncated} more. Narrow with '
+                         f'`/list-domains <vertical>`._'),
+            }]})
+
+        respond({
+            'response_type': 'ephemeral',
+            'blocks': blocks,
+            'text': header_text,  # fallback for clients without block support
+        })
 
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
@@ -299,6 +387,146 @@ if _bolt_app is not None:
                 channel=requester,
                 text=(f':envelope: Sent purchase request for `{domain}` to '
                       f'<@{purchaser}>. He\'ll confirm here once it\'s bought.'),
+            )
+
+    # ─── Path A: deploy lander to existing owned domain ──────────────────
+
+    @_bolt_app.action('deploy_lander_existing')
+    def handle_deploy_lander_click(ack, body, client):
+        """User clicked 'Deploy lander' on a domain in /list-domains.
+
+        Open a confirmation modal that:
+          • shows the picked target domain
+          • warns about the destructive nature (overwrites existing lander)
+          • asks for the source lander URL to deploy
+        """
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        target_domain = data['domain']
+        vertical = data.get('vertical') or '_no vertical_'
+
+        modal = {
+            'type': 'modal',
+            'callback_id': 'deploy_lander_modal',
+            'title': {'type': 'plain_text', 'text': 'Deploy lander'},
+            'submit': {'type': 'plain_text', 'text': 'Send to Utkarsh'},
+            'close': {'type': 'plain_text', 'text': 'Cancel'},
+            # Stash the picked target domain so the submission handler
+            # knows what was clicked. private_metadata is the standard
+            # bolt mechanism for this.
+            'private_metadata': json.dumps({
+                'target_domain': target_domain,
+                'vertical': vertical,
+            }),
+            'blocks': [
+                {
+                    'type': 'header',
+                    'text': {'type': 'plain_text',
+                             'text': f'Deploy to: {target_domain}'},
+                },
+                {
+                    'type': 'context',
+                    'elements': [{'type': 'mrkdwn',
+                                  'text': f'Vertical: *{vertical}*'}],
+                },
+                {
+                    'type': 'section',
+                    'text': {
+                        'type': 'mrkdwn',
+                        'text': (
+                            ':warning: *This will overwrite the existing '
+                            f'lander on `{target_domain}`.*\n'
+                            'If a campaign is currently live on this domain, '
+                            'redeploying may interrupt it for up to 24h while '
+                            'DNS / CloudFront caches refresh. Make sure this '
+                            'domain is not running a live campaign.'
+                        ),
+                    },
+                },
+                {'type': 'divider'},
+                {
+                    'type': 'input',
+                    'block_id': 'lander_block',
+                    'label': {'type': 'plain_text',
+                              'text': 'Lander URL (the page you want deployed)'},
+                    'element': {
+                        'type': 'url_text_input',
+                        'action_id': 'lander_input',
+                        'placeholder': {'type': 'plain_text',
+                                        'text': 'https://existing-lander.com/page'},
+                    },
+                },
+                {
+                    'type': 'input',
+                    'block_id': 'notes_block',
+                    'optional': True,
+                    'label': {'type': 'plain_text',
+                              'text': 'Notes for Utkarsh (optional)'},
+                    'element': {
+                        'type': 'plain_text_input',
+                        'action_id': 'notes_input',
+                        'multiline': True,
+                        'placeholder': {'type': 'plain_text',
+                                        'text': 'e.g. campaign starts Friday'},
+                    },
+                },
+            ],
+        }
+        client.views_open(trigger_id=body['trigger_id'], view=modal)
+
+    @_bolt_app.view('deploy_lander_modal')
+    def handle_deploy_lander_submission(ack, body, view, client):
+        """Modal submitted — DM Utkarsh with the deployment request.
+
+        Per TL/Utkarsh's spec: bot routes the request, Utkarsh executes
+        the actual deployment manually. Same pattern as Path B's purchase
+        request flow, just for redeployment instead of new purchase.
+        """
+        ack()
+
+        meta = json.loads(view.get('private_metadata') or '{}')
+        target_domain = meta.get('target_domain', '')
+        vertical = meta.get('vertical', '')
+
+        values = view['state']['values']
+        lander = (values['lander_block']['lander_input']['value'] or '').strip()
+        notes = (values['notes_block']['notes_input']['value'] or '').strip()
+
+        requester = body['user']['id']
+        recipient = Config.UTKARSH_SLACK_USER_ID or requester
+        recipient_is_requester = (recipient == requester)
+
+        # 1. Send the deployment request to Utkarsh (or fallback to requester)
+        utkarsh_msg = (
+            ':rocket: *Lander deployment request* :rocket:\n'
+            f'• Requester: <@{requester}>\n'
+            f'• Target domain: `{target_domain}`\n'
+            f'• Vertical: `{vertical}`\n'
+            f'• Lander to deploy: {lander}\n'
+            + (f'• Notes: _{notes}_\n' if notes else '')
+            + '\n:point_right: Please confirm this domain is safe to redeploy '
+            '(no live campaign), then deploy the lander files. Reply '
+            ':white_check_mark: in this thread when done.'
+        )
+        client.chat_postMessage(channel=recipient, text=utkarsh_msg)
+
+        # 2. Confirm to the requester
+        if recipient_is_requester:
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':envelope: Deploy request for `{target_domain}` was '
+                      'sent (to you, since UTKARSH_SLACK_USER_ID isn\'t set). '
+                      'In production this would route to Utkarsh.'),
+            )
+        else:
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':envelope: Deploy request for `{target_domain}` sent '
+                      f'to <@{recipient}>. He\'ll confirm here when done.'),
             )
 
 
