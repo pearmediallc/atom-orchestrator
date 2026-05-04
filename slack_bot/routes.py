@@ -336,19 +336,38 @@ if _bolt_app is not None:
         purchaser_is_requester = (purchaser == requester)
 
         # 1. DM Utkarsh (or fallback) with full context so he knows what to buy
-        # and where it'll be deployed.
-        utkarsh_msg = (
+        # and where it'll be deployed. Includes a "Mark Purchased" button so
+        # he can close the loop in one click — bot then notifies the MDB.
+        utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
             f'• Requester: <@{requester}>\n'
             f'• Domain to buy: `{domain}`\n'
             f'• Vertical: `{vertical}`\n'
             f'• Extension: `{extension}`\n'
             f'• Lander to deploy: {lander}\n\n'
-            ':point_right: Please buy this on Namecheap and reply '
-            ':white_check_mark: in this thread when done. The bot will then '
-            'kick off the ATOM domain setup and copy the lander files.'
+            ':point_right: Please buy this on Namecheap, then click '
+            '*Mark Purchased* below.'
         )
-        client.chat_postMessage(channel=purchaser, text=utkarsh_msg)
+        client.chat_postMessage(
+            channel=purchaser,
+            text=f'Domain purchase request for {domain}',
+            blocks=[
+                {'type': 'section',
+                 'text': {'type': 'mrkdwn', 'text': utkarsh_text}},
+                {'type': 'actions', 'elements': [{
+                    'type': 'button',
+                    'action_id': 'confirm_purchased',
+                    'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Purchased'},
+                    'style': 'primary',
+                    'value': json.dumps({
+                        'domain': domain,
+                        'vertical': vertical,
+                        'lander': lander,
+                        'requester': requester,
+                    }),
+                }]},
+            ],
+        )
 
         # 2. Update the original suggestion message so the buttons disappear
         # and the user can see which one they picked.
@@ -500,8 +519,9 @@ if _bolt_app is not None:
         recipient = Config.UTKARSH_SLACK_USER_ID or requester
         recipient_is_requester = (recipient == requester)
 
-        # 1. Send the deployment request to Utkarsh (or fallback to requester)
-        utkarsh_msg = (
+        # 1. Send the deployment request to Utkarsh (or fallback to requester),
+        # with a Mark Deployed button so he can close the loop in one click.
+        utkarsh_text = (
             ':rocket: *Lander deployment request* :rocket:\n'
             f'• Requester: <@{requester}>\n'
             f'• Target domain: `{target_domain}`\n'
@@ -509,10 +529,29 @@ if _bolt_app is not None:
             f'• Lander to deploy: {lander}\n'
             + (f'• Notes: _{notes}_\n' if notes else '')
             + '\n:point_right: Please confirm this domain is safe to redeploy '
-            '(no live campaign), then deploy the lander files. Reply '
-            ':white_check_mark: in this thread when done.'
+            '(no live campaign), deploy the lander files, then click '
+            '*Mark Deployed* below.'
         )
-        client.chat_postMessage(channel=recipient, text=utkarsh_msg)
+        client.chat_postMessage(
+            channel=recipient,
+            text=f'Lander deployment request for {target_domain}',
+            blocks=[
+                {'type': 'section',
+                 'text': {'type': 'mrkdwn', 'text': utkarsh_text}},
+                {'type': 'actions', 'elements': [{
+                    'type': 'button',
+                    'action_id': 'confirm_deployed',
+                    'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Deployed'},
+                    'style': 'primary',
+                    'value': json.dumps({
+                        'target_domain': target_domain,
+                        'vertical': vertical,
+                        'lander': lander,
+                        'requester': requester,
+                    }),
+                }]},
+            ],
+        )
 
         # 2. Confirm to the requester
         if recipient_is_requester:
@@ -527,6 +566,112 @@ if _bolt_app is not None:
                 channel=requester,
                 text=(f':envelope: Deploy request for `{target_domain}` sent '
                       f'to <@{recipient}>. He\'ll confirm here when done.'),
+            )
+
+    # ─── Loop closers: Utkarsh clicks "Mark Done" ────────────────────────
+
+    @_bolt_app.action('confirm_deployed')
+    def handle_confirm_deployed(ack, body, client):
+        """Utkarsh clicked Mark Deployed on a Path A deployment request.
+
+        Marks the inventory record as setup-complete, replaces the button
+        with a confirmation, and DMs the original requester so they know
+        their domain is live.
+        """
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        target_domain = data['target_domain']
+        requester = data['requester']
+        confirmer = body['user']['id']
+
+        # Update inventory: stamp setup_at so /list-domains shows ✅
+        try:
+            inventory_store.mark_setup_complete(target_domain)
+        except Exception:
+            pass  # Domain may not be in inventory yet (Phase 6 covers that)
+
+        # Replace the button with a "confirmed" view
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Confirmed deployed: {target_domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':white_check_mark: Deployed: {target_domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': f'Confirmed by <@{confirmer}>.',
+                }]},
+            ],
+        )
+
+        # Notify the requester (skip if requester == confirmer to avoid
+        # redundant self-DM during single-user testing)
+        if requester != confirmer:
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':tada: `{target_domain}` is deployed! '
+                      f'Confirmed by <@{confirmer}>.'),
+            )
+
+    @_bolt_app.action('confirm_purchased')
+    def handle_confirm_purchased(ack, body, client):
+        """Utkarsh clicked Mark Purchased on a Path B purchase request."""
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        domain = data['domain']
+        vertical = data.get('vertical') or ''
+        lander = data.get('lander') or ''
+        requester = data['requester']
+        confirmer = body['user']['id']
+
+        # Add to inventory so /list-domains starts showing it
+        try:
+            inventory_store.add_domain(
+                domain=domain,
+                vertical=vertical,
+                lander_url=lander,
+                requested_by=f'Slack:{requester}',
+                notes='Purchased via /new-domain bot flow',
+            )
+        except Exception:
+            pass  # Already exists or other issue — non-fatal for the UX update
+
+        # Replace the button with a "purchased" view
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Confirmed purchased: {domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':white_check_mark: Purchased: {domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (f'Confirmed by <@{confirmer}>. Added to '
+                             f'inventory. Phase 7 will auto-trigger the ATOM '
+                             f'domain setup + lander deployment from here.'),
+                }]},
+            ],
+        )
+
+        # Notify the requester
+        if requester != confirmer:
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':moneybag: `{domain}` has been purchased! '
+                      f'Confirmed by <@{confirmer}>. Setup will follow.'),
             )
 
 
