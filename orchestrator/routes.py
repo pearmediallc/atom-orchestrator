@@ -88,5 +88,14 @@ def new_domain_suggest():
         )
     except (ValueError, NotImplementedError) as e:
         return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        # Catches OpenAI API errors (RateLimitError, AuthenticationError,
+        # APIConnectionError, etc.) and returns a clean JSON response
+        # instead of Flask's 500-with-debug-HTML.
+        return jsonify({
+            'error': 'Suggestion engine failed.',
+            'exception': type(e).__name__,
+            'message': str(e),
+        }), 502
 
     return jsonify({'count': len(results), 'suggestions': results})
