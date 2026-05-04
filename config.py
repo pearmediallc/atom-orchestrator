@@ -1,4 +1,5 @@
 """Centralised env loading. All other modules import settings from here."""
+import json
 import os
 from dotenv import load_dotenv
 
@@ -52,3 +53,34 @@ class Config:
     # a suggested domain. Falls back to DMing the requester themselves so the
     # flow is self-testable without a second Slack user.
     UTKARSH_SLACK_USER_ID = os.getenv('UTKARSH_SLACK_USER_ID', '').strip()
+
+    # ─── Phase 7 — Mark Done click triggers ATOM ───────────────
+    # Master switch. When False, Mark Purchased/Deployed clicks behave like
+    # Phase 2.8 — update inventory only, no ATOM trigger. Lets you ship the
+    # bot without breaking the demo if ATOM is unreachable or AWS is broken.
+    ENABLE_PHASE_7 = os.getenv('ENABLE_PHASE_7', 'false').lower() in ('1', 'true', 'yes', 'on')
+
+    # Per-vertical defaults that tell run_existing_domain_workflow which
+    # source bucket / folder to copy lander files from. The Slack flow only
+    # collects a lander URL, not bucket+folder, so these defaults fill the
+    # gap. Override per-vertical via PHASE7_LANDER_DEFAULTS_JSON, e.g.:
+    #   PHASE7_LANDER_DEFAULTS_JSON='{"auto-insurance": {"source_account": "auto-insurance", "source_bucket": "pearmedia-default-lander-auto", "source_folders": ["lander/"]}}'
+    PHASE7_LANDER_DEFAULTS = json.loads(os.getenv('PHASE7_LANDER_DEFAULTS_JSON', '') or '{}')
+
+    # Single global fallback used when a vertical isn't in the JSON map above.
+    PHASE7_DEFAULT_SOURCE_ACCOUNT = os.getenv('PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
+    PHASE7_DEFAULT_SOURCE_BUCKET = os.getenv('PHASE7_DEFAULT_SOURCE_BUCKET', '').strip()
+    PHASE7_DEFAULT_SOURCE_FOLDERS = [
+        f.strip() for f in os.getenv('PHASE7_DEFAULT_SOURCE_FOLDERS', '').split(',') if f.strip()
+    ]
+
+    @classmethod
+    def phase7_defaults_for(cls, vertical: str) -> dict:
+        """Resolve source-* defaults for a given vertical, falling back to global."""
+        by_vert = cls.PHASE7_LANDER_DEFAULTS.get(vertical or '', {}) or {}
+        return {
+            'source_account': by_vert.get('source_account') or cls.PHASE7_DEFAULT_SOURCE_ACCOUNT,
+            'source_bucket': by_vert.get('source_bucket') or cls.PHASE7_DEFAULT_SOURCE_BUCKET,
+            'source_folders': by_vert.get('source_folders') or cls.PHASE7_DEFAULT_SOURCE_FOLDERS,
+            'source_files': by_vert.get('source_files') or [],
+        }

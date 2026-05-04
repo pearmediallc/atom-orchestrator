@@ -18,11 +18,19 @@ Slack, each Flask route below forwards to the SAME SlackRequestHandler — bolt
 internally dispatches based on the request body.
 """
 import json
+import logging
+import threading
 from flask import Blueprint, jsonify, request
 
 from config import Config
 from inventory import store as inventory_store
-from orchestrator.workflow import suggest_new_domains
+from orchestrator.workflow import (
+    ExistingDomainRequest,
+    run_existing_domain_workflow,
+    suggest_new_domains,
+)
+
+logger = logging.getLogger(__name__)
 
 slack_bp = Blueprint('slack', __name__)
 
@@ -47,6 +55,92 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
         request_verification_enabled=True,
     )
     _handler = SlackRequestHandler(_bolt_app)
+
+
+# ─── Phase 7 worker (module-level so tests can import it) ──────────────────
+
+def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
+                           vertical, requester):
+    """Worker: call run_existing_domain_workflow + post progress to Slack.
+
+    Runs in a daemon thread (so the Slack handler can ack quickly).
+    Posts thread replies on the original Mark Done message; DMs the
+    requester at completion or failure.
+
+    Thread-safety: inventory_store opens a fresh sqlite connection per
+    call, and the Slack WebClient is stateless wrt the auth token.
+    """
+    defaults = Config.phase7_defaults_for(vertical)
+
+    if not defaults['source_bucket']:
+        client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=(f':warning: *Phase 7 enabled but no source bucket configured '
+                  f'for vertical* `{vertical or "(none)"}`. Set '
+                  '`PHASE7_DEFAULT_SOURCE_BUCKET` (or add an entry to '
+                  '`PHASE7_LANDER_DEFAULTS_JSON`) and redeploy. Inventory was '
+                  'updated but the lander was NOT actually deployed.'),
+        )
+        return
+
+    client.chat_postMessage(
+        channel=channel, thread_ts=message_ts,
+        text=(f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
+              f'• source bucket: `{defaults["source_bucket"]}`\n'
+              f'• source folders: `{defaults["source_folders"] or "—"}`\n'
+              '_This usually takes 5–20 minutes (cert validation + '
+              'CloudFront)._'),
+    )
+
+    req = ExistingDomainRequest(
+        target_domain=target_domain,
+        source_account=defaults['source_account'],
+        source_bucket=defaults['source_bucket'],
+        source_folders=defaults['source_folders'],
+        source_files=defaults['source_files'],
+        requested_by=f'Slack:{requester}',
+    )
+
+    try:
+        result = run_existing_domain_workflow(req)
+    except Exception as e:
+        logger.exception('Phase 7 worker crashed for %s', target_domain)
+        client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=f':x: *ATOM workflow crashed:* `{type(e).__name__}: {e}`',
+        )
+        client.chat_postMessage(
+            channel=requester,
+            text=(f':x: Sorry — `{target_domain}` deploy hit an error: '
+                  f'`{type(e).__name__}: {e}`. See Slack thread for details.'),
+        )
+        return
+
+    if result.status == 'completed':
+        live = result.details.get('live_url') or f'https://{target_domain}'
+        client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=(f':white_check_mark: *ATOM finished.* {result.message}\n'
+                  f'Live at: {live}'),
+        )
+        client.chat_postMessage(
+            channel=requester,
+            text=(f':tada: `{target_domain}` is fully deployed. '
+                  f'Live at: {live}'),
+        )
+    else:
+        failed_step = (result.details.get('setup_result') or {}).get(
+            'failed_at_step', '?')
+        client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
+                  f'Reason: {result.message}'),
+        )
+        client.chat_postMessage(
+            channel=requester,
+            text=(f':x: `{target_domain}` deploy did not complete. '
+                  f'Step `{failed_step}` failed: {result.message}'),
+        )
 
 
 # ─── Slack command + interaction handlers (registered on the bolt app) ─────
@@ -577,6 +671,11 @@ if _bolt_app is not None:
         Marks the inventory record as setup-complete, replaces the button
         with a confirmation, and DMs the original requester so they know
         their domain is live.
+
+        Phase 7: when ENABLE_PHASE_7 is set, also spawns a background
+        worker that calls ATOM to actually run setup_domain + copy_files.
+        Progress is posted as thread replies on the original Mark Done
+        message; final status is DM'd to the requester.
         """
         ack()
         try:
@@ -585,8 +684,11 @@ if _bolt_app is not None:
             return
 
         target_domain = data['target_domain']
+        vertical = data.get('vertical') or ''
         requester = data['requester']
         confirmer = body['user']['id']
+        channel = body['channel']['id']
+        message_ts = body['message']['ts']
 
         # Update inventory: stamp setup_at so /list-domains shows ✅
         try:
@@ -596,8 +698,8 @@ if _bolt_app is not None:
 
         # Replace the button with a "confirmed" view
         client.chat_update(
-            channel=body['channel']['id'],
-            ts=body['message']['ts'],
+            channel=channel,
+            ts=message_ts,
             text=f'Confirmed deployed: {target_domain}',
             blocks=[
                 {'type': 'header', 'text': {
@@ -620,9 +722,28 @@ if _bolt_app is not None:
                       f'Confirmed by <@{confirmer}>.'),
             )
 
+        # Phase 7: trigger ATOM in a background thread (the workflow blocks
+        # for minutes; Slack interactions must ack within 3s).
+        if Config.ENABLE_PHASE_7:
+            threading.Thread(
+                target=_phase7_run_atom_setup,
+                args=(client, channel, message_ts, target_domain,
+                      vertical, requester),
+                daemon=True,
+                name=f'phase7-deploy-{target_domain}',
+            ).start()
+
     @_bolt_app.action('confirm_purchased')
     def handle_confirm_purchased(ack, body, client):
-        """Utkarsh clicked Mark Purchased on a Path B purchase request."""
+        """Utkarsh clicked Mark Purchased on a Path B purchase request.
+
+        Adds the new domain to inventory, replaces the button with a
+        confirmation, and DMs the original requester.
+
+        Phase 7: when ENABLE_PHASE_7 is set, also spawns the same
+        background worker as confirm_deployed — so a freshly-purchased
+        domain gets full setup_domain + lander copy automatically.
+        """
         ack()
         try:
             data = json.loads(body['actions'][0]['value'])
@@ -634,8 +755,12 @@ if _bolt_app is not None:
         lander = data.get('lander') or ''
         requester = data['requester']
         confirmer = body['user']['id']
+        channel = body['channel']['id']
+        message_ts = body['message']['ts']
 
-        # Add to inventory so /list-domains starts showing it
+        # Add to inventory so /list-domains starts showing it (and so the
+        # Phase 7 workflow can find it — run_existing_domain_workflow
+        # rejects domains that aren't in the store).
         try:
             inventory_store.add_domain(
                 domain=domain,
@@ -648,9 +773,14 @@ if _bolt_app is not None:
             pass  # Already exists or other issue — non-fatal for the UX update
 
         # Replace the button with a "purchased" view
+        phase7_note = (
+            'Triggering ATOM setup now — watch this thread for progress.'
+            if Config.ENABLE_PHASE_7
+            else 'Phase 7 (auto setup_domain) is OFF — set ENABLE_PHASE_7=true to enable.'
+        )
         client.chat_update(
-            channel=body['channel']['id'],
-            ts=body['message']['ts'],
+            channel=channel,
+            ts=message_ts,
             text=f'Confirmed purchased: {domain}',
             blocks=[
                 {'type': 'header', 'text': {
@@ -660,8 +790,7 @@ if _bolt_app is not None:
                 {'type': 'context', 'elements': [{
                     'type': 'mrkdwn',
                     'text': (f'Confirmed by <@{confirmer}>. Added to '
-                             f'inventory. Phase 7 will auto-trigger the ATOM '
-                             f'domain setup + lander deployment from here.'),
+                             f'inventory. {phase7_note}'),
                 }]},
             ],
         )
@@ -673,6 +802,16 @@ if _bolt_app is not None:
                 text=(f':moneybag: `{domain}` has been purchased! '
                       f'Confirmed by <@{confirmer}>. Setup will follow.'),
             )
+
+        # Phase 7: trigger ATOM in a background thread.
+        if Config.ENABLE_PHASE_7:
+            threading.Thread(
+                target=_phase7_run_atom_setup,
+                args=(client, channel, message_ts, domain,
+                      vertical, requester),
+                daemon=True,
+                name=f'phase7-purchase-{domain}',
+            ).start()
 
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
