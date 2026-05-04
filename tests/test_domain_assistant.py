@@ -40,22 +40,6 @@ def test_chatgpt_stub_respects_extension(monkeypatch):
         assert name.endswith('.pro')
 
 
-def test_chatgpt_real_path_raises_when_key_present_but_unimplemented(monkeypatch):
-    """Phase 5+ wiring isn't done yet — real path should raise clearly.
-
-    Uses a 40+ char fake key so it passes the _is_real_openai_key heuristic
-    (short keys like 'sk-...' from the .env.example placeholder fall through
-    to the stub instead).
-    """
-    monkeypatch.setattr(
-        Config, 'OPENAI_API_KEY',
-        'sk-fakekey-that-is-clearly-long-enough-to-look-real-12345',
-    )
-    with pytest.raises(NotImplementedError):
-        chatgpt.suggest_domains(vertical='x', example_domains=[],
-                                extension='.com', count=1)
-
-
 def test_chatgpt_short_placeholder_key_falls_back_to_stub(monkeypatch):
     """The .env.example placeholder 'sk-...' must NOT be treated as real."""
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'sk-...')
@@ -65,6 +49,50 @@ def test_chatgpt_short_placeholder_key_falls_back_to_stub(monkeypatch):
     assert len(out) == 2
     # Returns the stub names — not a NotImplementedError
     assert all('stub' in name for name in out)
+
+
+# ─── chatgpt._parse_model_response (parses OpenAI replies) ────────────────
+
+def test_parse_strips_numbering_prefixes():
+    out = chatgpt._parse_model_response(
+        '1. quickauto.com\n2) rateshero.com\n3. clickquote.com',
+        '.com', count=10,
+    )
+    assert out == ['quickauto.com', 'rateshero.com', 'clickquote.com']
+
+
+def test_parse_strips_bullet_prefixes():
+    out = chatgpt._parse_model_response(
+        '- quickauto.com\n* rateshero.com\n• clickquote.com',
+        '.com', count=10,
+    )
+    assert out == ['quickauto.com', 'rateshero.com', 'clickquote.com']
+
+
+def test_parse_strips_quotes_and_normalises_case():
+    out = chatgpt._parse_model_response(
+        '"QuickAuto.COM"\n\'RatesHero.com\'\n`ClickQuote.com`',
+        '.com', count=10,
+    )
+    assert out == ['quickauto.com', 'rateshero.com', 'clickquote.com']
+
+
+def test_parse_filters_wrong_extension():
+    """If the model ignores instructions and returns a different TLD,
+    we drop it rather than confuse the caller."""
+    out = chatgpt._parse_model_response(
+        'quickauto.com\nrateshero.net\nclickquote.com',
+        '.com', count=10,
+    )
+    assert out == ['quickauto.com', 'clickquote.com']
+
+
+def test_parse_respects_count_limit():
+    out = chatgpt._parse_model_response(
+        'a.com\nb.com\nc.com\nd.com\ne.com',
+        '.com', count=3,
+    )
+    assert out == ['a.com', 'b.com', 'c.com']
 
 
 # ─── namecheap_check.check_availability ───────────────────────────────────
