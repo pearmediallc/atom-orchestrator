@@ -140,3 +140,52 @@ def test_handles_utf8_bom_in_csv(tmp_inventory, tmp_path):
     stats = import_csv.import_csv(str(csv_path))
     assert stats['imported'] == 1
     assert tmp_inventory.get_domain('bom-test.com') is not None
+
+
+def test_other_vertical_uses_followup_column(tmp_inventory, tmp_path):
+    """When vertical=='Other', read the real value from the follow-up column.
+
+    Pear Media's Google Form has this exact pattern: a 'Vertical' dropdown
+    with an 'Other' option, plus a text field 'If selected others Write
+    Vertical Name' for when 'Other' is picked.
+    """
+    csv_path = tmp_path / 'test.csv'
+    _write_csv(
+        csv_path,
+        headers=['Domain', 'Vertical',
+                 'If selected others Write Vertical Name'],
+        rows=[
+            ['real-vertical.com', 'Auto Insurance', ''],
+            ['other-with-followup.com', 'Other', 'Cryptocurrency'],
+            ['other-no-followup.com', 'Other', ''],
+        ],
+    )
+
+    import_csv.import_csv(str(csv_path))
+
+    assert tmp_inventory.get_domain(
+        'real-vertical.com')['vertical'] == 'Auto Insurance'
+    assert tmp_inventory.get_domain(
+        'other-with-followup.com')['vertical'] == 'Cryptocurrency'
+    # When follow-up is empty, fall back to the original "Other"
+    assert tmp_inventory.get_domain(
+        'other-no-followup.com')['vertical'] == 'Other'
+
+
+def test_replace_flag_overwrites_existing(tmp_inventory, tmp_path):
+    """With --replace, existing rows are updated rather than skipped."""
+    csv_path = tmp_path / 'test.csv'
+
+    _write_csv(csv_path,
+               headers=['Domain', 'Vertical'],
+               rows=[['ex.com', 'oldvert']])
+    import_csv.import_csv(str(csv_path))
+
+    _write_csv(csv_path,
+               headers=['Domain', 'Vertical'],
+               rows=[['ex.com', 'newvert']])
+    stats = import_csv.import_csv(str(csv_path), replace=True)
+
+    assert stats['imported'] == 1
+    assert stats['skipped_duplicate'] == 0
+    assert tmp_inventory.get_domain('ex.com')['vertical'] == 'newvert'
