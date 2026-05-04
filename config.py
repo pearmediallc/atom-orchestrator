@@ -25,9 +25,17 @@ class Config:
     # Phase 3 — inventory
     INVENTORY_DB_PATH = os.getenv('INVENTORY_DB_PATH', './inventory.db')
 
-    # Phase 4 — ChatGPT + Namecheap availability
+    # Phase 4/5 — LLM provider (OpenAI-compatible API: works with OpenAI,
+    # Grok/xAI, any other provider that exposes the OpenAI Chat Completions
+    # spec). To use Grok instead of OpenAI:
+    #   OPENAI_BASE_URL=https://api.x.ai/v1
+    #   OPENAI_API_KEY=xai-...
+    #   OPENAI_MODEL=grok-2-1212    (or whichever Grok model is current)
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', '').strip() or None
     OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+
+    # Phase 4 — Namecheap availability
     NAMECHEAP_API_USER = os.getenv('NAMECHEAP_API_USER')
     NAMECHEAP_API_KEY = os.getenv('NAMECHEAP_API_KEY')
     NAMECHEAP_CLIENT_IP = os.getenv('NAMECHEAP_CLIENT_IP')

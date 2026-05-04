@@ -47,8 +47,30 @@ def test_chatgpt_short_placeholder_key_falls_back_to_stub(monkeypatch):
         vertical='x', example_domains=[], extension='.com', count=2,
     )
     assert len(out) == 2
-    # Returns the stub names — not a NotImplementedError
     assert all('stub' in name for name in out)
+
+
+def test_grok_placeholder_also_falls_back_to_stub(monkeypatch):
+    """Grok / xAI placeholder should also be ignored."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'xai-...')
+    out = chatgpt.suggest_domains(
+        vertical='x', example_domains=[], extension='.com', count=2,
+    )
+    assert len(out) == 2
+    assert all('stub' in name for name in out)
+
+
+def test_grok_realistic_key_treated_as_real(monkeypatch):
+    """A long xai- key (Grok) should be treated as real and trigger the
+    real-LLM path. We can't actually call Grok in a unit test, but we can
+    verify _is_real_openai_key accepts it."""
+    fake_grok_key = 'xai-' + 'a' * 80
+    assert chatgpt._is_real_openai_key(fake_grok_key) is True
+
+
+def test_empty_key_not_real(monkeypatch):
+    assert chatgpt._is_real_openai_key('') is False
+    assert chatgpt._is_real_openai_key(None) is False
 
 
 # ─── chatgpt._parse_model_response (parses OpenAI replies) ────────────────

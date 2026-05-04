@@ -1,19 +1,34 @@
-"""Domain-name suggestions via OpenAI."""
+"""Domain-name suggestions via an OpenAI-compatible LLM.
+
+Works with OpenAI directly OR any compatible provider (e.g. Grok / xAI)
+when OPENAI_BASE_URL is set in the env.
+"""
 import re
 from typing import List, Optional
 from config import Config
 
 
-def _is_real_openai_key(value: Optional[str]) -> bool:
-    """Distinguish a real OpenAI key from the placeholder / empty value.
+# Common placeholder strings we don't want mistaken for real keys.
+_KEY_PLACEHOLDERS = {
+    'sk-...',
+    'xai-...',
+    'your-key-here',
+    'your-openai-key-here',
+}
 
-    Real OpenAI keys look like `sk-...` or `sk-proj-...` and are 40+ chars.
-    The .env.example placeholder is the literal string `sk-...` (6 chars),
-    which we treat as "no key set" so the stub keeps running for local dev.
+
+def _is_real_openai_key(value: Optional[str]) -> bool:
+    """Tell apart a real LLM API key from a placeholder / empty value.
+
+    Real keys (OpenAI `sk-...`, Grok `xai-...`, etc.) are 30+ chars.
+    Placeholders from .env.example or empty strings are rejected so
+    the stub fallback kicks in instead.
     """
     if not value:
         return False
-    return value.startswith('sk-') and len(value) > 20
+    if value.strip() in _KEY_PLACEHOLDERS:
+        return False
+    return len(value) >= 20
 
 
 def _stub_suggestions(vertical: str, extension: str, count: int) -> List[str]:
@@ -84,7 +99,13 @@ def suggest_domains(vertical: str, example_domains: List[str],
     # if they only exercise the stub.
     from openai import OpenAI
 
-    client = OpenAI(api_key=Config.OPENAI_API_KEY)
+    client_kwargs = {'api_key': Config.OPENAI_API_KEY}
+    if Config.OPENAI_BASE_URL:
+        # Routes the SDK at a non-OpenAI provider (Grok / xAI, etc.) using
+        # the OpenAI-compatible API spec they expose.
+        client_kwargs['base_url'] = Config.OPENAI_BASE_URL
+
+    client = OpenAI(**client_kwargs)
     response = client.chat.completions.create(
         model=Config.OPENAI_MODEL,
         messages=[
