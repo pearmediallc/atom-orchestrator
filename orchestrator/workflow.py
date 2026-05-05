@@ -203,9 +203,10 @@ def suggest_new_domains(
     cap = Config.price_cap_for(extension)
     qualifying: List[dict] = []
     seen: set = set()
-    # Generate ~3x the count we need per attempt — most candidates are
-    # taken or premium-priced, so we need a buffer.
-    candidates_per_attempt = max(15, count * 3)
+    # Most "obvious" candidates (cheapauto.com, lowrate.com, etc.) are
+    # squatter-owned. Generate ~6x the count we need per attempt — only
+    # 1-2 in 30 typical LLM suggestions actually clear Namecheap.
+    candidates_per_attempt = max(30, count * 6)
 
     for attempt in range(max_attempts):
         if len(qualifying) >= count:

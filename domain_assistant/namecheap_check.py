@@ -48,9 +48,13 @@ def _has_namecheap_creds() -> bool:
     )
 
 
-def _request_namecheap(params: dict) -> Optional[ET.Element]:
+def _request_namecheap(params: dict, *, timeout: int = 15) -> Optional[ET.Element]:
     """Call Namecheap with proxy if configured. Returns parsed XML root, or
     None on transport failure. Caller checks for `<Errors>` inside.
+
+    `timeout` defaults to 15s (good for availability checks). Pass a
+    longer value for the getPricing call which returns a multi-KB XML
+    response and is slow through the Oxylabs proxy.
     """
     if not _has_namecheap_creds():
         logger.info('Namecheap creds not configured — skipping API call')
@@ -69,7 +73,7 @@ def _request_namecheap(params: dict) -> Optional[ET.Element]:
         r = requests.get(
             Config.NAMECHEAP_API_URL,
             params=base,
-            timeout=15,
+            timeout=timeout,
             proxies=proxies,
         )
         r.raise_for_status()
@@ -92,23 +96,26 @@ def _fetch_all_tld_prices() -> Dict[str, float]:
 
     Returns empty dict if creds aren't configured or the call fails.
     """
+    # users.getPricing returns prices for every TLD Namecheap sells in one
+    # ~50KB XML response; through the Oxylabs proxy this often takes
+    # 30-45 seconds. Result is cached for 24h so the slow path runs once.
     root = _request_namecheap({
         'Command': 'namecheap.users.getPricing',
         'ProductType': 'DOMAIN',
         'ProductCategory': 'REGISTER',
-    })
+    }, timeout=90)
     if root is None:
         return {}
 
-    prices: Dict[str, float] = {}
-    # XML structure (simplified):
-    #   <UserGetPricingResult>
-    #     <ProductType Name="domains">
-    #       <ProductCategory Name="register">
-    #         <Product Name="com">
-    #           <Price Duration="1" DurationType="YEAR" Price="9.18" YourPrice="9.18" .../>
-    #           <Price Duration="2" .../>
-    #         <Product Name="net">...</Product>
+    # Namecheap's getPricing response includes MULTIPLE entries per TLD —
+    # one for regular/renewal pricing (YourPriceType=MULTIPLE) and one for
+    # the promotional first-year price (YourPriceType=ABSOLUTE). Both have
+    # Duration=1 YEAR. Marketers buying a NEW domain pay the ABSOLUTE price,
+    # not the MULTIPLE one. To match their actual cost, take the MIN of all
+    # 1-year YourPrice entries per TLD — that's always either the promo
+    # price (when one exists) or the regular price (when no promo). Either
+    # way, it's "the cheapest this domain can be bought for right now."
+    by_tld: Dict[str, List[float]] = {}
     for product in root.iter():
         if _local_name(product.tag) != 'Product':
             continue
@@ -123,17 +130,18 @@ def _fetch_all_tld_prices() -> Dict[str, float]:
             if price_el.get('DurationType') != 'YEAR':
                 continue
             try:
-                # YourPrice = what this account actually pays. Falls back
-                # to RegularPrice / Price if YourPrice isn't included.
-                p_str = (price_el.get('YourPrice')
-                         or price_el.get('Price')
-                         or price_el.get('RegularPrice')
-                         or '0')
-                prices[f'.{ext_name.lower()}'] = float(p_str)
+                p = float(
+                    price_el.get('YourPrice')
+                    or price_el.get('Price')
+                    or price_el.get('RegularPrice')
+                    or '0'
+                )
             except ValueError:
                 continue
-            break  # Only need the 1-year price per product
-    return prices
+            if p > 0:
+                by_tld.setdefault(f'.{ext_name.lower()}', []).append(p)
+
+    return {tld: min(plist) for tld, plist in by_tld.items()}
 
 
 def get_tld_prices(force_refresh: bool = False) -> Dict[str, float]:

@@ -40,7 +40,7 @@ def _stub_suggestions(vertical: str, extension: str, count: int) -> List[str]:
 def _build_prompt(vertical: str, example_domains: List[str],
                   extension: str, count: int) -> str:
     examples_line = (
-        f'Names I like the style of: {", ".join(example_domains)}.'
+        f'Style examples I like: {", ".join(example_domains)}.'
         if example_domains else
         '(No example names provided — use your judgement on style.)'
     )
@@ -48,14 +48,27 @@ def _build_prompt(vertical: str, example_domains: List[str],
         f'Suggest {count} domain-name ideas for a {vertical!r} '
         f'landing page.\n'
         f'{examples_line}\n\n'
-        f'Requirements:\n'
+        f'CRITICAL — names must actually be available to register on '
+        f'Namecheap. Short single-word names like "cheapauto.com" or '
+        f'"lowrate.com" are virtually ALWAYS taken by squatters. Aim for:\n'
+        f'- 3-word compound names — e.g. "carguardianpro", "safetyfirstauto", '
+        f'"fixyourhomenow", "drivesafetyhub"\n'
+        f'- Brandable made-up words — e.g. "instapolicy", "flexicover", '
+        f'"swiftquoter", "easyrater"\n'
+        f'- Descriptive phrases joined with hyphens — e.g. "best-{vertical}-2026", '
+        f'"smart-{vertical}-finder", "your-{vertical}-quote"\n'
+        f'\n'
+        f'Other rules:\n'
         f'- Every name must end with "{extension}"\n'
         f'- Lowercase, no spaces; hyphens OK\n'
-        f'- Short and memorable (under ~25 chars including the extension)\n'
-        f"- Plausibly available — don't suggest big-brand names\n"
+        f'- 12-30 chars including the extension (avoid both very short and very long)\n'
+        f'- DO NOT suggest big-brand names (Geico, Allstate, Aetna, etc.)\n'
+        f'- DO NOT use "the" / "my" / "your" excessively — they don\'t make '
+        f'  a name more available\n'
         f'- One name per line\n'
         f'- No numbering, no quotes, no commentary\n\n'
-        f'Just {count} domain names, nothing else.'
+        f'Generate {count} truly varied options that prioritise '
+        f'availability over brevity.'
     )
 
 
