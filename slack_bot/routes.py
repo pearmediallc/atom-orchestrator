@@ -461,37 +461,17 @@ if _bolt_app is not None:
             text=f'{len(available)} available domains for {vertical}',
         )
 
-    @_bolt_app.action('pick_domain')
-    def handle_pick_domain(ack, body, client):
-        """User clicked "Pick this" on a suggested domain.
+    def _send_purchase_request_to_utkarsh(client, *, domain, vertical, lander,
+                                          extension, requester):
+        """DM Utkarsh (with dev-reroute applied) the purchase request card.
 
-        Per TL: do NOT auto-purchase via Namecheap API. Instead DM Utkarsh
-        (the human procurer) with the request. He'll buy it on Namecheap
-        and confirm in the thread, at which point Phase 6 will trigger the
-        ATOM domain setup + lander copy.
+        Extracted from handle_pick_domain so TL approval can call it after
+        the TL clicks Approve. Returns the resolved purchaser id (after
+        DEV_REROUTE_DMS_TO override) so callers can name them in UI text.
         """
-        ack()
+        real_purchaser = Config.UTKARSH_SLACK_USER_ID or requester
+        purchaser = Config.route_recipient(real_purchaser)
 
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
-            return
-
-        domain = data['domain']
-        vertical = data['vertical']
-        lander = data['lander']
-        extension = data['extension']
-        requester = data['requester']
-
-        # If UTKARSH_SLACK_USER_ID isn't set, fall back to DMing the requester
-        # themselves. Lets a single dev test the whole flow without a second
-        # Slack identity.
-        purchaser = Config.UTKARSH_SLACK_USER_ID or requester
-        purchaser_is_requester = (purchaser == requester)
-
-        # 1. DM Utkarsh (or fallback) with full context so he knows what to buy
-        # and where it'll be deployed. Includes a "Mark Purchased" button so
-        # he can close the loop in one click — bot then notifies the MDB.
         utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
             f'• Requester: <@{requester}>\n'
@@ -522,45 +502,242 @@ if _bolt_app is not None:
                 }]},
             ],
         )
+        return purchaser
 
-        # 2. Update the original suggestion message so the buttons disappear
-        # and the user can see which one they picked.
+    @_bolt_app.action('pick_domain')
+    def handle_pick_domain(ack, body, client):
+        """User clicked "Pick this" on a suggested domain.
+
+        Phase 7.5 routing:
+          • If Config.APPROVER_SLACK_USER_IDS is non-empty → send an
+            Approve/Reject card to each TL. Utkarsh is only DM'd after a
+            TL clicks Approve (handle_confirm_approved).
+          • If APPROVER_SLACK_USER_IDS is empty → fall through to the
+            Phase 5 behavior (DM Utkarsh directly). Useful for early
+            pilot / solo-dev testing.
+
+        Per TL spec: NEVER auto-purchase via Namecheap API. Always route
+        through humans (TL approval, then Utkarsh manual buy).
+        """
+        ack()
+
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        domain = data['domain']
+        vertical = data['vertical']
+        lander = data['lander']
+        extension = data['extension']
+        requester = data['requester']
+
+        approver_ids = Config.APPROVER_SLACK_USER_IDS
+        button_payload = json.dumps({
+            'domain': domain,
+            'vertical': vertical,
+            'lander': lander,
+            'extension': extension,
+            'requester': requester,
+        })
+
+        if approver_ids:
+            # Phase 7.5: send TL approval card to each configured approver
+            # (with dev reroute applied).
+            approval_text = (
+                ':bell: *New-domain approval requested* :bell:\n'
+                f'• Requester: <@{requester}>\n'
+                f'• Domain: `{domain}`\n'
+                f'• Vertical: `{vertical}`\n'
+                f'• Extension: `{extension}`\n'
+                f'• Lander to deploy: {lander}\n\n'
+                ':point_right: Approve to forward this to Utkarsh for '
+                'purchase, or Reject to cancel.'
+            )
+            approval_blocks = [
+                {'type': 'section',
+                 'text': {'type': 'mrkdwn', 'text': approval_text}},
+                {'type': 'actions', 'elements': [
+                    {
+                        'type': 'button',
+                        'action_id': 'confirm_approved',
+                        'text': {'type': 'plain_text', 'text': ':white_check_mark: Approve'},
+                        'style': 'primary',
+                        'value': button_payload,
+                    },
+                    {
+                        'type': 'button',
+                        'action_id': 'confirm_rejected',
+                        'text': {'type': 'plain_text', 'text': ':x: Reject'},
+                        'style': 'danger',
+                        'value': button_payload,
+                    },
+                ]},
+            ]
+            for approver in approver_ids:
+                routed = Config.route_recipient(approver)
+                client.chat_postMessage(
+                    channel=routed,
+                    text=f'Approval requested: {domain}',
+                    blocks=approval_blocks,
+                )
+
+            # Update the original suggestion message so the buttons go away.
+            client.chat_update(
+                channel=body['channel']['id'],
+                ts=body['message']['ts'],
+                text=f'Selected: {domain}',
+                blocks=[
+                    {'type': 'header', 'text': {
+                        'type': 'plain_text',
+                        'text': f':white_check_mark: Selected: {domain}',
+                    }},
+                    {'type': 'context', 'elements': [{
+                        'type': 'mrkdwn',
+                        'text': (f'Sent to <@{approver_ids[0]}>'
+                                 + (f' and {len(approver_ids) - 1} other approver(s)'
+                                    if len(approver_ids) > 1 else '')
+                                 + ' for approval.'),
+                    }]},
+                ],
+            )
+
+            # Tell the requester their pick is awaiting approval.
+            client.chat_postMessage(
+                channel=requester,
+                text=(f':hourglass_flowing_sand: `{domain}` is awaiting TL '
+                      'approval. You\'ll get a DM here when it\'s decided.'),
+            )
+            return
+
+        # No approvers configured — Phase 5 behavior. DM Utkarsh directly.
+        purchaser = _send_purchase_request_to_utkarsh(
+            client,
+            domain=domain, vertical=vertical, lander=lander,
+            extension=extension, requester=requester,
+        )
+        purchaser_is_requester = (purchaser == requester)
+
+        # Update the original suggestion message.
         client.chat_update(
             channel=body['channel']['id'],
             ts=body['message']['ts'],
             text=f'Selected: {domain}',
             blocks=[
-                {
-                    'type': 'header',
-                    'text': {
-                        'type': 'plain_text',
-                        'text': f':white_check_mark: Selected: {domain}',
-                    },
-                },
-                {
-                    'type': 'context',
-                    'elements': [{
-                        'type': 'mrkdwn',
-                        'text': (
-                            'Purchase request sent to '
-                            f'<@{purchaser}>'
-                            + (' (you, since UTKARSH_SLACK_USER_ID isn\'t set)'
-                               if purchaser_is_requester else '')
-                            + '.'
-                        ),
-                    }],
-                },
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':white_check_mark: Selected: {domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (
+                        'Purchase request sent to '
+                        f'<@{purchaser}>'
+                        + (' (you, since UTKARSH_SLACK_USER_ID isn\'t set)'
+                           if purchaser_is_requester else '')
+                        + '.'
+                    ),
+                }]},
             ],
         )
 
-        # 3. If we DMed someone other than the requester, also confirm to the
-        # requester so they know their click did something.
         if not purchaser_is_requester:
             client.chat_postMessage(
                 channel=requester,
                 text=(f':envelope: Sent purchase request for `{domain}` to '
                       f'<@{purchaser}>. He\'ll confirm here once it\'s bought.'),
             )
+
+    @_bolt_app.action('confirm_approved')
+    def handle_confirm_approved(ack, body, client):
+        """TL clicked Approve on a Path B approval card.
+
+        Forwards the now-approved domain to Utkarsh (manual purchase) and
+        notifies the requester. Replaces the approval card with an
+        "Approved by @TL" view so the same TL can't approve twice.
+        """
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        domain = data['domain']
+        vertical = data['vertical']
+        lander = data['lander']
+        extension = data.get('extension') or '.com'
+        requester = data['requester']
+        approver = body['user']['id']
+
+        # Forward to Utkarsh
+        purchaser = _send_purchase_request_to_utkarsh(
+            client,
+            domain=domain, vertical=vertical, lander=lander,
+            extension=extension, requester=requester,
+        )
+
+        # Replace the approval card so it can't be re-approved
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Approved: {domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':white_check_mark: Approved: {domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (f'Approved by <@{approver}>. Forwarded to '
+                             f'<@{purchaser}> for purchase.'),
+                }]},
+            ],
+        )
+
+        # Notify the requester
+        client.chat_postMessage(
+            channel=requester,
+            text=(f':white_check_mark: `{domain}` was *approved* by '
+                  f'<@{approver}>. Sent to <@{purchaser}> to buy on Namecheap.'),
+        )
+
+    @_bolt_app.action('confirm_rejected')
+    def handle_confirm_rejected(ack, body, client):
+        """TL clicked Reject on a Path B approval card. Stop the flow,
+        tell the requester. No domain enters inventory."""
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        domain = data['domain']
+        requester = data['requester']
+        rejecter = body['user']['id']
+
+        # Replace the approval card
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Rejected: {domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':x: Rejected: {domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': f'Rejected by <@{rejecter}>. Flow stopped.',
+                }]},
+            ],
+        )
+
+        # Notify the requester
+        client.chat_postMessage(
+            channel=requester,
+            text=(f':x: `{domain}` was *rejected* by <@{rejecter}>. '
+                  'Try a different suggestion via `/new-domain`.'),
+        )
 
     # ─── Path A: deploy lander to existing owned domain ──────────────────
 
@@ -689,7 +866,8 @@ if _bolt_app is not None:
         ack()
 
         requester = body['user']['id']
-        recipient = Config.UTKARSH_SLACK_USER_ID or requester
+        real_recipient = Config.UTKARSH_SLACK_USER_ID or requester
+        recipient = Config.route_recipient(real_recipient)
         recipient_is_requester = (recipient == requester)
 
         # 1. Send the deployment request to Utkarsh (or fallback to requester),

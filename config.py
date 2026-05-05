@@ -54,6 +54,23 @@ class Config:
     # flow is self-testable without a second Slack user.
     UTKARSH_SLACK_USER_ID = os.getenv('UTKARSH_SLACK_USER_ID', '').strip()
 
+    # Dev override — when set to a Slack user ID, every TL approval card,
+    # Utkarsh purchase/deploy DM, and worker progress message gets rerouted
+    # to this single user instead of the real recipients. Lets a solo dev
+    # walk the whole flow alone without spamming TL/Utkarsh in production.
+    # Empty in real use.
+    DEV_REROUTE_DMS_TO = os.getenv('DEV_REROUTE_DMS_TO', '').strip()
+
+    @classmethod
+    def route_recipient(cls, real_recipient: str) -> str:
+        """Return DEV_REROUTE_DMS_TO if set, else the real recipient unchanged.
+
+        Use this everywhere we'd send a DM to a TL/approver/Utkarsh — never
+        for the requester themselves (their own DMs should always reach
+        them, not get hijacked by the dev override).
+        """
+        return cls.DEV_REROUTE_DMS_TO or real_recipient
+
     # ─── Phase 7 — Mark Done click triggers ATOM ───────────────
     # Master switch. When False, Mark Purchased/Deployed clicks behave like
     # Phase 2.8 — update inventory only, no ATOM trigger. Lets you ship the
