@@ -2,6 +2,10 @@ Flask==3.0.3
 python-dotenv==1.0.1
 requests>=2.31.0
 
+# Production WSGI server (Render uses this; local dev still uses Flask's
+# built-in dev server via `python app.py`).
+gunicorn>=21.2.0
+
 # Phase 2: Slack
 slack-bolt>=1.18.0
 
