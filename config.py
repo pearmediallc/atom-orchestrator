@@ -1,6 +1,7 @@
 """Centralised env loading. All other modules import settings from here."""
 import json
 import os
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,10 +44,49 @@ class Config:
     OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', '').strip() or None
     OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 
-    # Phase 4 — Namecheap availability
-    NAMECHEAP_API_USER = os.getenv('NAMECHEAP_API_USER')
-    NAMECHEAP_API_KEY = os.getenv('NAMECHEAP_API_KEY')
-    NAMECHEAP_CLIENT_IP = os.getenv('NAMECHEAP_CLIENT_IP')
+    # Phase 4/8 — Namecheap availability + pricing
+    # Same credentials ATOM uses (aws_automation/.env). The bot calls Namecheap
+    # directly for /new-domain availability + price filtering rather than
+    # routing through ATOM, to keep ATOM's API surface small.
+    NAMECHEAP_API_USER = os.getenv('NAMECHEAP_API_USER', '').strip()
+    NAMECHEAP_API_KEY = os.getenv('NAMECHEAP_API_KEY', '').strip()
+    NAMECHEAP_CLIENT_IP = os.getenv('NAMECHEAP_CLIENT_IP', '').strip()
+    NAMECHEAP_API_URL = os.getenv(
+        'NAMECHEAP_API_URL', 'https://api.namecheap.com/xml.response'
+    ).strip()
+
+    # Oxylabs HTTPS proxy — Namecheap whitelists this proxy's IP, so all
+    # Namecheap API calls must go through it. Same creds as ATOM uses.
+    PROXY_USERNAME = os.getenv('PROXY_USERNAME', '').strip()
+    PROXY_PASSWORD = os.getenv('PROXY_PASSWORD', '').strip()
+    PROXY_HOST = os.getenv('PROXY_HOST', 'ddc.oxylabs.io').strip()
+    PROXY_PORT = os.getenv('PROXY_PORT', '8001').strip()
+
+    @classmethod
+    def get_proxy(cls) -> Optional[dict]:
+        """Returns a requests-compatible proxy dict, or None if proxy creds
+        aren't configured. Mirrors ATOM's Config.get_proxy() pattern."""
+        if not (cls.PROXY_USERNAME and cls.PROXY_PASSWORD):
+            return None
+        url = (
+            f'https://{cls.PROXY_USERNAME}:{cls.PROXY_PASSWORD}@'
+            f'{cls.PROXY_HOST}:{cls.PROXY_PORT}'
+        )
+        return {'http': url, 'https': url}
+
+    # Per-extension price cap for /new-domain suggestions. The bot only
+    # suggests domains whose Namecheap price is at-or-below this cap.
+    # Override per-vertical or per-extension via env var if needed; for now
+    # hard-coded to TL's spec on 2026-05-05.
+    DOMAIN_PRICE_CAP_USD = {
+        '.com': 15.00,    # .com under $15
+        '_default': 5.00,  # everything else under or equal to $5
+    }
+
+    @classmethod
+    def price_cap_for(cls, extension: str) -> float:
+        ext = extension if extension.startswith('.') else f'.{extension}'
+        return cls.DOMAIN_PRICE_CAP_USD.get(ext, cls.DOMAIN_PRICE_CAP_USD['_default'])
 
     # Phase 5 — approvers
     APPROVER_SLACK_USER_IDS = [

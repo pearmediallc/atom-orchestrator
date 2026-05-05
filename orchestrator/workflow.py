@@ -172,39 +172,75 @@ def suggest_new_domains(
     vertical: str,
     example_domains: List[str],
     extension: str = '.com',
-    count: int = 10,
+    count: int = 5,
+    max_attempts: int = 4,
 ) -> List[dict]:
-    """Path B step 1 — suggest available new-domain names.
+    """Path B step 1 — suggest *available* + *price-filtered* new domain names.
 
-    Composes ChatGPT (for naming style) with Namecheap (for availability).
-    Both providers fall back to deterministic stubs when API keys are absent
-    (see domain_assistant/), so this function works end-to-end in local dev
-    without any external credentials.
+    Composes:
+      • ChatGPT-style LLM for naming
+      • Namecheap `domains.check` for availability
+      • Namecheap `users.getPricing` for register price
+      • Per-extension price cap from Config.DOMAIN_PRICE_CAP_USD
+        (TL spec 2026-05-05: .com under $15, others under-or-equal $5)
 
-    Returns a list shaped like:
-      [{'domain': 'foo.com', 'available': True}, ...]
-    sorted with available domains first.
+    Tries up to `max_attempts` LLM batches to assemble exactly `count`
+    domains that are (a) available on Namecheap AND (b) price-capped.
+    Returns whatever it found if the cap can't be met after max_attempts.
+
+    Each result row:
+        {'domain': str, 'available': True, 'price': 9.18}
+
+    The returned list is suitable to render directly as Pick this buttons.
+    Stubs in domain_assistant/ keep the function working end-to-end in
+    local dev without any real API keys.
     """
     if not vertical:
         raise ValueError("'vertical' is required")
     if extension and not extension.startswith('.'):
         extension = '.' + extension
 
-    suggestions = chatgpt.suggest_domains(
-        vertical=vertical,
-        example_domains=example_domains or [],
-        extension=extension,
-        count=count,
-    )
-    availability = namecheap_check.check_availability(suggestions)
+    cap = Config.price_cap_for(extension)
+    qualifying: List[dict] = []
+    seen: set = set()
+    # Generate ~3x the count we need per attempt — most candidates are
+    # taken or premium-priced, so we need a buffer.
+    candidates_per_attempt = max(15, count * 3)
 
-    results = [
-        {'domain': d, 'available': bool(availability.get(d, False))}
-        for d in suggestions
-    ]
-    # Available domains first, otherwise preserve original order.
-    results.sort(key=lambda r: not r['available'])
-    return results
+    for attempt in range(max_attempts):
+        if len(qualifying) >= count:
+            break
+
+        candidates = chatgpt.suggest_domains(
+            vertical=vertical,
+            example_domains=example_domains or [],
+            extension=extension,
+            count=candidates_per_attempt,
+        )
+        # Dedupe across attempts (LLMs sometimes repeat)
+        candidates = [d for d in candidates if d not in seen]
+        seen.update(candidates)
+        if not candidates:
+            continue
+
+        checked = namecheap_check.check_availability_and_price(
+            candidates, extension=extension,
+        )
+        for r in checked:
+            if not r['available']:
+                continue
+            price = r.get('price')
+            # Unknown price (no creds / API failure) — exclude. We can't
+            # confirm it's under the cap.
+            if price is None:
+                continue
+            if price > cap:
+                continue
+            qualifying.append(r)
+            if len(qualifying) >= count:
+                break
+
+    return qualifying[:count]
 
 
 def run_new_domain_workflow(req: WorkflowRequest) -> WorkflowResult:

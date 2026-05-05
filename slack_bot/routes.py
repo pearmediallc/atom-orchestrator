@@ -369,8 +369,9 @@ if _bolt_app is not None:
         )
         client.chat_postMessage(channel=requester, text=receipt)
 
-        # 2. Call the suggestion engine. Stays cheap thanks to the stubs in
-        # domain_assistant/ when API keys aren't set.
+        # 2. Call the suggestion engine. It already filters to available +
+        # price-capped (.com <$15, other extensions <=$5 per TL 2026-05-05).
+        # Falls back to stubs in domain_assistant/ when API keys aren't set.
         try:
             suggestions = suggest_new_domains(
                 vertical=vertical,
@@ -386,8 +387,11 @@ if _bolt_app is not None:
             )
             return
 
-        available = [s for s in suggestions if s['available']]
-        unavailable = [s for s in suggestions if not s['available']]
+        # `available` is now the full result — the workflow already filtered
+        # out taken / premium-priced domains. There's no `unavailable` bucket
+        # to render any more.
+        available = suggestions
+        unavailable = []
 
         # 3. Build the shortlist message as Block Kit blocks with a "Pick this"
         # button next to each available domain. Per TL, a click on Pick This
@@ -413,6 +417,8 @@ if _bolt_app is not None:
                 'requester': requester,
             })
 
+        # Per-extension price cap (just for display in the header)
+        cap_usd = Config.price_cap_for(extension)
         blocks = [
             {
                 'type': 'header',
@@ -426,15 +432,22 @@ if _bolt_app is not None:
                 'elements': [{
                     'type': 'mrkdwn',
                     'text': (f'Vertical: *{vertical}*  ·  Extension: `{extension}`'
-                             f'  ·  Lander: {lander}'),
+                             f'  ·  Lander: {lander}\n'
+                             f'_All shown are available on Namecheap and '
+                             f'priced at-or-below ${cap_usd:.2f}/yr._'),
                 }],
             },
             {'type': 'divider'},
         ]
         for s in available:
+            price = s.get('price')
+            price_label = f'  ·  ${price:.2f}/yr' if price is not None else ''
             blocks.append({
                 'type': 'section',
-                'text': {'type': 'mrkdwn', 'text': f'`{s["domain"]}`'},
+                'text': {
+                    'type': 'mrkdwn',
+                    'text': f'`{s["domain"]}`{price_label}',
+                },
                 'accessory': {
                     'type': 'button',
                     'action_id': 'pick_domain',
@@ -442,17 +455,6 @@ if _bolt_app is not None:
                     'style': 'primary',
                     'value': _button_value(s['domain']),
                 },
-            })
-
-        if unavailable:
-            blocks.append({'type': 'divider'})
-            taken = ', '.join(f'`{u["domain"]}`' for u in unavailable)
-            blocks.append({
-                'type': 'context',
-                'elements': [{
-                    'type': 'mrkdwn',
-                    'text': f'_Already taken ({len(unavailable)}): {taken}_',
-                }],
             })
 
         client.chat_postMessage(
