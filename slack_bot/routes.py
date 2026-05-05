@@ -417,8 +417,22 @@ if _bolt_app is not None:
                 'requester': requester,
             })
 
-        # Per-extension price cap (just for display in the header)
-        cap_usd = Config.price_cap_for(extension)
+        # Header price-cap label depends on whether the user picked one
+        # extension or asked for "any" (mixed cheapest)
+        if extension == 'any':
+            cap_label = (
+                'Mixed extensions — sorted cheapest first. '
+                '.com priced under $15, other extensions ≤$5.'
+            )
+            ext_display = 'Any (cheapest first)'
+        else:
+            cap_usd = Config.price_cap_for(extension)
+            cap_label = (
+                f'All shown are available on Namecheap and '
+                f'priced at-or-below ${cap_usd:.2f}/yr.'
+            )
+            ext_display = extension
+
         blocks = [
             {
                 'type': 'header',
@@ -431,10 +445,8 @@ if _bolt_app is not None:
                 'type': 'context',
                 'elements': [{
                     'type': 'mrkdwn',
-                    'text': (f'Vertical: *{vertical}*  ·  Extension: `{extension}`'
-                             f'  ·  Lander: {lander}\n'
-                             f'_All shown are available on Namecheap and '
-                             f'priced at-or-below ${cap_usd:.2f}/yr._'),
+                    'text': (f'Vertical: *{vertical}*  ·  Extension: `{ext_display}`'
+                             f'  ·  Lander: {lander}\n_{cap_label}_'),
                 }],
             },
             {'type': 'divider'},
@@ -1127,15 +1139,18 @@ _NEW_DOMAIN_MODAL = {
                 'type': 'static_select',
                 'action_id': 'extension_select',
                 'initial_option': {
-                    'text': {'type': 'plain_text', 'text': '.com'},
-                    'value': '.com',
+                    'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'},
+                    'value': 'any',
                 },
                 'options': [
-                    {'text': {'type': 'plain_text', 'text': '.com'},  'value': '.com'},
-                    {'text': {'type': 'plain_text', 'text': '.pro'},  'value': '.pro'},
-                    {'text': {'type': 'plain_text', 'text': '.site'}, 'value': '.site'},
-                    {'text': {'type': 'plain_text', 'text': '.net'},  'value': '.net'},
-                    {'text': {'type': 'plain_text', 'text': '.io'},   'value': '.io'},
+                    {'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'}, 'value': 'any'},
+                    {'text': {'type': 'plain_text', 'text': '.com  (under $15)'},    'value': '.com'},
+                    {'text': {'type': 'plain_text', 'text': '.pro  (~$4)'},          'value': '.pro'},
+                    {'text': {'type': 'plain_text', 'text': '.info (~$4)'},          'value': '.info'},
+                    {'text': {'type': 'plain_text', 'text': '.site (~$1)'},          'value': '.site'},
+                    {'text': {'type': 'plain_text', 'text': '.live (~$3)'},          'value': '.live'},
+                    {'text': {'type': 'plain_text', 'text': '.top  (~$3)'},          'value': '.top'},
+                    {'text': {'type': 'plain_text', 'text': '.icu  (~$3)'},          'value': '.icu'},
                 ],
             },
         },
