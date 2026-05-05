@@ -31,7 +31,7 @@ class WorkflowRequest:
     """Inputs for Path B (new domain). Phase 5 fleshes this out."""
     requester_slack_id: str
     vertical: Optional[str] = None
-    example_domains: List[str] = field(default_factory=list)
+    audience: Optional[str] = None
     extension: Optional[str] = None
     lander_url: Optional[str] = None
     chosen_domain: Optional[str] = None
@@ -168,43 +168,128 @@ def run_existing_domain_workflow(
     )
 
 
+# When the user picks "Any" extension, we sweep across these cheap TLDs
+# and return the cheapest available results. Order matters — earlier
+# entries get tried first per LLM batch, so the cheapest TLDs surface
+# faster. .com is included so .com names still show up in mixed mode.
+_ANY_EXTENSION_SWEEP = [
+    '.site', '.icu', '.top', '.live', '.pro', '.info', '.com',
+]
+
+
 def suggest_new_domains(
     vertical: str,
-    example_domains: List[str],
-    extension: str = '.com',
-    count: int = 10,
+    audience: str = '',
+    extension: str = 'any',
+    count: int = 5,
+    max_attempts: int = 4,
 ) -> List[dict]:
-    """Path B step 1 — suggest available new-domain names.
+    """Path B step 1 — suggest *available* + *price-filtered* new domain names.
 
-    Composes ChatGPT (for naming style) with Namecheap (for availability).
-    Both providers fall back to deterministic stubs when API keys are absent
-    (see domain_assistant/), so this function works end-to-end in local dev
-    without any external credentials.
+    Composes:
+      • LLM for naming (vertical + optional audience/angle inform style)
+      • Namecheap `domains.check` for availability
+      • Namecheap `users.getPricing` for register price
+      • Per-extension price cap from Config.DOMAIN_PRICE_CAP_USD
+        (TL spec 2026-05-05: .com under $15, others under-or-equal $5)
 
-    Returns a list shaped like:
-      [{'domain': 'foo.com', 'available': True}, ...]
-    sorted with available domains first.
+    Two modes based on `extension`:
+      • `'any'` (default) — sweep across cheap TLDs (.site, .icu, .top,
+        .live, .pro, .info, .com) and return the 5 cheapest available.
+      • `'.com'` / `'.pro'` / etc. — restrict to that TLD only.
+
+    `audience` is the marketer's free-text description of WHO the
+    campaign is for (e.g. "seniors looking for medigap"). Optional —
+    pass an empty string when no audience info is provided.
+
+    Returns up to `count` rows shaped like
+        {'domain': str, 'available': True, 'price': 9.18, 'extension': '.com'}.
+    Empty list if nothing qualifies after max_attempts.
     """
     if not vertical:
         raise ValueError("'vertical' is required")
-    if extension and not extension.startswith('.'):
+    if not extension:
+        extension = 'any'
+
+    if extension == 'any':
+        return _suggest_across_extensions(
+            vertical, audience, count, max_attempts,
+        )
+
+    if not extension.startswith('.'):
         extension = '.' + extension
-
-    suggestions = chatgpt.suggest_domains(
-        vertical=vertical,
-        example_domains=example_domains or [],
-        extension=extension,
-        count=count,
+    return _suggest_for_extension(
+        vertical, audience, extension, count, max_attempts,
     )
-    availability = namecheap_check.check_availability(suggestions)
 
-    results = [
-        {'domain': d, 'available': bool(availability.get(d, False))}
-        for d in suggestions
-    ]
-    # Available domains first, otherwise preserve original order.
-    results.sort(key=lambda r: not r['available'])
-    return results
+
+def _suggest_for_extension(
+    vertical: str, audience: str, extension: str,
+    count: int, max_attempts: int,
+) -> List[dict]:
+    """Single-extension search — generate, filter to available + price-capped,
+    retry until count is satisfied or attempts exhausted."""
+    cap = Config.price_cap_for(extension)
+    qualifying: List[dict] = []
+    seen: set = set()
+    # Most "obvious" candidates (cheapauto.com, lowrate.com, etc.) are
+    # squatter-owned. Generate ~6x the count we need per attempt — only
+    # 1-2 in 30 typical LLM suggestions actually clear Namecheap.
+    candidates_per_attempt = max(30, count * 6)
+
+    for attempt in range(max_attempts):
+        if len(qualifying) >= count:
+            break
+        candidates = chatgpt.suggest_domains(
+            vertical=vertical,
+            audience=audience,
+            extension=extension,
+            count=candidates_per_attempt,
+        )
+        candidates = [d for d in candidates if d not in seen]
+        seen.update(candidates)
+        if not candidates:
+            continue
+
+        checked = namecheap_check.check_availability_and_price(
+            candidates, extension=extension,
+        )
+        for r in checked:
+            if not r['available']:
+                continue
+            price = r.get('price')
+            if price is None or price > cap:
+                continue
+            qualifying.append(r)
+            if len(qualifying) >= count:
+                break
+
+    return qualifying[:count]
+
+
+def _suggest_across_extensions(
+    vertical: str, audience: str, count: int, max_attempts: int,
+) -> List[dict]:
+    """Mixed-extension search — try each cheap TLD until we have `count`
+    available + price-capped domains, then sort by price ascending so
+    the cheapest options show first.
+    """
+    qualifying: List[dict] = []
+
+    for ext in _ANY_EXTENSION_SWEEP:
+        if len(qualifying) >= count:
+            break
+        per_ext_target = min(2, count - len(qualifying))
+
+        results = _suggest_for_extension(
+            vertical, audience, ext, per_ext_target, max_attempts=2,
+        )
+        for r in results:
+            r['extension'] = ext
+        qualifying.extend(results)
+
+    qualifying.sort(key=lambda r: r.get('price') or 999.0)
+    return qualifying[:count]
 
 
 def run_new_domain_workflow(req: WorkflowRequest) -> WorkflowResult:

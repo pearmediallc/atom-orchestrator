@@ -56,12 +56,19 @@ def logged_in_client(atom_running):
 def tmp_inventory(tmp_path, monkeypatch):
     """Per-test SQLite inventory at a temp path. Tests using this fixture
     get a freshly initialised, empty store, isolated from each other and
-    from the dev database.
+    from the dev database — and CRITICALLY also isolated from any
+    DATABASE_URL pointing at production Postgres.
+
+    Without the DATABASE_URL override, tests would write to production
+    Postgres (we found this out the hard way on 2026-05-05 when
+    Phase 8 changes triggered import-csv tests that inserted real1.com /
+    ex.com / etc. into production before this fix landed).
     """
     from config import Config
     from inventory import store
 
     db_path = str(tmp_path / 'inventory.db')
     monkeypatch.setattr(Config, 'INVENTORY_DB_PATH', db_path)
+    monkeypatch.setattr(Config, 'DATABASE_URL', '')   # force SQLite path
     store.init_db()
     return store

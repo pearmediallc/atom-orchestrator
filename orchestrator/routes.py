@@ -60,18 +60,19 @@ def existing_domain():
 def new_domain_suggest():
     """POST /workflow/new-domain/suggest
     body: {
-      vertical:        "auto-insurance",   required
-      example_domains: ["a.com", "b.com"], optional seeds for ChatGPT
-      extension:       ".com",             default ".com"
-      count:           10                   default 10
+      vertical:  "auto-insurance",                required
+      audience:  "seniors looking for medigap",   optional, free text
+      extension: ".com" | ".pro" | "any",         default "any"
+      count:     5                                default 5
     }
 
-    Returns suggestion list sorted with available-first:
-      { suggestions: [{domain, available}, ...], count: N }
+    Returns availability + price-filtered list:
+      { suggestions: [{domain, available, price, extension}, ...], count: N }
 
-    Phase 5 — uses ChatGPT + Namecheap stubs when API keys are absent
-    (see domain_assistant/). Drop in OPENAI_API_KEY + NAMECHEAP_* in .env
-    to switch to real calls without changing this code.
+    Phase 8 — when extension is "any", sweeps cheap TLDs and returns
+    cheapest-available first. Per-extension price caps from Config
+    (.com under $15, others ≤$5). Falls back to deterministic stubs in
+    domain_assistant/ when API keys are absent.
     """
     body = request.get_json(silent=True) or {}
 
@@ -82,9 +83,9 @@ def new_domain_suggest():
     try:
         results = suggest_new_domains(
             vertical=vertical,
-            example_domains=body.get('example_domains') or [],
-            extension=body.get('extension') or '.com',
-            count=int(body.get('count') or 10),
+            audience=(body.get('audience') or '').strip(),
+            extension=body.get('extension') or 'any',
+            count=int(body.get('count') or 5),
         )
     except (ValueError, NotImplementedError) as e:
         return jsonify({'error': str(e)}), 400

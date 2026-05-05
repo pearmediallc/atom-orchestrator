@@ -37,25 +37,39 @@ def _stub_suggestions(vertical: str, extension: str, count: int) -> List[str]:
     return [f'{vertical}-stub-{i}.{ext}' for i in range(1, count + 1)]
 
 
-def _build_prompt(vertical: str, example_domains: List[str],
+def _build_prompt(vertical: str, audience: str,
                   extension: str, count: int) -> str:
-    examples_line = (
-        f'Names I like the style of: {", ".join(example_domains)}.'
-        if example_domains else
-        '(No example names provided — use your judgement on style.)'
+    audience_line = (
+        f'Audience / angle: {audience}.'
+        if audience else
+        '(No specific audience given — generate broad options for the vertical.)'
     )
     return (
-        f'Suggest {count} domain-name ideas for a {vertical!r} '
-        f'landing page.\n'
-        f'{examples_line}\n\n'
-        f'Requirements:\n'
+        f'You are a domain-name generator for an affiliate-marketing team '
+        f'(Pear Media). Suggest {count} landing-page domain-name ideas '
+        f'for the *{vertical}* vertical.\n'
+        f'{audience_line}\n\n'
+        f'CRITICAL — names must actually be available to register on '
+        f'Namecheap. Short single-word names like "cheapauto.com" or '
+        f'"lowrate.com" are virtually ALWAYS taken by squatters. Aim for:\n'
+        f'- 3-word compound names — e.g. "carguardianpro", "safetyfirstauto", '
+        f'"fixyourhomenow", "drivesafetyhub"\n'
+        f'- Brandable made-up words — e.g. "instapolicy", "flexicover", '
+        f'"swiftquoter", "easyrater"\n'
+        f'- Descriptive phrases joined with hyphens — e.g. "best-{vertical}-2026", '
+        f'"smart-{vertical}-finder", "your-{vertical}-quote"\n'
+        f'\n'
+        f'Other rules:\n'
         f'- Every name must end with "{extension}"\n'
         f'- Lowercase, no spaces; hyphens OK\n'
-        f'- Short and memorable (under ~25 chars including the extension)\n'
-        f"- Plausibly available — don't suggest big-brand names\n"
+        f'- 12-30 chars including the extension (avoid both very short and very long)\n'
+        f'- DO NOT suggest big-brand names (Geico, Allstate, Aetna, etc.)\n'
+        f'- DO NOT use "the" / "my" / "your" excessively — they don\'t make '
+        f'  a name more available\n'
         f'- One name per line\n'
         f'- No numbering, no quotes, no commentary\n\n'
-        f'Just {count} domain names, nothing else.'
+        f'Generate {count} truly varied options that prioritise '
+        f'availability over brevity.'
     )
 
 
@@ -77,7 +91,7 @@ def _parse_model_response(content: str, extension: str,
     return names[:count]
 
 
-def suggest_domains(vertical: str, example_domains: List[str],
+def suggest_domains(vertical: str, audience: str = '',
                     extension: str = '.com', count: int = 10) -> List[str]:
     """Generate `count` domain-name suggestions for the given vertical.
 
@@ -87,7 +101,8 @@ def suggest_domains(vertical: str, example_domains: List[str],
 
     Args:
       vertical: e.g. "auto-insurance"
-      example_domains: 2-3 seed names the MDB likes the style of
+      audience: optional free-text describing target audience / angle
+                (e.g. "seniors looking for medigap"). Empty string OK.
       extension: ".com" / ".pro" / ".site" / etc.
       count: how many to suggest (before any availability filtering)
     """
@@ -120,7 +135,7 @@ def suggest_domains(vertical: str, example_domains: List[str],
             {
                 'role': 'user',
                 'content': _build_prompt(
-                    vertical, example_domains, extension, count,
+                    vertical, audience, extension, count,
                 ),
             },
         ],

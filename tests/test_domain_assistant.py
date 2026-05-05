@@ -15,7 +15,7 @@ def test_chatgpt_stub_returns_requested_count(monkeypatch):
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
     out = chatgpt.suggest_domains(
         vertical='auto-insurance',
-        example_domains=['cheaprates.com', 'quickquote.com'],
+        audience='seniors looking for medigap',
         extension='.com',
         count=5,
     )
@@ -25,7 +25,7 @@ def test_chatgpt_stub_returns_requested_count(monkeypatch):
 def test_chatgpt_stub_uses_vertical_in_names(monkeypatch):
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
     out = chatgpt.suggest_domains(
-        vertical='health-quotes', example_domains=[], extension='.com', count=3,
+        vertical='health-quotes', audience="", extension='.com', count=3,
     )
     for name in out:
         assert 'health-quotes' in name
@@ -34,7 +34,7 @@ def test_chatgpt_stub_uses_vertical_in_names(monkeypatch):
 def test_chatgpt_stub_respects_extension(monkeypatch):
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
     out = chatgpt.suggest_domains(
-        vertical='x', example_domains=[], extension='.pro', count=2,
+        vertical='x', audience="", extension='.pro', count=2,
     )
     for name in out:
         assert name.endswith('.pro')
@@ -44,7 +44,7 @@ def test_chatgpt_short_placeholder_key_falls_back_to_stub(monkeypatch):
     """The .env.example placeholder 'sk-...' must NOT be treated as real."""
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'sk-...')
     out = chatgpt.suggest_domains(
-        vertical='x', example_domains=[], extension='.com', count=2,
+        vertical='x', audience="", extension='.com', count=2,
     )
     assert len(out) == 2
     assert all('stub' in name for name in out)
@@ -54,7 +54,7 @@ def test_grok_placeholder_also_falls_back_to_stub(monkeypatch):
     """Grok / xAI placeholder should also be ignored."""
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', 'xai-...')
     out = chatgpt.suggest_domains(
-        vertical='x', example_domains=[], extension='.com', count=2,
+        vertical='x', audience="", extension='.com', count=2,
     )
     assert len(out) == 2
     assert all('stub' in name for name in out)

@@ -167,41 +167,119 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
 
 # ─── suggest_new_domains (Path B step 1) ──────────────────────────────────
 
-def test_suggest_returns_requested_count(monkeypatch):
-    """Stub path: returns count items, all marked available."""
+def test_suggest_returns_exactly_count_in_stub_mode(monkeypatch):
+    """Stub fallback: returns exactly `count` items, all available, with
+    fake prices under the per-extension cap."""
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
     monkeypatch.setattr(Config, 'NAMECHEAP_API_USER', '')
 
     out = suggest_new_domains(
         vertical='auto-insurance',
-        example_domains=['cheaprates.com'],
+        audience='seniors looking for medigap',
         extension='.com',
-        count=4,
+        count=5,
     )
-    assert len(out) == 4
+    assert len(out) == 5
     for entry in out:
-        assert 'domain' in entry and 'available' in entry
         assert entry['available'] is True
+        assert entry['price'] is not None
+        # Price must respect the .com cap ($15) per Config
+        assert entry['price'] <= 15.0
 
 
-def test_suggest_sorts_available_first(monkeypatch):
-    """When availability mix is partial, available entries come first."""
+def test_suggest_filters_taken_domains(monkeypatch):
+    """Only available + price-capped domains come through."""
     monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
 
-    # Mix: even-indexed names available, odd-indexed taken
-    def fake_check(domains):
-        return {d: (i % 2 == 0) for i, d in enumerate(domains)}
+    # 12 candidates, only the first 5 are "available", rest are taken
+    def fake_check_avail_price(domains, extension):
+        results = []
+        for i, d in enumerate(domains):
+            results.append({
+                'domain': d,
+                'available': i < 5,
+                'price': 9.99,
+            })
+        return results
     monkeypatch.setattr(
-        'orchestrator.workflow.namecheap_check.check_availability',
-        fake_check,
+        'orchestrator.workflow.namecheap_check.check_availability_and_price',
+        fake_check_avail_price,
     )
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='.com', count=6,
+        vertical='x', audience="", extension='.com', count=5,
     )
-    available_flags = [r['available'] for r in out]
-    # All Trues should appear before any Falses
-    assert available_flags == sorted(available_flags, reverse=True)
+    assert len(out) == 5
+    assert all(r['available'] for r in out)
+
+
+def test_suggest_filters_overpriced_domains(monkeypatch):
+    """Available but priced above the .com cap of $15 → excluded."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+
+    def fake_check_avail_price(domains, extension):
+        # Half are at $9 (under cap), half at $50 (premium - over cap)
+        return [
+            {
+                'domain': d,
+                'available': True,
+                'price': 9.0 if i % 2 == 0 else 50.0,
+            }
+            for i, d in enumerate(domains)
+        ]
+    monkeypatch.setattr(
+        'orchestrator.workflow.namecheap_check.check_availability_and_price',
+        fake_check_avail_price,
+    )
+
+    out = suggest_new_domains(
+        vertical='x', audience="", extension='.com', count=5,
+    )
+    # Every returned domain is under the cap
+    for r in out:
+        assert r['price'] <= 15.0
+
+
+def test_suggest_uses_stricter_cap_for_non_com_extensions(monkeypatch):
+    """`.pro` cap is $5, not $15. A $9 .pro domain should be filtered out."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+
+    def fake_check_avail_price(domains, extension):
+        return [
+            {'domain': d, 'available': True, 'price': 9.0}
+            for d in domains
+        ]
+    monkeypatch.setattr(
+        'orchestrator.workflow.namecheap_check.check_availability_and_price',
+        fake_check_avail_price,
+    )
+
+    out = suggest_new_domains(
+        vertical='x', audience="", extension='.pro', count=5,
+    )
+    # All candidates priced $9, .pro cap is $5, nothing qualifies
+    assert out == []
+
+
+def test_suggest_excludes_unknown_price(monkeypatch):
+    """If Namecheap doesn't return a price (creds missing / API failure),
+    those domains are excluded — we can't confirm they're under the cap."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+
+    def fake_check_avail_price(domains, extension):
+        return [
+            {'domain': d, 'available': True, 'price': None}
+            for d in domains
+        ]
+    monkeypatch.setattr(
+        'orchestrator.workflow.namecheap_check.check_availability_and_price',
+        fake_check_avail_price,
+    )
+
+    out = suggest_new_domains(
+        vertical='x', audience="", extension='.com', count=5,
+    )
+    assert out == []
 
 
 def test_suggest_normalises_extension_without_dot(monkeypatch):
@@ -210,7 +288,7 @@ def test_suggest_normalises_extension_without_dot(monkeypatch):
     monkeypatch.setattr(Config, 'NAMECHEAP_API_USER', '')
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='pro', count=2,
+        vertical='x', audience="", extension='pro', count=2,
     )
     for r in out:
         assert r['domain'].endswith('.pro')
@@ -219,5 +297,5 @@ def test_suggest_normalises_extension_without_dot(monkeypatch):
 def test_suggest_rejects_empty_vertical():
     with pytest.raises(ValueError):
         suggest_new_domains(
-            vertical='', example_domains=[], extension='.com', count=5,
+            vertical='', audience="", extension='.com', count=5,
         )
