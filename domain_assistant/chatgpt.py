@@ -37,17 +37,18 @@ def _stub_suggestions(vertical: str, extension: str, count: int) -> List[str]:
     return [f'{vertical}-stub-{i}.{ext}' for i in range(1, count + 1)]
 
 
-def _build_prompt(vertical: str, example_domains: List[str],
+def _build_prompt(vertical: str, audience: str,
                   extension: str, count: int) -> str:
-    examples_line = (
-        f'Style examples I like: {", ".join(example_domains)}.'
-        if example_domains else
-        '(No example names provided — use your judgement on style.)'
+    audience_line = (
+        f'Audience / angle: {audience}.'
+        if audience else
+        '(No specific audience given — generate broad options for the vertical.)'
     )
     return (
-        f'Suggest {count} domain-name ideas for a {vertical!r} '
-        f'landing page.\n'
-        f'{examples_line}\n\n'
+        f'You are a domain-name generator for an affiliate-marketing team '
+        f'(Pear Media). Suggest {count} landing-page domain-name ideas '
+        f'for the *{vertical}* vertical.\n'
+        f'{audience_line}\n\n'
         f'CRITICAL — names must actually be available to register on '
         f'Namecheap. Short single-word names like "cheapauto.com" or '
         f'"lowrate.com" are virtually ALWAYS taken by squatters. Aim for:\n'
@@ -90,7 +91,7 @@ def _parse_model_response(content: str, extension: str,
     return names[:count]
 
 
-def suggest_domains(vertical: str, example_domains: List[str],
+def suggest_domains(vertical: str, audience: str = '',
                     extension: str = '.com', count: int = 10) -> List[str]:
     """Generate `count` domain-name suggestions for the given vertical.
 
@@ -100,7 +101,8 @@ def suggest_domains(vertical: str, example_domains: List[str],
 
     Args:
       vertical: e.g. "auto-insurance"
-      example_domains: 2-3 seed names the MDB likes the style of
+      audience: optional free-text describing target audience / angle
+                (e.g. "seniors looking for medigap"). Empty string OK.
       extension: ".com" / ".pro" / ".site" / etc.
       count: how many to suggest (before any availability filtering)
     """
@@ -133,7 +135,7 @@ def suggest_domains(vertical: str, example_domains: List[str],
             {
                 'role': 'user',
                 'content': _build_prompt(
-                    vertical, example_domains, extension, count,
+                    vertical, audience, extension, count,
                 ),
             },
         ],

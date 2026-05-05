@@ -346,14 +346,9 @@ if _bolt_app is not None:
         ack()
         values = view['state']['values']
         vertical = (values['vertical_block']['vertical_input']['value'] or '').strip()
-        examples_raw = (values['examples_block']['examples_input']['value'] or '').strip()
+        audience = (values['audience_block']['audience_input']['value'] or '').strip()
         lander = (values['lander_block']['lander_input']['value'] or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
-
-        # Parse comma-separated examples into a list, dropping blanks.
-        example_domains = [
-            e.strip() for e in examples_raw.split(',') if e.strip()
-        ]
 
         requester = body['user']['id']
 
@@ -362,8 +357,8 @@ if _bolt_app is not None:
             ':sparkles: *New-domain request received* :sparkles:\n'
             f'• Requested by: <@{requester}>\n'
             f'• Vertical: `{vertical}`\n'
-            f"• Example domains: `{examples_raw or '(none)'}`\n"
-            f'• Lander URL: {lander}\n'
+            + (f"• Audience / angle: _{audience}_\n" if audience else '')
+            + f'• Lander URL: {lander}\n'
             f'• Extension: `{extension}`\n'
             ':mag: Generating suggestions and checking Namecheap availability…'
         )
@@ -375,7 +370,7 @@ if _bolt_app is not None:
         try:
             suggestions = suggest_new_domains(
                 vertical=vertical,
-                example_domains=example_domains,
+                audience=audience,
                 extension=extension,
                 count=5,
             )
@@ -1108,15 +1103,21 @@ _NEW_DOMAIN_MODAL = {
         },
         {
             'type': 'input',
-            'block_id': 'examples_block',
+            'block_id': 'audience_block',
             'optional': True,
             'label': {'type': 'plain_text',
-                      'text': 'Example domain names (comma-separated, optional)'},
+                      'text': 'Audience or angle (optional)'},
+            'hint': {
+                'type': 'plain_text',
+                'text': ('Who are you targeting and how. The bot will use '
+                         'this to match name style to the campaign. Leave '
+                         'blank if the vertical alone is enough.'),
+            },
             'element': {
                 'type': 'plain_text_input',
-                'action_id': 'examples_input',
+                'action_id': 'audience_input',
                 'placeholder': {'type': 'plain_text',
-                                'text': 'cheaprates.com, quickquote.com'},
+                                'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
             },
         },
         {

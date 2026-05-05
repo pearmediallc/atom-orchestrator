@@ -175,7 +175,7 @@ def test_suggest_returns_exactly_count_in_stub_mode(monkeypatch):
 
     out = suggest_new_domains(
         vertical='auto-insurance',
-        example_domains=['cheaprates.com'],
+        audience='seniors looking for medigap',
         extension='.com',
         count=5,
     )
@@ -207,7 +207,7 @@ def test_suggest_filters_taken_domains(monkeypatch):
     )
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='.com', count=5,
+        vertical='x', audience="", extension='.com', count=5,
     )
     assert len(out) == 5
     assert all(r['available'] for r in out)
@@ -233,7 +233,7 @@ def test_suggest_filters_overpriced_domains(monkeypatch):
     )
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='.com', count=5,
+        vertical='x', audience="", extension='.com', count=5,
     )
     # Every returned domain is under the cap
     for r in out:
@@ -255,7 +255,7 @@ def test_suggest_uses_stricter_cap_for_non_com_extensions(monkeypatch):
     )
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='.pro', count=5,
+        vertical='x', audience="", extension='.pro', count=5,
     )
     # All candidates priced $9, .pro cap is $5, nothing qualifies
     assert out == []
@@ -277,7 +277,7 @@ def test_suggest_excludes_unknown_price(monkeypatch):
     )
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='.com', count=5,
+        vertical='x', audience="", extension='.com', count=5,
     )
     assert out == []
 
@@ -288,7 +288,7 @@ def test_suggest_normalises_extension_without_dot(monkeypatch):
     monkeypatch.setattr(Config, 'NAMECHEAP_API_USER', '')
 
     out = suggest_new_domains(
-        vertical='x', example_domains=[], extension='pro', count=2,
+        vertical='x', audience="", extension='pro', count=2,
     )
     for r in out:
         assert r['domain'].endswith('.pro')
@@ -297,5 +297,5 @@ def test_suggest_normalises_extension_without_dot(monkeypatch):
 def test_suggest_rejects_empty_vertical():
     with pytest.raises(ValueError):
         suggest_new_domains(
-            vertical='', example_domains=[], extension='.com', count=5,
+            vertical='', audience="", extension='.com', count=5,
         )

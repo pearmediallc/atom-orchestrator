@@ -31,7 +31,7 @@ class WorkflowRequest:
     """Inputs for Path B (new domain). Phase 5 fleshes this out."""
     requester_slack_id: str
     vertical: Optional[str] = None
-    example_domains: List[str] = field(default_factory=list)
+    audience: Optional[str] = None
     extension: Optional[str] = None
     lander_url: Optional[str] = None
     chosen_domain: Optional[str] = None
@@ -179,7 +179,7 @@ _ANY_EXTENSION_SWEEP = [
 
 def suggest_new_domains(
     vertical: str,
-    example_domains: List[str],
+    audience: str = '',
     extension: str = 'any',
     count: int = 5,
     max_attempts: int = 4,
@@ -187,7 +187,7 @@ def suggest_new_domains(
     """Path B step 1 — suggest *available* + *price-filtered* new domain names.
 
     Composes:
-      • ChatGPT-style LLM for naming
+      • LLM for naming (vertical + optional audience/angle inform style)
       • Namecheap `domains.check` for availability
       • Namecheap `users.getPricing` for register price
       • Per-extension price cap from Config.DOMAIN_PRICE_CAP_USD
@@ -198,16 +198,13 @@ def suggest_new_domains(
         .live, .pro, .info, .com) and return the 5 cheapest available.
       • `'.com'` / `'.pro'` / etc. — restrict to that TLD only.
 
-    Tries up to `max_attempts` LLM batches per extension to assemble
-    `count` qualifying domains. Returns whatever it found if the cap
-    can't be met after max_attempts.
+    `audience` is the marketer's free-text description of WHO the
+    campaign is for (e.g. "seniors looking for medigap"). Optional —
+    pass an empty string when no audience info is provided.
 
-    Each result row:
-        {'domain': str, 'available': True, 'price': 9.18}
-
-    The returned list is suitable to render directly as Pick this buttons.
-    Stubs in domain_assistant/ keep the function working end-to-end in
-    local dev without any real API keys.
+    Returns up to `count` rows shaped like
+        {'domain': str, 'available': True, 'price': 9.18, 'extension': '.com'}.
+    Empty list if nothing qualifies after max_attempts.
     """
     if not vertical:
         raise ValueError("'vertical' is required")
@@ -215,20 +212,19 @@ def suggest_new_domains(
         extension = 'any'
 
     if extension == 'any':
-        # Mixed mode — sweep across cheap extensions, sort by price.
         return _suggest_across_extensions(
-            vertical, example_domains, count, max_attempts,
+            vertical, audience, count, max_attempts,
         )
 
     if not extension.startswith('.'):
         extension = '.' + extension
     return _suggest_for_extension(
-        vertical, example_domains, extension, count, max_attempts,
+        vertical, audience, extension, count, max_attempts,
     )
 
 
 def _suggest_for_extension(
-    vertical: str, example_domains: List[str], extension: str,
+    vertical: str, audience: str, extension: str,
     count: int, max_attempts: int,
 ) -> List[dict]:
     """Single-extension search — generate, filter to available + price-capped,
@@ -246,7 +242,7 @@ def _suggest_for_extension(
             break
         candidates = chatgpt.suggest_domains(
             vertical=vertical,
-            example_domains=example_domains or [],
+            audience=audience,
             extension=extension,
             count=candidates_per_attempt,
         )
@@ -272,33 +268,26 @@ def _suggest_for_extension(
 
 
 def _suggest_across_extensions(
-    vertical: str, example_domains: List[str], count: int, max_attempts: int,
+    vertical: str, audience: str, count: int, max_attempts: int,
 ) -> List[dict]:
     """Mixed-extension search — try each cheap TLD until we have `count`
     available + price-capped domains, then sort by price ascending so
     the cheapest options show first.
-
-    Walks _ANY_EXTENSION_SWEEP in order. Each TLD gets ~count/2 candidates
-    so we don't burn the entire LLM budget on one TLD. Stops as soon as
-    we have count qualifying domains or all extensions exhausted.
     """
     qualifying: List[dict] = []
 
     for ext in _ANY_EXTENSION_SWEEP:
         if len(qualifying) >= count:
             break
-        # Cap each extension at 2 results per call so the final list
-        # includes variety across 3+ TLDs rather than 5 of the cheapest.
         per_ext_target = min(2, count - len(qualifying))
 
         results = _suggest_for_extension(
-            vertical, example_domains, ext, per_ext_target, max_attempts=2,
+            vertical, audience, ext, per_ext_target, max_attempts=2,
         )
         for r in results:
             r['extension'] = ext
         qualifying.extend(results)
 
-    # Sort by price ascending so cheapest options surface at the top
     qualifying.sort(key=lambda r: r.get('price') or 999.0)
     return qualifying[:count]
 
