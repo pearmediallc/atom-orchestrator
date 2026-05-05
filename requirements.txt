@@ -8,5 +8,10 @@ slack-bolt>=1.18.0
 # Phase 4: OpenAI for domain suggestions
 openai>=1.40.0
 
+# Phase 6: Postgres for production inventory store (SQLite stays the
+# default for local dev + tests; psycopg2 is only loaded when
+# DATABASE_URL points at Postgres).
+psycopg2-binary>=2.9.9
+
 # Tests
 pytest>=8.0.0

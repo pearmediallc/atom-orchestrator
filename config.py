@@ -24,7 +24,14 @@ class Config:
     SLACK_APP_TOKEN = os.getenv('SLACK_APP_TOKEN')
 
     # Phase 3 — inventory
+    # SQLite is the default for local dev / tests (zero setup, one file).
     INVENTORY_DB_PATH = os.getenv('INVENTORY_DB_PATH', './inventory.db')
+
+    # Production override: when set to a Postgres connection string
+    # (postgres://… or postgresql://…), inventory.store uses Postgres
+    # instead of SQLite. Required for Render deploy because Render's
+    # free tier has no persistent disk for SQLite.
+    DATABASE_URL = (os.getenv('DATABASE_URL', '') or '').strip()
 
     # Phase 4/5 — LLM provider (OpenAI-compatible API: works with OpenAI,
     # Grok/xAI, any other provider that exposes the OpenAI Chat Completions
