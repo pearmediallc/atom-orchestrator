@@ -92,6 +92,150 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
     _handler = SlackRequestHandler(_bolt_app)
 
 
+# ─── /new-domain shortlist builder (shared by modal submission + refresh) ─
+
+def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
+                                       extension, lander, requester):
+    """Render the /new-domain shortlist as Slack Block Kit blocks.
+
+    Used by both the initial modal submission and the "Show 5 more"
+    refresh handler. Each domain row gets a Pick this button; the
+    bottom of the message gets a Show-5-more button that re-runs
+    the same query with fresh LLM output.
+    """
+    if extension == 'any':
+        cap_label = (
+            'Mixed extensions — sorted cheapest first. '
+            '.com priced under $15, other extensions ≤$5.'
+        )
+        ext_display = 'Any (cheapest first)'
+    else:
+        cap_usd = Config.price_cap_for(extension)
+        cap_label = (
+            f'All shown are available on Namecheap and '
+            f'priced at-or-below ${cap_usd:.2f}/yr.'
+        )
+        ext_display = extension
+
+    audience_line = f'  ·  Audience: _{audience}_' if audience else ''
+
+    blocks = [
+        {
+            'type': 'header',
+            'text': {
+                'type': 'plain_text',
+                'text': f'{len(suggestions)} available — pick one to continue',
+            },
+        },
+        {
+            'type': 'context',
+            'elements': [{
+                'type': 'mrkdwn',
+                'text': (f'Vertical: *{vertical}*  ·  Extension: `{ext_display}`'
+                         f'{audience_line}  ·  Lander: {lander}\n_{cap_label}_'),
+            }],
+        },
+        {'type': 'divider'},
+    ]
+
+    for s in suggestions:
+        price = s.get('price')
+        price_label = f'  ·  ${price:.2f}/yr' if price is not None else ''
+        # When extension='any', each domain has its own real TLD on s['extension'].
+        # Pin that into the per-domain button payload so downstream Path B
+        # logic (TL approval card, Utkarsh purchase request, etc.) sees the
+        # actual TLD, not the literal 'any'.
+        per_domain_extension = s.get('extension') or extension
+        blocks.append({
+            'type': 'section',
+            'text': {
+                'type': 'mrkdwn',
+                'text': f'`{s["domain"]}`{price_label}',
+            },
+            'accessory': {
+                'type': 'button',
+                'action_id': 'pick_domain',
+                'text': {'type': 'plain_text', 'text': 'Pick this'},
+                'style': 'primary',
+                'value': json.dumps({
+                    'domain': s['domain'],
+                    'vertical': vertical,
+                    'lander': lander,
+                    'extension': per_domain_extension,
+                    'requester': requester,
+                }),
+            },
+        })
+
+    blocks.append({'type': 'divider'})
+    blocks.append({
+        'type': 'actions',
+        'elements': [{
+            'type': 'button',
+            'action_id': 'refresh_domain_suggestions',
+            'text': {'type': 'plain_text', 'text': ':arrows_counterclockwise: Show 5 more'},
+            'value': json.dumps({
+                'vertical': vertical,
+                'audience': audience,
+                'extension': extension,
+                'lander': lander,
+                'requester': requester,
+            }),
+        }],
+    })
+    return blocks
+
+
+def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
+                                vertical, audience, extension,
+                                lander, requester):
+    """Worker that regenerates the /new-domain shortlist. Runs in a
+    daemon thread so the original Slack action click can ack within 3s
+    while the LLM + Namecheap calls take 15–30s.
+
+    Edits the placeholder message in-place to either show the new
+    shortlist or surface a clear failure reason.
+    """
+    try:
+        suggestions = suggest_new_domains(
+            vertical=vertical,
+            audience=audience,
+            extension=extension,
+            count=5,
+        )
+    except Exception as e:
+        logger.exception('Phase 8 refresh failed for vertical=%s', vertical)
+        client.chat_update(
+            channel=channel, ts=placeholder_ts,
+            text=(f':warning: Could not regenerate suggestions: '
+                  f'`{type(e).__name__}: {e}`'),
+        )
+        return
+
+    if not suggestions:
+        client.chat_update(
+            channel=channel, ts=placeholder_ts,
+            text=(':no_entry: No new available + price-capped domains found. '
+                  'Try a different extension or audience via `/new-domain`.'),
+        )
+        return
+
+    new_blocks = _build_new_domain_shortlist_blocks(
+        suggestions=suggestions,
+        vertical=vertical,
+        audience=audience,
+        extension=extension,
+        lander=lander,
+        requester=requester,
+    )
+    client.chat_update(
+        channel=channel,
+        ts=placeholder_ts,
+        blocks=new_blocks,
+        text=f'{len(suggestions)} fresh domains for {vertical}',
+    )
+
+
 # ─── Phase 7 worker (module-level so tests can import it) ──────────────────
 
 def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
@@ -400,70 +544,14 @@ if _bolt_app is not None:
             )
             return
 
-        # Context that the click handler needs to know what was picked. Encoded
-        # into each button's `value` field (Slack caps button values at ~2k
-        # chars, this fits comfortably).
-        def _button_value(domain: str) -> str:
-            return json.dumps({
-                'domain': domain,
-                'vertical': vertical,
-                'lander': lander,
-                'extension': extension,
-                'requester': requester,
-            })
-
-        # Header price-cap label depends on whether the user picked one
-        # extension or asked for "any" (mixed cheapest)
-        if extension == 'any':
-            cap_label = (
-                'Mixed extensions — sorted cheapest first. '
-                '.com priced under $15, other extensions ≤$5.'
-            )
-            ext_display = 'Any (cheapest first)'
-        else:
-            cap_usd = Config.price_cap_for(extension)
-            cap_label = (
-                f'All shown are available on Namecheap and '
-                f'priced at-or-below ${cap_usd:.2f}/yr.'
-            )
-            ext_display = extension
-
-        blocks = [
-            {
-                'type': 'header',
-                'text': {
-                    'type': 'plain_text',
-                    'text': f'{len(available)} available — pick one to continue',
-                },
-            },
-            {
-                'type': 'context',
-                'elements': [{
-                    'type': 'mrkdwn',
-                    'text': (f'Vertical: *{vertical}*  ·  Extension: `{ext_display}`'
-                             f'  ·  Lander: {lander}\n_{cap_label}_'),
-                }],
-            },
-            {'type': 'divider'},
-        ]
-        for s in available:
-            price = s.get('price')
-            price_label = f'  ·  ${price:.2f}/yr' if price is not None else ''
-            blocks.append({
-                'type': 'section',
-                'text': {
-                    'type': 'mrkdwn',
-                    'text': f'`{s["domain"]}`{price_label}',
-                },
-                'accessory': {
-                    'type': 'button',
-                    'action_id': 'pick_domain',
-                    'text': {'type': 'plain_text', 'text': 'Pick this'},
-                    'style': 'primary',
-                    'value': _button_value(s['domain']),
-                },
-            })
-
+        blocks = _build_new_domain_shortlist_blocks(
+            suggestions=available,
+            vertical=vertical,
+            audience=audience,
+            extension=extension,
+            lander=lander,
+            requester=requester,
+        )
         client.chat_postMessage(
             channel=requester,
             blocks=blocks,
@@ -512,6 +600,65 @@ if _bolt_app is not None:
             ],
         )
         return purchaser
+
+    @_bolt_app.action('refresh_domain_suggestions')
+    def handle_refresh_suggestions(ack, body, client):
+        """User clicked "Show 5 more" on a /new-domain shortlist.
+
+        Regenerates 5 fresh domains with the same vertical / audience /
+        extension. The original suggestion message is muted (Pick this
+        + Show 5 more buttons removed) so the user isn't tempted to
+        click on stale options. A new placeholder message is posted
+        immediately ("generating…"); a daemon thread does the slow LLM
+        + Namecheap work and edits the placeholder into the new
+        shortlist when ready.
+        """
+        ack()
+        try:
+            data = json.loads(body['actions'][0]['value'])
+        except (KeyError, json.JSONDecodeError, IndexError):
+            return
+
+        vertical = data.get('vertical', '')
+        audience = data.get('audience', '')
+        extension = data.get('extension', 'any')
+        lander = data.get('lander', '')
+        requester = data['requester']
+        channel = body['channel']['id']
+        old_ts = body['message']['ts']
+
+        # Mute the old message so the user can't accidentally pick from it
+        client.chat_update(
+            channel=channel,
+            ts=old_ts,
+            text='Older suggestions',
+            blocks=[
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (':information_source: _Older suggestions — see '
+                             'newer ones below._'),
+                }]},
+            ],
+        )
+
+        # Post a placeholder we'll edit in-place when the new list is ready
+        placeholder = client.chat_postMessage(
+            channel=channel,
+            text=':mag: *Generating 5 more suggestions…*\n_15-30 sec; '
+                 'checking Namecheap availability + pricing._',
+        )
+
+        threading.Thread(
+            target=_phase8_refresh_suggestions,
+            args=(client, channel, placeholder['ts']),
+            kwargs={
+                'vertical': vertical, 'audience': audience,
+                'extension': extension, 'lander': lander,
+                'requester': requester,
+            },
+            daemon=True,
+            name=f'phase8-refresh-{vertical}',
+        ).start()
 
     @_bolt_app.action('pick_domain')
     def handle_pick_domain(ack, body, client):
