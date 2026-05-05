@@ -14,7 +14,7 @@ import pytest
 
 from config import Config
 from orchestrator.workflow import WorkflowResult
-from slack_bot.routes import _phase7_run_atom_setup
+from slack_bot.routes import _phase7_run_atom_setup, _parse_lander_url
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -57,8 +57,8 @@ def _patch_workflow(monkeypatch, result: WorkflowResult):
 
 # ─── Tests ─────────────────────────────────────────────────────────────────
 
-def test_worker_warns_when_no_default_bucket_configured(monkeypatch):
-    """Phase 7 enabled but no source bucket → post a clear warning, abort."""
+def test_worker_warns_when_no_url_and_no_default_bucket(monkeypatch):
+    """No lander URL + no default bucket → clear warning, abort."""
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', '')
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', [])
     monkeypatch.setattr(Config, 'PHASE7_LANDER_DEFAULTS', {})
@@ -68,18 +68,17 @@ def test_worker_warns_when_no_default_bucket_configured(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='example.com', vertical='auto-insurance',
         requester='U_REQUESTER',
+        lander_url='',
     )
 
-    # Exactly one message — the warning. No workflow call attempted.
     assert client.chat_postMessage.call_count == 1
     msg = _all_text(client)
-    assert 'no source bucket configured' in msg.lower()
-    assert 'auto-insurance' in msg
+    assert 'cannot deploy' in msg.lower()
 
 
-def test_worker_posts_progress_and_completion_on_success(monkeypatch):
-    """Happy path — kickoff message, completion message, requester DM."""
-    _set_default_bucket(monkeypatch)
+def test_worker_uses_url_derived_bucket_and_folder(monkeypatch):
+    """Happy path — kickoff + completion + DM, source pulled from URL."""
+    _set_default_bucket(monkeypatch)  # set defaults so we can verify URL wins
     captured = _patch_workflow(monkeypatch, WorkflowResult(
         status='completed',
         message='Lander deployed. Live at https://example.com',
@@ -91,29 +90,49 @@ def test_worker_posts_progress_and_completion_on_success(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='example.com', vertical='auto-insurance',
         requester='U_REQUESTER',
+        lander_url='https://safetyfirstauto.pro/h-insure-c/',
     )
 
-    # Three calls: kickoff (thread), completion (thread), DM to requester.
     assert client.chat_postMessage.call_count == 3
     text = _all_text(client)
     assert 'Triggering ATOM setup' in text
+    assert 'parsed from lander URL' in text   # the new origin label
     assert 'ATOM finished' in text
-    assert 'https://example.com' in text
 
-    # The workflow received the resolved defaults
+    # URL-derived source overrides config defaults
     req = captured['req']
-    assert req.target_domain == 'example.com'
-    assert req.source_bucket == 'lander-source-default'
-    assert req.source_folders == ['lander/']
+    assert req.source_bucket == 'safetyfirstauto.pro'
+    assert req.source_folders == ['h-insure-c/']
     assert req.requested_by == 'Slack:U_REQUESTER'
 
-    # Requester got a DM (call with channel=requester user id)
     dm_calls = [
         c for c in client.chat_postMessage.call_args_list
         if c.kwargs.get('channel') == 'U_REQUESTER'
     ]
     assert len(dm_calls) == 1
     assert 'fully deployed' in (dm_calls[0].kwargs.get('text') or '')
+
+
+def test_worker_falls_back_to_config_defaults_when_no_url(monkeypatch):
+    """Empty URL but valid config default → workflow still runs using defaults."""
+    _set_default_bucket(monkeypatch)
+    captured = _patch_workflow(monkeypatch, WorkflowResult(
+        status='completed', message='ok',
+        details={'live_url': 'https://example.com'},
+    ))
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='123.45',
+        target_domain='example.com', vertical='auto-insurance',
+        requester='U_REQUESTER',
+        lander_url='',
+    )
+    req = captured['req']
+    # Falls back to the config defaults
+    assert req.source_bucket == 'lander-source-default'
+    assert req.source_folders == ['lander/']
+    text = _all_text(client)
+    assert 'config defaults' in text
 
 
 def test_worker_reports_failure_with_failed_step(monkeypatch):
@@ -136,6 +155,7 @@ def test_worker_reports_failure_with_failed_step(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='will-fail.com', vertical='auto-insurance',
         requester='U_REQUESTER',
+        lander_url='https://safetyfirstauto.pro/h-insure-c/',
     )
 
     text = _all_text(client)
@@ -170,6 +190,7 @@ def test_worker_recovers_from_workflow_exception(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='boom.com', vertical='auto-insurance',
         requester='U_REQUESTER',
+        lander_url='https://safetyfirstauto.pro/h-insure-c/',
     )
 
     text = _all_text(client)
@@ -177,10 +198,8 @@ def test_worker_recovers_from_workflow_exception(monkeypatch):
     assert 'atom went poof' in text
 
 
-def test_worker_uses_per_vertical_override_when_present(monkeypatch):
-    """If PHASE7_LANDER_DEFAULTS has an entry for the vertical, that wins
-    over the global default.
-    """
+def test_worker_uses_per_vertical_override_when_no_url(monkeypatch):
+    """No URL passed → per-vertical config wins over the global default."""
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', 'global-default')
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', ['default/'])
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
@@ -201,12 +220,42 @@ def test_worker_uses_per_vertical_override_when_present(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='m.com', vertical='medicare',
         requester='U_REQUESTER',
+        lander_url='',  # no URL → fall back to config
     )
 
     req = captured['req']
     assert req.source_bucket == 'medicare-special-bucket'
     assert req.source_account == 'other-vertical'
     assert req.source_folders == ['v2-lander/']
+
+
+# ─── _parse_lander_url ────────────────────────────────────────────────
+
+@pytest.mark.parametrize('url,want_bucket,want_folders', [
+    ('https://safetyfirstauto.pro/h-insure-c/',  'safetyfirstauto.pro', ['h-insure-c/']),
+    ('https://safetyfirstauto.pro/h-insure-c',   'safetyfirstauto.pro', ['h-insure-c/']),
+    ('http://example.com/lander-v3/',            'example.com',         ['lander-v3/']),
+    ('https://abc.com/nested/path/',             'abc.com',             ['nested/path/']),
+])
+def test_parse_lander_url_happy_paths(url, want_bucket, want_folders):
+    bucket, folders, err = _parse_lander_url(url)
+    assert err is None
+    assert bucket == want_bucket
+    assert folders == want_folders
+
+
+@pytest.mark.parametrize('url,err_substr', [
+    ('',                                'empty'),
+    ('https://abc.com/',                'missing a folder path'),
+    ('https://abc.com',                 'missing a folder path'),
+    ('abc.com/lander/',                 'must start with https'),  # no scheme
+    ('ftp://abc.com/lander/',           'must start with https'),
+])
+def test_parse_lander_url_failure_modes(url, err_substr):
+    bucket, folders, err = _parse_lander_url(url)
+    assert bucket == ''
+    assert folders == []
+    assert err and err_substr.lower() in err.lower()
 
 
 def test_phase7_defaults_for_falls_back_to_global():

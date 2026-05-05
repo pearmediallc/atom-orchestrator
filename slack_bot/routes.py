@@ -20,6 +20,7 @@ internally dispatches based on the request body.
 import json
 import logging
 import threading
+from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request
 
 from config import Config
@@ -31,6 +32,40 @@ from orchestrator.workflow import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_lander_url(url: str):
+    """Parse 'https://domain.com/folder/' into (bucket, folders, error_message).
+
+    The lander URL is the user's "where do I want this lander copied FROM"
+    — the host part is treated as the source S3 bucket name (matches ATOM's
+    convention that bucket name == domain), and the path is the folder
+    inside that bucket.
+
+    Returns:
+      (bucket, [folder], None)         on success — folder always ends with '/'
+      ('', [], 'reason')               on failure — caller surfaces the reason
+
+    Examples:
+      'https://safetyfirstauto.pro/h-insure-c/'  → ('safetyfirstauto.pro', ['h-insure-c/'], None)
+      'https://safetyfirstauto.pro/h-insure-c'   → ('safetyfirstauto.pro', ['h-insure-c/'], None)
+      'https://safetyfirstauto.pro/'             → ('', [], 'URL is missing a folder path…')
+      'safetyfirstauto.pro/lander/'              → ('', [], 'URL must start with https://')
+    """
+    if not url:
+        return '', [], 'URL is empty'
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ('http', 'https'):
+        return '', [], 'URL must start with https:// (or http://)'
+    if not parsed.netloc:
+        return '', [], 'URL is missing a domain'
+    folder = parsed.path.strip('/')
+    if not folder:
+        return '', [], (
+            'URL is missing a folder path. Use the form '
+            'https://<bucket>/<folder>/ — e.g. https://safetyfirstauto.pro/h-insure-c/'
+        )
+    return parsed.netloc, [folder + '/'], None
 
 slack_bp = Blueprint('slack', __name__)
 
@@ -60,44 +95,69 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
 # ─── Phase 7 worker (module-level so tests can import it) ──────────────────
 
 def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
-                           vertical, requester):
+                           vertical, requester, lander_url=''):
     """Worker: call run_existing_domain_workflow + post progress to Slack.
 
     Runs in a daemon thread (so the Slack handler can ack quickly).
     Posts thread replies on the original Mark Done message; DMs the
     requester at completion or failure.
 
+    The source bucket + folder come from the user-supplied lander_url
+    (parsed via _parse_lander_url) — the URL itself names the source.
+    Falls back to Config.phase7_defaults_for(vertical) when no URL is
+    available (e.g. legacy buttons that pre-date URL parsing).
+
     Thread-safety: inventory_store opens a fresh sqlite connection per
     call, and the Slack WebClient is stateless wrt the auth token.
     """
-    defaults = Config.phase7_defaults_for(vertical)
+    url_bucket, url_folders, url_err = _parse_lander_url(lander_url)
+    if url_bucket:
+        source_bucket = url_bucket
+        source_folders = url_folders
+        source_files = []
+        # Account still comes from per-vertical config — the URL only
+        # tells us WHERE the files are, not which AWS creds can read them.
+        source_account = Config.phase7_defaults_for(vertical)['source_account']
+        source_origin = f'parsed from lander URL `{lander_url}`'
+    else:
+        defaults = Config.phase7_defaults_for(vertical)
+        source_bucket = defaults['source_bucket']
+        source_folders = defaults['source_folders']
+        source_files = defaults['source_files']
+        source_account = defaults['source_account']
+        source_origin = (
+            'config defaults '
+            f'(URL parse failed: {url_err})' if lander_url
+            else 'config defaults (no lander URL provided)'
+        )
 
-    if not defaults['source_bucket']:
+    if not source_bucket:
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
-            text=(f':warning: *Phase 7 enabled but no source bucket configured '
-                  f'for vertical* `{vertical or "(none)"}`. Set '
-                  '`PHASE7_DEFAULT_SOURCE_BUCKET` (or add an entry to '
-                  '`PHASE7_LANDER_DEFAULTS_JSON`) and redeploy. Inventory was '
-                  'updated but the lander was NOT actually deployed.'),
+            text=(f':warning: *Phase 7 cannot deploy* — '
+                  f'{url_err or "no source bucket configured"}.\n'
+                  'Inventory was updated but the lander was NOT actually deployed.\n'
+                  '_Tip: use the form `https://<bucket>/<folder>/` in the lander '
+                  'URL field next time and the bot will figure out the rest._'),
         )
         return
 
     client.chat_postMessage(
         channel=channel, thread_ts=message_ts,
         text=(f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
-              f'• source bucket: `{defaults["source_bucket"]}`\n'
-              f'• source folders: `{defaults["source_folders"] or "—"}`\n'
+              f'• source bucket: `{source_bucket}`\n'
+              f'• source folders: `{source_folders or "—"}`\n'
+              f'• source resolved from: _{source_origin}_\n'
               '_This usually takes 5–20 minutes (cert validation + '
               'CloudFront)._'),
     )
 
     req = ExistingDomainRequest(
         target_domain=target_domain,
-        source_account=defaults['source_account'],
-        source_bucket=defaults['source_bucket'],
-        source_folders=defaults['source_folders'],
-        source_files=defaults['source_files'],
+        source_account=source_account,
+        source_bucket=source_bucket,
+        source_folders=source_folders,
+        source_files=source_files,
         requested_by=f'Slack:{requester}',
     )
 
@@ -565,12 +625,18 @@ if _bolt_app is not None:
                     'type': 'input',
                     'block_id': 'lander_block',
                     'label': {'type': 'plain_text',
-                              'text': 'Lander URL (the page you want deployed)'},
+                              'text': 'Lander source URL — https://<bucket>/<folder>/'},
+                    'hint': {
+                        'type': 'plain_text',
+                        'text': ('The bucket name and folder are pulled from this URL. '
+                                 'e.g. https://safetyfirstauto.pro/h-insure-c/ '
+                                 'will copy from bucket safetyfirstauto.pro, folder h-insure-c/.'),
+                    },
                     'element': {
                         'type': 'url_text_input',
                         'action_id': 'lander_input',
                         'placeholder': {'type': 'plain_text',
-                                        'text': 'https://existing-lander.com/page'},
+                                        'text': 'https://safetyfirstauto.pro/h-insure-c/'},
                     },
                 },
                 {
@@ -598,9 +664,12 @@ if _bolt_app is not None:
         Per TL/Utkarsh's spec: bot routes the request, Utkarsh executes
         the actual deployment manually. Same pattern as Path B's purchase
         request flow, just for redeployment instead of new purchase.
-        """
-        ack()
 
+        The lander URL must be in the form `https://<bucket>/<folder>/`
+        because Phase 7 parses it into source bucket + folder. We
+        validate this up-front and surface inline modal errors so the
+        user fixes it before submitting.
+        """
         meta = json.loads(view.get('private_metadata') or '{}')
         target_domain = meta.get('target_domain', '')
         vertical = meta.get('vertical', '')
@@ -608,6 +677,16 @@ if _bolt_app is not None:
         values = view['state']['values']
         lander = (values['lander_block']['lander_input']['value'] or '').strip()
         notes = (values['notes_block']['notes_input']['value'] or '').strip()
+
+        # Validate URL shape — must be parseable into bucket + folder so
+        # Phase 7 can use it as the source. Failing here keeps the modal
+        # open with the field highlighted in red.
+        _, _, url_err = _parse_lander_url(lander)
+        if url_err:
+            ack(response_action='errors', errors={'lander_block': url_err})
+            return
+
+        ack()
 
         requester = body['user']['id']
         recipient = Config.UTKARSH_SLACK_USER_ID or requester
@@ -685,6 +764,7 @@ if _bolt_app is not None:
 
         target_domain = data['target_domain']
         vertical = data.get('vertical') or ''
+        lander_url = data.get('lander') or ''
         requester = data['requester']
         confirmer = body['user']['id']
         channel = body['channel']['id']
@@ -728,7 +808,7 @@ if _bolt_app is not None:
             threading.Thread(
                 target=_phase7_run_atom_setup,
                 args=(client, channel, message_ts, target_domain,
-                      vertical, requester),
+                      vertical, requester, lander_url),
                 daemon=True,
                 name=f'phase7-deploy-{target_domain}',
             ).start()
@@ -808,7 +888,7 @@ if _bolt_app is not None:
             threading.Thread(
                 target=_phase7_run_atom_setup,
                 args=(client, channel, message_ts, domain,
-                      vertical, requester),
+                      vertical, requester, lander),
                 daemon=True,
                 name=f'phase7-purchase-{domain}',
             ).start()
