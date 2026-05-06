@@ -494,12 +494,21 @@ if _bolt_app is not None:
         lander = (values['lander_block']['lander_input']['value'] or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
 
-        requester = body['user']['id']
+        # Resolve the effective MDB. When an operator (e.g. Utkarsh during the
+        # trial-run period) submits on behalf of someone else, the MDB picker
+        # holds that person's user ID. Otherwise the operator IS the MDB.
+        operator = body['user']['id']
+        mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
+        picked_mdb = mdb_select.get('selected_user') or ''
+        requester = picked_mdb or operator
+        on_behalf = bool(picked_mdb and picked_mdb != operator)
 
-        # 1. Confirm receipt up-front so the user knows we're working.
+        # 1. Confirm receipt up-front so MDB knows we're working.
         receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
-            f'• Requested by: <@{requester}>\n'
+            f'• Requested by: <@{requester}>'
+            + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
+            + f'\n'
             f'• Vertical: `{vertical}`\n'
             + (f"• Audience / angle: _{audience}_\n" if audience else '')
             + f'• Lander URL: {lander}\n'
@@ -507,6 +516,15 @@ if _bolt_app is not None:
             ':mag: Generating suggestions and checking Namecheap availability…'
         )
         client.chat_postMessage(channel=requester, text=receipt)
+        # When the operator is acting on behalf of the MDB, also DM the
+        # operator a short ack so they know the request landed.
+        if on_behalf:
+            client.chat_postMessage(
+                channel=operator,
+                text=(f':envelope_with_arrow: Submitted new-domain request on '
+                      f'behalf of <@{requester}>. They\'ll see suggestions in '
+                      'their DMs shortly.'),
+            )
 
         # 2. Call the suggestion engine. It already filters to available +
         # price-capped (.com <$15, other extensions <=$5 per TL 2026-05-05).
@@ -565,6 +583,12 @@ if _bolt_app is not None:
         Extracted from handle_pick_domain so TL approval can call it after
         the TL clicks Approve. Returns the resolved purchaser id (after
         DEV_REROUTE_DMS_TO override) so callers can name them in UI text.
+
+        Note: `requester` here is already the EFFECTIVE MDB (could be the
+        original /new-domain submitter, or the user picked in the MDB
+        users_select on the modal). Caller doesn't need to know about
+        operator-vs-MDB — that distinction is preserved upstream and
+        already shown in the TL approval card.
         """
         real_purchaser = Config.UTKARSH_SLACK_USER_ID or requester
         purchaser = Config.route_recipient(real_purchaser)
@@ -956,6 +980,24 @@ if _bolt_app is not None:
                 {'type': 'divider'},
                 {
                     'type': 'input',
+                    'block_id': 'mdb_block',
+                    'optional': True,
+                    'label': {'type': 'plain_text',
+                              'text': 'Requesting MDB (leave blank if this is for you)'},
+                    'hint': {
+                        'type': 'plain_text',
+                        'text': ('Pick the marketer you\'re running this on '
+                                 'behalf of. The final "deployed" notification '
+                                 'goes to them instead of you when set.'),
+                    },
+                    'element': {
+                        'type': 'users_select',
+                        'action_id': 'mdb_select',
+                        'placeholder': {'type': 'plain_text', 'text': 'Pick an MDB'},
+                    },
+                },
+                {
+                    'type': 'input',
                     'block_id': 'lander_block',
                     'label': {'type': 'plain_text',
                               'text': 'Lander source URL — https://<bucket>/<folder>/'},
@@ -1021,7 +1063,14 @@ if _bolt_app is not None:
 
         ack()
 
-        requester = body['user']['id']
+        # Resolve the effective MDB. Operator (Utkarsh during the trial-run
+        # period) may submit on behalf of someone else via the MDB picker.
+        operator = body['user']['id']
+        mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
+        picked_mdb = mdb_select.get('selected_user') or ''
+        requester = picked_mdb or operator
+        on_behalf = bool(picked_mdb and picked_mdb != operator)
+
         real_recipient = Config.UTKARSH_SLACK_USER_ID or requester
         recipient = Config.route_recipient(real_recipient)
         recipient_is_requester = (recipient == requester)
@@ -1030,7 +1079,9 @@ if _bolt_app is not None:
         # with a Mark Deployed button so he can close the loop in one click.
         utkarsh_text = (
             ':rocket: *Lander deployment request* :rocket:\n'
-            f'• Requester: <@{requester}>\n'
+            f'• Requester: <@{requester}>'
+            + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
+            + f'\n'
             f'• Target domain: `{target_domain}`\n'
             f'• Vertical: `{vertical}`\n'
             f'• Lander to deploy: {lander}\n'
@@ -1060,7 +1111,7 @@ if _bolt_app is not None:
             ],
         )
 
-        # 2. Confirm to the requester
+        # 2. Confirm to the MDB (the effective requester)
         if recipient_is_requester:
             client.chat_postMessage(
                 channel=requester,
@@ -1073,6 +1124,14 @@ if _bolt_app is not None:
                 channel=requester,
                 text=(f':envelope: Deploy request for `{target_domain}` sent '
                       f'to <@{recipient}>. He\'ll confirm here when done.'),
+            )
+        # 3. When operator is acting on behalf of MDB, also DM the operator
+        # so they know the request was submitted.
+        if on_behalf:
+            client.chat_postMessage(
+                channel=operator,
+                text=(f':envelope_with_arrow: Submitted deploy request for '
+                      f'`{target_domain}` on behalf of <@{requester}>.'),
             )
 
     # ─── Loop closers: Utkarsh clicks "Mark Done" ────────────────────────
@@ -1237,6 +1296,25 @@ _NEW_DOMAIN_MODAL = {
     'submit': {'type': 'plain_text', 'text': 'Continue'},
     'close': {'type': 'plain_text', 'text': 'Cancel'},
     'blocks': [
+        {
+            'type': 'input',
+            'block_id': 'mdb_block',
+            'optional': True,
+            'label': {'type': 'plain_text',
+                      'text': 'Requesting MDB (leave blank if this is for you)'},
+            'hint': {
+                'type': 'plain_text',
+                'text': ('Pick the marketer you\'re running this on behalf of. '
+                         'When set, all bot DMs (suggestions, approval status, '
+                         'final deploy notification) go to them instead of you.'),
+            },
+            'element': {
+                'type': 'users_select',
+                'action_id': 'mdb_select',
+                'placeholder': {'type': 'plain_text',
+                                'text': 'Pick an MDB'},
+            },
+        },
         {
             'type': 'input',
             'block_id': 'vertical_block',
