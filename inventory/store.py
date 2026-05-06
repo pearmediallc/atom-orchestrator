@@ -213,13 +213,26 @@ def get_domain(domain: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
-def mark_setup_complete(domain: str) -> None:
-    """Stamp setup_at = NOW() on the given domain (no-op if not found)."""
+def mark_setup_complete(domain: str, lander_url: Optional[str] = None) -> None:
+    """Stamp setup_at = NOW() on the given domain (no-op if not found).
+
+    When `lander_url` is provided, also update the row's lander_url so Path A
+    deployments persist what was actually deployed (Path A's confirm_deployed
+    didn't store this previously, leaving the column NULL on Path-A rows).
+    """
     with _conn() as c:
-        cur = _execute(
-            c,
-            'UPDATE domains SET setup_at = CURRENT_TIMESTAMP WHERE domain = ?',
-            (domain,),
-        )
+        if lander_url:
+            cur = _execute(
+                c,
+                'UPDATE domains SET setup_at = CURRENT_TIMESTAMP, '
+                'lander_url = ? WHERE domain = ?',
+                (lander_url, domain),
+            )
+        else:
+            cur = _execute(
+                c,
+                'UPDATE domains SET setup_at = CURRENT_TIMESTAMP WHERE domain = ?',
+                (domain,),
+            )
         if _is_postgres():
             cur.close()

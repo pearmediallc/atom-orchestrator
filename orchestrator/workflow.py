@@ -4,6 +4,7 @@ Two workflows mirror Utkarsh's two flows:
   • run_existing_domain_workflow — Path A (this phase)
   • run_new_domain_workflow      — Path B (Phase 5)
 """
+import re
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -153,15 +154,40 @@ def run_existing_domain_workflow(
             details={'reason': 'copy_files_error', 'copy_result': copy_result},
         )
 
-    # 5. Mark complete in inventory
-    store.mark_setup_complete(req.target_domain)
+    # ATOM returns 200 with "Successfully copied 0 files from ..." when the
+    # source path has no content. Treat that as failure — otherwise the bot
+    # reports "deployed" on a no-op (caught 2026-05-06 on safetyfirstauto.pro).
+    msg = copy_result.get('message', '')
+    m = re.search(r'copied\s+(\d+)\s+files', msg, re.IGNORECASE)
+    if m and int(m.group(1)) == 0:
+        return WorkflowResult(
+            status='failed',
+            message=(
+                f'File copy returned 0 files — source has no content at '
+                f"folders={req.source_folders or '(none)'} files={req.source_files or '(none)'} "
+                f'in s3://{req.source_bucket}.'
+            ),
+            details={'reason': 'copy_files_zero', 'copy_result': copy_result},
+        )
+
+    # Build the live URL with the folder path included. The lander typically
+    # lives under the first source folder (e.g. https://target.com/h-insure-c/),
+    # not the apex.
+    if req.source_folders:
+        folder = req.source_folders[0].strip('/')
+        live_url = f'https://{req.target_domain}/{folder}/' if folder else f'https://{req.target_domain}'
+    else:
+        live_url = f'https://{req.target_domain}'
+
+    # 5. Mark complete in inventory + persist the lander URL we just deployed
+    store.mark_setup_complete(req.target_domain, lander_url=live_url)
 
     # 6. Done
     return WorkflowResult(
         status='completed',
-        message=f'Lander deployed. Live at https://{req.target_domain}',
+        message=f'Lander deployed. Live at {live_url}',
         details={
-            'live_url': f'https://{req.target_domain}',
+            'live_url': live_url,
             'setup_result': setup_result,
             'copy_result': copy_result,
         },

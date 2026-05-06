@@ -1163,9 +1163,13 @@ if _bolt_app is not None:
         channel = body['channel']['id']
         message_ts = body['message']['ts']
 
-        # Update inventory: stamp setup_at so /list-domains shows ✅
+        # Update inventory: stamp setup_at so /list-domains shows ✅, and
+        # persist the lander URL the operator submitted (Path A previously
+        # left lander_url NULL on the row).
         try:
-            inventory_store.mark_setup_complete(target_domain)
+            inventory_store.mark_setup_complete(
+                target_domain, lander_url=lander_url or None,
+            )
         except Exception:
             pass  # Domain may not be in inventory yet (Phase 6 covers that)
 

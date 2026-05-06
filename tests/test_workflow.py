@@ -82,14 +82,17 @@ def test_completes_when_setup_and_copy_both_succeed(tmp_inventory):
     result = run_existing_domain_workflow(req, client=client)
 
     assert result.status == 'completed'
-    assert 'https://owned-by-us.com' in result.message
-    assert result.details['live_url'] == 'https://owned-by-us.com'
+    # Live URL must include the source folder path — the lander lives at
+    # /lander-v3/, not at the apex (post-2026-05-06 false-positive fix).
+    assert result.details['live_url'] == 'https://owned-by-us.com/lander-v3/'
+    assert 'https://owned-by-us.com/lander-v3/' in result.message
     client.setup_domain.assert_called_once()
     client.copy_files.assert_called_once()
 
-    # Inventory record should be marked complete
+    # Inventory record should be marked complete AND lander_url persisted.
     record = tmp_inventory.get_domain('owned-by-us.com')
     assert record['setup_at'] is not None
+    assert record['lander_url'] == 'https://owned-by-us.com/lander-v3/'
 
 
 def test_returns_failed_when_atom_setup_fails(tmp_inventory):
@@ -163,6 +166,34 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
     assert result.details['reason'] == 'copy_files_error'
     # Inventory should NOT be marked complete on a copy failure
     assert tmp_inventory.get_domain('copy-fail.com')['setup_at'] is None
+
+
+def test_returns_failed_when_copy_files_reports_zero_files(tmp_inventory):
+    """ATOM returns 200 OK with 'Successfully copied 0 files from ...' when
+    the source path is empty. This was a Path A false-positive bug — the
+    bot used to report 'deployed' on a no-op. Must now fail loudly.
+    """
+    tmp_inventory.add_domain(
+        domain='copy-zero.com', aws_account='auto-insurance')
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.return_value = _completed_status()
+    client.copy_files.return_value = {
+        'message': 'Successfully copied 0 files from empty-source.com to copy-zero.com'
+    }
+
+    req = ExistingDomainRequest(
+        target_domain='copy-zero.com',
+        source_account='auto-insurance',
+        source_bucket='empty-source.com',
+        source_folders=['nonexistent-folder/'],
+    )
+    result = run_existing_domain_workflow(req, client=client)
+
+    assert result.status == 'failed'
+    assert result.details['reason'] == 'copy_files_zero'
+    # Inventory must NOT be marked complete on a 0-file no-op
+    assert tmp_inventory.get_domain('copy-zero.com')['setup_at'] is None
 
 
 # ─── suggest_new_domains (Path B step 1) ──────────────────────────────────
