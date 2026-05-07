@@ -95,14 +95,20 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
 # ─── /new-domain shortlist builder (shared by modal submission + refresh) ─
 
 def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
-                                       extension, lander, requester):
+                                       extension, lander, requester,
+                                       examples=None):
     """Render the /new-domain shortlist as Slack Block Kit blocks.
 
     Used by both the initial modal submission and the "Show 5 more"
     refresh handler. Each domain row gets a Pick this button; the
     bottom of the message gets a Show-5-more button that re-runs
     the same query with fresh LLM output.
+
+    `examples` is the user-supplied list of stylistic anchor domains
+    from the modal. Carried through the Show-5-more button so the
+    refresh worker can produce names in the same family.
     """
+    examples = examples or []
     if extension == 'any':
         cap_label = (
             'Mixed extensions — sorted cheapest first. '
@@ -180,6 +186,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                 'extension': extension,
                 'lander': lander,
                 'requester': requester,
+                'examples': examples,
             }),
         }],
     })
@@ -188,7 +195,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
 
 def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
                                 vertical, audience, extension,
-                                lander, requester):
+                                lander, requester, examples=None):
     """Worker that regenerates the /new-domain shortlist. Runs in a
     daemon thread so the original Slack action click can ack within 3s
     while the LLM + Namecheap calls take 15–30s.
@@ -196,12 +203,14 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
     Edits the placeholder message in-place to either show the new
     shortlist or surface a clear failure reason.
     """
+    examples = examples or []
     try:
         suggestions = suggest_new_domains(
             vertical=vertical,
             audience=audience,
             extension=extension,
             count=5,
+            examples=examples,
         )
     except Exception as e:
         logger.exception('Phase 8 refresh failed for vertical=%s', vertical)
@@ -227,6 +236,7 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         extension=extension,
         lander=lander,
         requester=requester,
+        examples=examples,
     )
     client.chat_update(
         channel=channel,
@@ -494,6 +504,21 @@ if _bolt_app is not None:
         lander = (values['lander_block']['lander_input']['value'] or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
 
+        # Optional Example domains — multiline text input, one name per line.
+        # Anchors the AI's stylistic feel when the prompt's generic defaults
+        # don't match the vertical (re-introduced post-Phase-8.1 as an
+        # opt-in steering knob alongside Audience).
+        examples_raw = (
+            (values.get('examples_block') or {})
+            .get('examples_input', {})
+            .get('value') or ''
+        )
+        examples = [
+            line.strip().lower()
+            for line in examples_raw.split('\n')
+            if line.strip()
+        ]
+
         # Resolve the effective MDB. When an operator (e.g. Utkarsh during the
         # trial-run period) submits on behalf of someone else, the MDB picker
         # holds that person's user ID. Otherwise the operator IS the MDB.
@@ -504,6 +529,9 @@ if _bolt_app is not None:
         on_behalf = bool(picked_mdb and picked_mdb != operator)
 
         # 1. Confirm receipt up-front so MDB knows we're working.
+        examples_summary = (
+            f"• Style examples: `{', '.join(examples)}`\n" if examples else ''
+        )
         receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
             f'• Requested by: <@{requester}>'
@@ -511,6 +539,7 @@ if _bolt_app is not None:
             + f'\n'
             f'• Vertical: `{vertical}`\n'
             + (f"• Audience / angle: _{audience}_\n" if audience else '')
+            + examples_summary
             + f'• Lander URL: {lander}\n'
             f'• Extension: `{extension}`\n'
             ':mag: Generating suggestions and checking Namecheap availability…'
@@ -535,6 +564,7 @@ if _bolt_app is not None:
                 audience=audience,
                 extension=extension,
                 count=5,
+                examples=examples,
             )
         except Exception as e:
             client.chat_postMessage(
@@ -569,6 +599,7 @@ if _bolt_app is not None:
             extension=extension,
             lander=lander,
             requester=requester,
+            examples=examples,
         )
         client.chat_postMessage(
             channel=requester,
@@ -648,6 +679,7 @@ if _bolt_app is not None:
         extension = data.get('extension', 'any')
         lander = data.get('lander', '')
         requester = data['requester']
+        examples = data.get('examples') or []
         channel = body['channel']['id']
         old_ts = body['message']['ts']
 
@@ -678,7 +710,7 @@ if _bolt_app is not None:
             kwargs={
                 'vertical': vertical, 'audience': audience,
                 'extension': extension, 'lander': lander,
-                'requester': requester,
+                'requester': requester, 'examples': examples,
             },
             daemon=True,
             name=f'phase8-refresh-{vertical}',
@@ -1347,6 +1379,27 @@ _NEW_DOMAIN_MODAL = {
                 'action_id': 'audience_input',
                 'placeholder': {'type': 'plain_text',
                                 'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
+            },
+        },
+        {
+            'type': 'input',
+            'block_id': 'examples_block',
+            'optional': True,
+            'label': {'type': 'plain_text',
+                      'text': 'Example domain names (optional)'},
+            'hint': {
+                'type': 'plain_text',
+                'text': ('One per line. The bot anchors the AI on the STYLE '
+                         'of these names (word count, tone, compounding) — '
+                         'it will NOT reuse them. Use this when the vertical '
+                         'is unusual or the AI\'s defaults don\'t match.'),
+            },
+            'element': {
+                'type': 'plain_text_input',
+                'action_id': 'examples_input',
+                'multiline': True,
+                'placeholder': {'type': 'plain_text',
+                                'text': 'mymedicareexperts.online\nseniorhealthhub.com\nmedicarequotefinder.pro'},
             },
         },
         {

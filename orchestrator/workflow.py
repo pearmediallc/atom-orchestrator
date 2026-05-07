@@ -209,11 +209,13 @@ def suggest_new_domains(
     extension: str = 'any',
     count: int = 5,
     max_attempts: int = 4,
+    examples: Optional[List[str]] = None,
 ) -> List[dict]:
     """Path B step 1 — suggest *available* + *price-filtered* new domain names.
 
     Composes:
-      • LLM for naming (vertical + optional audience/angle inform style)
+      • LLM for naming (vertical + optional audience/angle + optional
+        user-supplied stylistic example domains)
       • Namecheap `domains.check` for availability
       • Namecheap `users.getPricing` for register price
       • Per-extension price cap from Config.DOMAIN_PRICE_CAP_USD
@@ -228,6 +230,10 @@ def suggest_new_domains(
     campaign is for (e.g. "seniors looking for medigap"). Optional —
     pass an empty string when no audience info is provided.
 
+    `examples` is an optional list of domain names whose stylistic feel
+    the AI should match (NOT reuse). Useful when the vertical's
+    vocabulary differs from what the prompt's generic defaults assume.
+
     Returns up to `count` rows shaped like
         {'domain': str, 'available': True, 'price': 9.18, 'extension': '.com'}.
     Empty list if nothing qualifies after max_attempts.
@@ -239,19 +245,21 @@ def suggest_new_domains(
 
     if extension == 'any':
         return _suggest_across_extensions(
-            vertical, audience, count, max_attempts,
+            vertical, audience, count, max_attempts, examples=examples,
         )
 
     if not extension.startswith('.'):
         extension = '.' + extension
     return _suggest_for_extension(
         vertical, audience, extension, count, max_attempts,
+        examples=examples,
     )
 
 
 def _suggest_for_extension(
     vertical: str, audience: str, extension: str,
     count: int, max_attempts: int,
+    examples: Optional[List[str]] = None,
 ) -> List[dict]:
     """Single-extension search — generate, filter to available + price-capped,
     retry until count is satisfied or attempts exhausted."""
@@ -271,6 +279,7 @@ def _suggest_for_extension(
             audience=audience,
             extension=extension,
             count=candidates_per_attempt,
+            examples=examples,
         )
         candidates = [d for d in candidates if d not in seen]
         seen.update(candidates)
@@ -295,6 +304,7 @@ def _suggest_for_extension(
 
 def _suggest_across_extensions(
     vertical: str, audience: str, count: int, max_attempts: int,
+    examples: Optional[List[str]] = None,
 ) -> List[dict]:
     """Mixed-extension search — try each cheap TLD until we have `count`
     available + price-capped domains, then sort by price ascending so
@@ -309,6 +319,7 @@ def _suggest_across_extensions(
 
         results = _suggest_for_extension(
             vertical, audience, ext, per_ext_target, max_attempts=2,
+            examples=examples,
         )
         for r in results:
             r['extension'] = ext
