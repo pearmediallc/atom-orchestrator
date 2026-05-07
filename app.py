@@ -17,7 +17,14 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = Config.FLASK_SECRET_KEY or 'dev-only-not-for-prod'
 
+    # Refuse to start with dev-only knobs left on in production. This is
+    # the gate that catches a forgotten DEV_REROUTE_DMS_TO before the
+    # bot starts silently absorbing real users' approvals (audit #15).
+    Config.assert_production_safe()
+
     # Initialise local storage (idempotent — safe to call every boot).
+    # Includes ALTER TABLE migrations + legacy aws_account backfill on
+    # first boot after the schema bump.
     inventory_store.init_db()
 
     app.register_blueprint(slack_bp, url_prefix='/slack')

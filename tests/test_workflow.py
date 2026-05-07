@@ -168,6 +168,94 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
     assert tmp_inventory.get_domain('copy-fail.com')['setup_at'] is None
 
 
+def test_workflow_fails_loud_when_aws_account_missing(tmp_inventory):
+    """Audit #6 fix 2026-05-08: a row with NULL/empty aws_account
+    used to silently default to 'auto-insurance' inside workflow.py.
+    That hid bugs where rows for non-auto-insurance verticals routed
+    to the wrong AWS account. Now we refuse to proceed and return a
+    clear error instead.
+    """
+    # Insert a row WITHOUT calling init_db's backfill so aws_account
+    # stays NULL — simulating a row inserted by someone bypassing the
+    # bot's add_domain (which requires status etc.).
+    with tmp_inventory._conn() as c:
+        tmp_inventory._execute(
+            c,
+            'INSERT INTO domains (domain, vertical) VALUES (?, ?)',
+            ('null-account.com', 'medicare'),
+        )
+
+    client = MagicMock()
+    req = ExistingDomainRequest(
+        target_domain='null-account.com',
+        source_account='auto-insurance',
+        source_bucket='lander-source.com',
+        source_folders=['lander-v3/'],
+    )
+    result = run_existing_domain_workflow(req, client=client)
+
+    assert result.status == 'failed'
+    assert result.details['reason'] == 'aws_account_missing'
+    # Workflow must not have called ATOM at all.
+    client.setup_domain.assert_not_called()
+    client.copy_files.assert_not_called()
+
+
+def test_workflow_transitions_to_deployed_on_success(tmp_inventory):
+    """Phase 7 worker stamps STATUS_DEPLOYING then STATUS_DEPLOYED so
+    /list-domains can show in-flight state without polling Slack."""
+    tmp_inventory.add_domain(
+        domain='happy-path.com', aws_account='auto-insurance',
+        status=tmp_inventory.STATUS_PENDING,
+    )
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.return_value = _completed_status()
+    client.copy_files.return_value = {'message': 'copied 1 files'}
+
+    req = ExistingDomainRequest(
+        target_domain='happy-path.com',
+        source_account='auto-insurance',
+        source_bucket='src.com',
+        source_folders=['lander-v1/'],
+    )
+    result = run_existing_domain_workflow(req, client=client)
+    assert result.status == 'completed'
+    row = tmp_inventory.get_domain('happy-path.com')
+    assert row['status'] == tmp_inventory.STATUS_DEPLOYED
+    # task_id from _ok_setup_response should be persisted.
+    assert row['latest_task_id'] is not None
+    assert row['latest_error'] is None
+
+
+def test_workflow_transitions_to_failed_with_error_on_atom_setup_failure(
+    tmp_inventory,
+):
+    """When ATOM reports a non-completed status, the row is marked
+    STATUS_FAILED and the error message is captured in latest_error so
+    operators can inspect failure cause without scrolling Slack."""
+    tmp_inventory.add_domain(
+        domain='will-fail.com', aws_account='auto-insurance',
+        status=tmp_inventory.STATUS_PENDING,
+    )
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.return_value = _failed_status_at('cloudfront')
+
+    req = ExistingDomainRequest(
+        target_domain='will-fail.com',
+        source_account='auto-insurance',
+        source_bucket='src.com',
+        source_folders=['lander-v1/'],
+    )
+    result = run_existing_domain_workflow(req, client=client)
+    assert result.status == 'failed'
+    row = tmp_inventory.get_domain('will-fail.com')
+    assert row['status'] == tmp_inventory.STATUS_FAILED
+    assert 'cloudfront' in row['latest_error']
+    assert row['latest_task_id'] is not None
+
+
 def test_workflow_uses_configured_phase7_timeout(tmp_inventory, monkeypatch):
     """Audit fix 2026-05-08: timeout was hardcoded to 600s, too short
     for fresh-domain ACM cert validation. Now read from

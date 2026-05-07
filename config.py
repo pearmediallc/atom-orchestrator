@@ -108,6 +108,32 @@ class Config:
     # Empty in real use.
     DEV_REROUTE_DMS_TO = os.getenv('DEV_REROUTE_DMS_TO', '').strip()
 
+    # Identifies the deployment environment. Drives the production
+    # safeguards below — set to 'production' on the live Render
+    # service so misconfiguration (e.g. forgetting to clear
+    # DEV_REROUTE_DMS_TO after a solo test) refuses to boot instead
+    # of silently absorbing real users' approvals (audit #15).
+    ENVIRONMENT = os.getenv('ENVIRONMENT', '').strip().lower()
+
+    @classmethod
+    def assert_production_safe(cls) -> None:
+        """Refuse to boot with dev-only knobs left on in production.
+
+        Called once from create_app() at startup. Any failure here is a
+        fatal misconfiguration — better to die loudly than serve traffic
+        with TL approvals routed to one developer.
+        """
+        if cls.ENVIRONMENT != 'production':
+            return
+        if cls.DEV_REROUTE_DMS_TO:
+            raise RuntimeError(
+                'DEV_REROUTE_DMS_TO is set in a production deployment. '
+                'This redirects TL approvals + Utkarsh DMs to a single '
+                'user, which would silently break the workflow for real '
+                'users. Unset DEV_REROUTE_DMS_TO in the production '
+                'environment, then redeploy.'
+            )
+
     @classmethod
     def route_recipient(cls, real_recipient: str) -> str:
         """Return DEV_REROUTE_DMS_TO if set, else the real recipient unchanged.

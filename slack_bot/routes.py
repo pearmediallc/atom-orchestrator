@@ -1305,6 +1305,9 @@ if _bolt_app is not None:
                 lander_url=lander,
                 requested_by=f'Slack:{requester}',
                 notes='Purchased via /new-domain bot flow',
+                # State machine starts here — Phase 7 worker will move
+                # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
+                status=inventory_store.STATUS_PENDING,
             )
         except inventory_store.DuplicateDomainError:
             logger.info(

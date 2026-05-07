@@ -108,3 +108,118 @@ def test_mark_setup_complete_persists_lander_url(tmp_inventory):
     row = tmp_inventory.get_domain('lander-test.com')
     assert row['lander_url'] == 'https://src.com/folder/'
     assert row['setup_at'] is not None
+
+
+# ─── Schema bump (status / latest_task_id / latest_error / updated_at) ────
+
+def test_status_column_exists_after_init(tmp_inventory):
+    """Post-launch ALTER TABLE migration must add the status column."""
+    tmp_inventory.add_domain(domain='status-col-test.com')
+    row = tmp_inventory.get_domain('status-col-test.com')
+    # All four post-launch columns must be readable.
+    assert 'status' in row
+    assert 'latest_task_id' in row
+    assert 'latest_error' in row
+    assert 'updated_at' in row
+
+
+def test_init_db_is_idempotent(tmp_inventory):
+    """Running init_db a second time must not error or corrupt data —
+    the ALTER TABLE checks must skip already-present columns and the
+    backfill must leave non-NULL aws_account untouched."""
+    tmp_inventory.add_domain(
+        domain='already-here.com', aws_account='other-vertical',
+    )
+    # Run the migration again.
+    tmp_inventory.init_db()
+    row = tmp_inventory.get_domain('already-here.com')
+    # The pre-existing aws_account must be preserved — the backfill
+    # only touches NULL/empty rows.
+    assert row['aws_account'] == 'other-vertical'
+
+
+def test_init_db_backfills_legacy_null_aws_account(tmp_inventory):
+    """Rows that pre-date the explicit-aws_account contract must be
+    backfilled to 'auto-insurance' so the workflow's fail-loud NULL
+    check doesn't reject them."""
+    # Insert with explicit NULL.
+    tmp_inventory.add_domain(domain='legacy.com', aws_account=None)
+    # Re-run init_db — backfill should fire.
+    tmp_inventory.init_db()
+    row = tmp_inventory.get_domain('legacy.com')
+    assert row['aws_account'] == 'auto-insurance'
+
+
+def test_init_db_backfill_does_not_touch_non_null_rows(tmp_inventory):
+    tmp_inventory.add_domain(
+        domain='explicit.com', aws_account='other-vertical',
+    )
+    tmp_inventory.add_domain(
+        domain='also-explicit.com', aws_account='auto-insurance',
+    )
+    tmp_inventory.init_db()
+    assert tmp_inventory.get_domain('explicit.com')['aws_account'] == 'other-vertical'
+    assert tmp_inventory.get_domain('also-explicit.com')['aws_account'] == 'auto-insurance'
+
+
+# ─── add_domain status param ──────────────────────────────────────────────
+
+def test_add_domain_with_status_pending(tmp_inventory):
+    tmp_inventory.add_domain(
+        domain='with-status.com', status=tmp_inventory.STATUS_PENDING,
+    )
+    row = tmp_inventory.get_domain('with-status.com')
+    assert row['status'] == 'pending'
+    assert row['updated_at'] is not None
+
+
+def test_add_domain_rejects_invalid_status(tmp_inventory):
+    with pytest.raises(ValueError) as exc_info:
+        tmp_inventory.add_domain(domain='bad-status.com', status='garbage')
+    assert 'garbage' in str(exc_info.value)
+
+
+# ─── transition_status ────────────────────────────────────────────────────
+
+def test_transition_status_moves_state_and_stamps_updated_at(tmp_inventory):
+    tmp_inventory.add_domain(
+        domain='trans.com', status=tmp_inventory.STATUS_PENDING,
+    )
+    before = tmp_inventory.get_domain('trans.com')['updated_at']
+    tmp_inventory.transition_status(
+        'trans.com', to_status=tmp_inventory.STATUS_DEPLOYING,
+        task_id='task-abc',
+    )
+    after = tmp_inventory.get_domain('trans.com')
+    assert after['status'] == 'deploying'
+    assert after['latest_task_id'] == 'task-abc'
+    # updated_at moved forward (allowing equality on backends with
+    # second-resolution timestamps).
+    assert after['updated_at'] >= before
+
+
+def test_transition_status_records_error_on_failure(tmp_inventory):
+    tmp_inventory.add_domain(
+        domain='err.com', status=tmp_inventory.STATUS_DEPLOYING,
+    )
+    tmp_inventory.transition_status(
+        'err.com', to_status=tmp_inventory.STATUS_FAILED,
+        error='ATOM cert validation timed out after 30 min',
+    )
+    row = tmp_inventory.get_domain('err.com')
+    assert row['status'] == 'failed'
+    assert 'cert validation timed out' in row['latest_error']
+
+
+def test_transition_status_rejects_unknown_status(tmp_inventory):
+    tmp_inventory.add_domain(domain='x.com')
+    with pytest.raises(ValueError):
+        tmp_inventory.transition_status('x.com', to_status='garbage')
+
+
+def test_transition_status_no_op_on_missing_row(tmp_inventory):
+    # Should NOT raise — UPDATE of 0 rows is benign by contract.
+    tmp_inventory.transition_status(
+        'never-inserted.com',
+        to_status=tmp_inventory.STATUS_DEPLOYED,
+    )

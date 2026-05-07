@@ -70,6 +70,24 @@ def _is_postgres() -> bool:
 # Two slightly-different DDL strings — same logical schema, different
 # dialects. The data shape is identical.
 
+# ─── Status state machine ──────────────────────────────────────────────────
+# A domain row's `status` column moves through a strict state machine that
+# the bot's button handlers + Phase 7 worker drive. Encoded as constants so
+# tests + workflow code share one source of truth.
+
+STATUS_UNKNOWN = 'unknown'    # Legacy rows from before status column existed.
+STATUS_PENDING = 'pending'    # Row inserted (Path B Mark Purchased) but
+                              # Phase 7 hasn't started yet.
+STATUS_DEPLOYING = 'deploying'  # Phase 7 worker is in flight.
+STATUS_DEPLOYED = 'deployed'  # Phase 7 finished successfully.
+STATUS_FAILED = 'failed'      # Phase 7 finished with an error.
+
+_VALID_STATUSES = {
+    STATUS_UNKNOWN, STATUS_PENDING, STATUS_DEPLOYING,
+    STATUS_DEPLOYED, STATUS_FAILED,
+}
+
+
 _SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS domains (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,9 +98,15 @@ CREATE TABLE IF NOT EXISTS domains (
     purchased_at    TIMESTAMP,
     setup_at        TIMESTAMP,
     requested_by    TEXT,
-    notes           TEXT
+    notes           TEXT,
+    status          TEXT,
+    latest_task_id  TEXT,
+    latest_error    TEXT,
+    updated_at      TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_domains_vertical ON domains(vertical);
+CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status);
+CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by);
 """
 
 _POSTGRES_SCHEMA = """
@@ -95,10 +119,35 @@ CREATE TABLE IF NOT EXISTS domains (
     purchased_at    TIMESTAMPTZ,
     setup_at        TIMESTAMPTZ,
     requested_by    TEXT,
-    notes           TEXT
+    notes           TEXT,
+    status          TEXT,
+    latest_task_id  TEXT,
+    latest_error    TEXT,
+    updated_at      TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_domains_vertical ON domains(vertical);
+CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status);
+CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by);
 """
+
+# Columns added post-launch — these need to be ALTER-added on existing
+# deployments (init_db only CREATEs IF NOT EXISTS, which doesn't touch
+# already-created tables). _ensure_columns walks this list on every
+# boot and adds anything missing from the live schema. Idempotent —
+# safe to run repeatedly.
+_POST_LAUNCH_COLUMNS = {
+    'status':         ('TEXT', 'TEXT'),                  # (sqlite_type, postgres_type)
+    'latest_task_id': ('TEXT', 'TEXT'),
+    'latest_error':   ('TEXT', 'TEXT'),
+    'updated_at':     ('TIMESTAMP', 'TIMESTAMPTZ'),
+}
+
+# Indices added post-launch (separate from column adds because Postgres
+# CREATE INDEX IF NOT EXISTS is sufficient and idempotent).
+_POST_LAUNCH_INDICES = {
+    'idx_domains_status':       'CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status)',
+    'idx_domains_requested_by': 'CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by)',
+}
 
 
 # ─── Connection management ─────────────────────────────────────────────────
@@ -164,8 +213,96 @@ def _execute(c, query: str, params: tuple = ()):
 
 # ─── Public API ────────────────────────────────────────────────────────────
 
+def _existing_columns(c) -> set:
+    """Return the set of column names currently on the `domains` table.
+
+    Backend-aware (sqlite3 PRAGMA vs Postgres information_schema). Used
+    by _ensure_columns to skip columns that are already there so the
+    migration is idempotent across many boots.
+    """
+    if _is_postgres():
+        cur = c.cursor()
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'domains'"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return {r['column_name'] for r in rows}
+    cur = c.execute('PRAGMA table_info(domains)')
+    return {row[1] for row in cur.fetchall()}
+
+
+def _ensure_columns(c) -> None:
+    """Idempotent ALTER TABLE — adds any column from _POST_LAUNCH_COLUMNS
+    that is missing from the live schema.
+
+    Why not Alembic: this codebase has 4 columns to migrate; pulling in
+    a migration framework for that is more risk than reward. The
+    invariant is simple — every column listed in _POST_LAUNCH_COLUMNS
+    must exist after init_db() returns.
+
+    Each ALTER TABLE is its own statement-level transaction in Postgres;
+    if column N+1 fails, columns 1..N stay added and the next boot
+    will pick up where this one left off. No half-migrated state.
+    """
+    existing = _existing_columns(c)
+    for name, (sqlite_type, pg_type) in _POST_LAUNCH_COLUMNS.items():
+        if name in existing:
+            continue
+        col_type = pg_type if _is_postgres() else sqlite_type
+        _execute(c, f'ALTER TABLE domains ADD COLUMN {name} {col_type}')
+
+
+def _ensure_indices(c) -> None:
+    """Idempotent CREATE INDEX for post-launch indices.
+
+    Both Postgres and SQLite support `CREATE INDEX IF NOT EXISTS` so
+    re-running on every boot is a cheap no-op once the index exists.
+    """
+    for _name, ddl in _POST_LAUNCH_INDICES.items():
+        _execute(c, ddl)
+
+
+def _backfill_legacy_aws_account(c) -> None:
+    """Set aws_account = 'auto-insurance' on rows where it is NULL or
+    empty.
+
+    Why this exists: workflow.py has long had
+        target_account = record.get('aws_account') or 'auto-insurance'
+    so legacy rows with NULL aws_account were already being silently
+    routed to auto-insurance. This UPDATE makes that implicit fallback
+    explicit so the next-batch fail-loud NULL check can run without
+    rejecting the 743 pre-existing rows.
+
+    Does NOT change runtime behaviour — the rows already behave as if
+    aws_account were 'auto-insurance'. The UPDATE only changes what's
+    recorded in the column.
+
+    Idempotent: subsequent runs match 0 rows because aws_account is
+    already populated.
+    """
+    _execute(
+        c,
+        "UPDATE domains SET aws_account = 'auto-insurance' "
+        "WHERE aws_account IS NULL OR aws_account = ''"
+    )
+
+
 def init_db() -> None:
-    """Idempotent — safe to call on every app boot."""
+    """Idempotent — safe to call on every app boot.
+
+    Order:
+      1. CREATE TABLE / INDEX baseline (no-op if the table exists)
+      2. ALTER TABLE add new columns (idempotent — skips anything present)
+      3. CREATE INDEX for post-launch indices (idempotent)
+      4. Backfill legacy NULL aws_account rows
+
+    Each step uses its own connection so a failure in (2) doesn't roll
+    back (1) — relevant because Postgres transactions are
+    statement-level for DDL but a Python-level exception in step 2
+    would still abort the connection's pending work otherwise.
+    """
     with _conn() as c:
         if _is_postgres():
             cur = c.cursor()
@@ -173,6 +310,15 @@ def init_db() -> None:
             cur.close()
         else:
             c.executescript(_SQLITE_SCHEMA)
+
+    with _conn() as c:
+        _ensure_columns(c)
+
+    with _conn() as c:
+        _ensure_indices(c)
+
+    with _conn() as c:
+        _backfill_legacy_aws_account(c)
 
 
 def health_check() -> None:
@@ -200,20 +346,31 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                aws_account: Optional[str] = None,
                lander_url: Optional[str] = None,
                requested_by: Optional[str] = None,
-               notes: Optional[str] = None) -> int:
+               notes: Optional[str] = None,
+               status: Optional[str] = None) -> int:
     """Insert a new domain; returns its row id.
 
-    Both backends timestamp purchased_at to NOW() at insert time.
+    Both backends timestamp purchased_at AND updated_at to NOW().
+
+    `status` is the initial workflow state (one of STATUS_* constants).
+    Path B's confirm_purchased passes STATUS_PENDING; Phase 7 will
+    transition it to STATUS_DEPLOYING then STATUS_DEPLOYED / FAILED.
+    Bulk imports (import_csv) and tests pass None to keep status NULL —
+    those rows are treated as 'unknown' by the runtime.
 
     Raises DuplicateDomainError if the domain is already in inventory —
     the only DB failure the bot's button handlers should treat as
-    benign. All other failures escalate to the caller as the original
-    driver exception (caller is expected to log + warn + re-raise).
+    benign. All other failures escalate to the caller (caller is
+    expected to log + warn + re-raise).
     """
+    if status is not None and status not in _VALID_STATUSES:
+        raise ValueError(
+            f'status={status!r} not in {sorted(_VALID_STATUSES)}'
+        )
     insert_sql = (
         'INSERT INTO domains (domain, vertical, aws_account, lander_url, '
-        'requested_by, notes, purchased_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
+        'requested_by, notes, status, purchased_at, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
     )
     try:
         with _conn() as c:
@@ -221,13 +378,13 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                 cur = c.cursor()
                 cur.execute(_q(insert_sql) + ' RETURNING id',
                             (domain, vertical, aws_account, lander_url,
-                             requested_by, notes))
+                             requested_by, notes, status))
                 row = cur.fetchone()
                 cur.close()
                 return row['id']
             cur = c.execute(insert_sql,
                             (domain, vertical, aws_account, lander_url,
-                             requested_by, notes))
+                             requested_by, notes, status))
             return cur.lastrowid
     except sqlite3.IntegrityError as e:
         # SQLite raises IntegrityError on UNIQUE violations.
@@ -244,6 +401,38 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                 f'Domain {domain!r} already exists in inventory'
             ) from e
         raise
+
+
+def transition_status(domain: str, *, to_status: str,
+                      task_id: Optional[str] = None,
+                      error: Optional[str] = None) -> None:
+    """Atomically move a domain row to a new workflow status.
+
+    Always stamps updated_at = NOW() so callers can sort by recent
+    activity. Optionally records the ATOM task_id (so Phase 7 progress
+    is correlatable from the inventory row) and the latest_error
+    (when transitioning into STATUS_FAILED).
+
+    Silent on missing rows (UPDATE ... WHERE domain=?) — the caller
+    knows whether the row should exist; this helper doesn't second-
+    guess. Path A's mark_setup_complete already documented this
+    contract.
+    """
+    if to_status not in _VALID_STATUSES:
+        raise ValueError(
+            f'to_status={to_status!r} not in {sorted(_VALID_STATUSES)}'
+        )
+    sql = (
+        'UPDATE domains SET status = ?, '
+        'latest_task_id = COALESCE(?, latest_task_id), '
+        'latest_error = ?, '
+        'updated_at = CURRENT_TIMESTAMP '
+        'WHERE domain = ?'
+    )
+    with _conn() as c:
+        cur = _execute(c, sql, (to_status, task_id, error, domain))
+        if _is_postgres():
+            cur.close()
 
 
 def list_domains(vertical: Optional[str] = None) -> List[Dict]:

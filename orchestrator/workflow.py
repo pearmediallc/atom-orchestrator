@@ -47,6 +47,33 @@ class WorkflowResult:
 
 # ---------- Workflows ----------
 
+def _fail(req: ExistingDomainRequest, message: str, *,
+          reason: str, task_id: Optional[str] = None,
+          extra_details: Optional[dict] = None) -> WorkflowResult:
+    """Build a WorkflowResult(status='failed') and stamp the inventory
+    row with STATUS_FAILED + latest_error so /list-domains and any
+    future re-deploy logic can see the last failure cause.
+
+    Inventory write is best-effort — if the DB itself is the failure
+    we don't want to mask the original error with a secondary one.
+    """
+    details = {'reason': reason}
+    if task_id is not None:
+        details['task_id'] = task_id
+    if extra_details:
+        details.update(extra_details)
+    try:
+        store.transition_status(
+            req.target_domain,
+            to_status=store.STATUS_FAILED,
+            task_id=task_id,
+            error=message[:500],  # cap to keep DB rows small
+        )
+    except Exception:
+        pass  # original error wins; don't mask it.
+    return WorkflowResult(status='failed', message=message, details=details)
+
+
 def run_existing_domain_workflow(
     req: ExistingDomainRequest,
     client: Optional[AtomClient] = None,
@@ -59,17 +86,38 @@ def run_existing_domain_workflow(
       3. Wait for setup to finish (or fail).
       4. Copy lander files from source bucket to the target domain's bucket.
       5. Mark setup_complete in inventory.
+
+    Status state machine: the inventory row's `status` column is
+    transitioned to STATUS_DEPLOYING right before kicking off ATOM,
+    and to STATUS_DEPLOYED / STATUS_FAILED at the end of every return
+    path. /list-domains can then surface the live state of any in-
+    flight deploy without polling Slack threads.
     """
     # 1. Inventory lookup
     record = store.get_domain(req.target_domain)
     if not record:
+        # No row = nothing to update; build the result inline (can't call
+        # _fail because there's no row to stamp).
         return WorkflowResult(
             status='failed',
             message=f"Domain '{req.target_domain}' is not in our inventory.",
             details={'reason': 'not_in_inventory'},
         )
 
-    target_account = record.get('aws_account') or 'auto-insurance'
+    # aws_account must be explicitly set on the row. Legacy NULL rows
+    # were backfilled to 'auto-insurance' by init_db at boot time, and
+    # newly inserted rows are required to set this column. A NULL we
+    # see at runtime now indicates a real bug — better to fail loudly
+    # than silently route to the wrong AWS account (audit #6 fix).
+    target_account = record.get('aws_account')
+    if not target_account:
+        return _fail(
+            req,
+            f"Domain '{req.target_domain}' has no aws_account set in "
+            'inventory. Refusing to silently default — set the column '
+            'explicitly via SQL or re-import the row.',
+            reason='aws_account_missing',
+        )
 
     # Inject-or-create AtomClient. Tests pass a mock; real callers get login.
     owns_client = client is None
@@ -78,11 +126,24 @@ def run_existing_domain_workflow(
         try:
             client.login(Config.ATOM_USERNAME, Config.ATOM_PASSWORD)
         except Exception as e:
-            return WorkflowResult(
-                status='failed',
-                message=f'Could not log in to ATOM: {e}',
-                details={'reason': 'atom_login_failed'},
+            return _fail(
+                req,
+                f'Could not log in to ATOM: {e}',
+                reason='atom_login_failed',
             )
+
+    # Mark the row as deploying BEFORE we kick off ATOM — so an
+    # external observer (/list-domains, dashboards) can see the
+    # in-flight state from the moment the worker starts. We pass
+    # task_id=None for now and overwrite with the real ID after the
+    # kickoff response below.
+    try:
+        store.transition_status(
+            req.target_domain,
+            to_status=store.STATUS_DEPLOYING,
+        )
+    except Exception:
+        pass  # status is observability only; never block the deploy on it.
 
     # 2. Trigger ATOM domain setup
     try:
@@ -92,11 +153,22 @@ def run_existing_domain_workflow(
         )
         task_id = setup_response['tasks'][0]['task_id']
     except Exception as e:
-        return WorkflowResult(
-            status='failed',
-            message=f'Could not start ATOM domain setup: {e}',
-            details={'reason': 'atom_setup_kickoff_failed'},
+        return _fail(
+            req,
+            f'Could not start ATOM domain setup: {e}',
+            reason='atom_setup_kickoff_failed',
         )
+
+    # Now record the real ATOM task_id on the row so it's correlatable
+    # with ATOM's logs / status endpoint without re-deriving it.
+    try:
+        store.transition_status(
+            req.target_domain,
+            to_status=store.STATUS_DEPLOYING,
+            task_id=task_id,
+        )
+    except Exception:
+        pass
 
     # 3. Wait for setup to finish. Timeout is configured via
     # Config.PHASE7_SETUP_TIMEOUT_SEC (default 30 min) — long enough
@@ -108,33 +180,29 @@ def run_existing_domain_workflow(
             task_id, timeout=Config.PHASE7_SETUP_TIMEOUT_SEC,
         )
     except TimeoutError as e:
-        return WorkflowResult(
-            status='failed',
-            message=f'ATOM setup did not complete in time: {e}',
-            details={'reason': 'atom_setup_timeout', 'task_id': task_id},
+        return _fail(
+            req,
+            f'ATOM setup did not complete in time: {e}',
+            reason='atom_setup_timeout', task_id=task_id,
         )
 
     if setup_result.get('status') != 'completed':
         # Forward ATOM's structured error so the caller sees AWS error code,
         # request id, etc.
-        return WorkflowResult(
-            status='failed',
-            message=(
-                f"ATOM domain setup failed at step "
-                f"'{setup_result.get('failed_at_step', 'unknown')}'."
-            ),
-            details={
-                'reason': 'atom_setup_failed',
-                'setup_result': setup_result,
-            },
+        return _fail(
+            req,
+            "ATOM domain setup failed at step "
+            f"'{setup_result.get('failed_at_step', 'unknown')}'.",
+            reason='atom_setup_failed', task_id=task_id,
+            extra_details={'setup_result': setup_result},
         )
 
     # 4. Copy lander files from source → target with domain rewrite
     if not (req.source_folders or req.source_files):
-        return WorkflowResult(
-            status='failed',
-            message='No source_folders or source_files specified — nothing to copy.',
-            details={'reason': 'no_source_specified'},
+        return _fail(
+            req,
+            'No source_folders or source_files specified — nothing to copy.',
+            reason='no_source_specified', task_id=task_id,
         )
 
     try:
@@ -147,17 +215,18 @@ def run_existing_domain_workflow(
             selected_files=req.source_files,
         )
     except Exception as e:
-        return WorkflowResult(
-            status='failed',
-            message=f'File copy failed: {e}',
-            details={'reason': 'copy_files_exception'},
+        return _fail(
+            req,
+            f'File copy failed: {e}',
+            reason='copy_files_exception', task_id=task_id,
         )
 
     if copy_result.get('error'):
-        return WorkflowResult(
-            status='failed',
-            message=f"File copy reported an error: {copy_result['error']}",
-            details={'reason': 'copy_files_error', 'copy_result': copy_result},
+        return _fail(
+            req,
+            f"File copy reported an error: {copy_result['error']}",
+            reason='copy_files_error', task_id=task_id,
+            extra_details={'copy_result': copy_result},
         )
 
     # ATOM returns 200 with "Successfully copied 0 files from ..." when the
@@ -166,14 +235,13 @@ def run_existing_domain_workflow(
     msg = copy_result.get('message', '')
     m = re.search(r'copied\s+(\d+)\s+files', msg, re.IGNORECASE)
     if m and int(m.group(1)) == 0:
-        return WorkflowResult(
-            status='failed',
-            message=(
-                f'File copy returned 0 files — source has no content at '
-                f"folders={req.source_folders or '(none)'} files={req.source_files or '(none)'} "
-                f'in s3://{req.source_bucket}.'
-            ),
-            details={'reason': 'copy_files_zero', 'copy_result': copy_result},
+        return _fail(
+            req,
+            f'File copy returned 0 files — source has no content at '
+            f"folders={req.source_folders or '(none)'} files={req.source_files or '(none)'} "
+            f'in s3://{req.source_bucket}.',
+            reason='copy_files_zero', task_id=task_id,
+            extra_details={'copy_result': copy_result},
         )
 
     # Build the live URL with the folder path included. The lander typically
@@ -188,7 +256,20 @@ def run_existing_domain_workflow(
     # 5. Mark complete in inventory + persist the lander URL we just deployed
     store.mark_setup_complete(req.target_domain, lander_url=live_url)
 
-    # 6. Done
+    # 6. Move the row into its terminal STATUS_DEPLOYED state.
+    # Best-effort — mark_setup_complete already stamped setup_at, so a
+    # transition_status failure here only loses the status field, not
+    # the deploy itself.
+    try:
+        store.transition_status(
+            req.target_domain,
+            to_status=store.STATUS_DEPLOYED,
+            task_id=task_id,
+        )
+    except Exception:
+        pass
+
+    # 7. Done
     return WorkflowResult(
         status='completed',
         message=f'Lander deployed. Live at {live_url}',
