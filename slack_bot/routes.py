@@ -25,6 +25,7 @@ from flask import Blueprint, jsonify, request
 
 from config import Config
 from inventory import store as inventory_store
+from orchestrator.log_setup import log_event
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
@@ -1195,6 +1196,13 @@ if _bolt_app is not None:
         channel = body['channel']['id']
         message_ts = body['message']['ts']
 
+        log_event(
+            'slack_button_clicked', button='confirm_deployed',
+            domain=target_domain, vertical=vertical,
+            requester=requester, confirmer=confirmer,
+            lander_url=lander_url,
+        )
+
         # Update inventory: stamp setup_at so /list-domains shows ✅, and
         # persist the lander URL the operator submitted (Path A previously
         # left lander_url NULL on the row).
@@ -1292,6 +1300,13 @@ if _bolt_app is not None:
         confirmer = body['user']['id']
         channel = body['channel']['id']
         message_ts = body['message']['ts']
+
+        log_event(
+            'slack_button_clicked', button='confirm_purchased',
+            domain=domain, vertical=vertical,
+            requester=requester, confirmer=confirmer,
+            lander_url=lander,
+        )
 
         # Add to inventory so /list-domains starts showing it (and so the
         # Phase 7 workflow can find it — run_existing_domain_workflow

@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from inventory import store
+from orchestrator.log_setup import log_event
 
 
 logger = logging.getLogger(__name__)
@@ -133,13 +134,19 @@ def enqueue(domain: str, kind: str, request: dict, *,
             )
             row = cur.fetchone()
             cur.close()
-            return row['id']
-        cur = c.execute(
-            sql,
-            (domain, kind, json.dumps(request),
-             TASK_QUEUED, max_attempts),
-        )
-        return cur.lastrowid
+            task_id = row['id']
+        else:
+            cur = c.execute(
+                sql,
+                (domain, kind, json.dumps(request),
+                 TASK_QUEUED, max_attempts),
+            )
+            task_id = cur.lastrowid
+    log_event(
+        'task_enqueued', task_id=task_id, domain=domain, kind=kind,
+        max_attempts=max_attempts,
+    )
+    return task_id
 
 
 def claim(task_id: int) -> ClaimedTask:
@@ -179,7 +186,7 @@ def claim(task_id: int) -> ClaimedTask:
         row = cur.fetchone()
         if store._is_postgres():
             cur.close()
-    return ClaimedTask(
+    claimed = ClaimedTask(
         id=row['id'],
         domain=row['domain'],
         kind=row['kind'],
@@ -187,6 +194,12 @@ def claim(task_id: int) -> ClaimedTask:
         attempt=row['attempt'],
         max_attempts=row['max_attempts'],
     )
+    log_event(
+        'task_claimed', task_id=claimed.id, domain=claimed.domain,
+        kind=claimed.kind, attempt=claimed.attempt,
+        max_attempts=claimed.max_attempts, worker_id=worker_id,
+    )
+    return claimed
 
 
 def heartbeat(task_id: int) -> None:
@@ -215,6 +228,7 @@ def mark_done(task_id: int, *, atom_task_id: Optional[str] = None) -> None:
         cur = store._execute(c, sql, (TASK_DONE, atom_task_id, task_id))
         if store._is_postgres():
             cur.close()
+    log_event('task_done', task_id=task_id, atom_task_id=atom_task_id)
 
 
 def mark_failed(task_id: int, error: str, *,
@@ -226,13 +240,21 @@ def mark_failed(task_id: int, error: str, *,
         "updated_at = CURRENT_TIMESTAMP "
         "WHERE id = ?"
     )
+    truncated = error[:1000]
     with store._conn() as c:
         cur = store._execute(
             c, sql,
-            (TASK_FAILED, error[:1000], atom_task_id, task_id),
+            (TASK_FAILED, truncated, atom_task_id, task_id),
         )
         if store._is_postgres():
             cur.close()
+    log_event(
+        'task_failed', level=logging.ERROR,
+        task_id=task_id, atom_task_id=atom_task_id,
+        # Cap error in the log line too — it's already truncated in
+        # the DB, so log the same value to keep them in sync.
+        error=truncated,
+    )
 
 
 # ─── Recovery sweeper (called once at boot) ────────────────────────────────
@@ -318,9 +340,10 @@ def recover_stale_running_tasks() -> list:
     for tid in stale:
         if requeue(tid):
             requeued.append(tid)
-            logger.warning(
-                'Phase 7 task %s was stale (worker died mid-task); '
-                'requeued for retry', tid,
+            log_event(
+                'task_requeued_after_stale',
+                level=logging.WARNING,
+                task_id=tid,
             )
     if requeued:
         # Dispatch workers for each requeued task. Lazy-import the

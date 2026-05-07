@@ -11,9 +11,17 @@ from slack_bot.routes import slack_bp
 from inventory.routes import inventory_bp
 from inventory import store as inventory_store
 from orchestrator.routes import orchestrator_bp
+from orchestrator.log_setup import configure_logging, log_event
 
 
 def create_app() -> Flask:
+    # Install the JSON formatter FIRST so every subsequent log line
+    # — including init_db's migration output, the production-safety
+    # assertion, recover_stale_running_tasks() — emits in the
+    # structured format Render's log viewer can grep.
+    configure_logging()
+    log_event('boot_start', service='atom-orchestrator')
+
     app = Flask(__name__)
     app.secret_key = Config.FLASK_SECRET_KEY or 'dev-only-not-for-prod'
 
@@ -36,16 +44,23 @@ def create_app() -> Flask:
     try:
         recovered = tasks.recover_stale_running_tasks()
         if recovered:
-            print(
-                f"  → recovered {len(recovered)} stale Phase 7 task(s): "
-                f"{recovered}"
+            log_event(
+                'task_recovery_completed',
+                recovered_task_ids=recovered,
+                count=len(recovered),
             )
+        else:
+            log_event('task_recovery_completed', count=0)
     except Exception as e:
         # Never block the app from booting on a recovery failure —
         # the tasks stay in 'running' and the next boot will try
         # again. The DB itself being unreachable will fail /health,
         # and Render's load balancer will drain the pod.
-        print(f"  → Phase 7 task recovery failed (non-fatal): {e}")
+        log_event(
+            'task_recovery_failed',
+            level=__import__('logging').ERROR,
+            error=f'{type(e).__name__}: {e}',
+        )
 
     app.register_blueprint(slack_bp, url_prefix='/slack')
     app.register_blueprint(inventory_bp, url_prefix='/inventory')
@@ -81,6 +96,7 @@ def create_app() -> Flask:
             'db': 'reachable',
         })
 
+    log_event('boot_completed', service='atom-orchestrator')
     return app
 
 

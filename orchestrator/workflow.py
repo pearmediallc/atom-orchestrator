@@ -4,13 +4,16 @@ Two workflows mirror Utkarsh's two flows:
   • run_existing_domain_workflow — Path A (this phase)
   • run_new_domain_workflow      — Path B (Phase 5)
 """
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 
 from config import Config
 from inventory import store
 from orchestrator.atom_client import AtomClient
+from orchestrator.log_setup import log_event
 from domain_assistant import chatgpt, namecheap_check
 
 
@@ -56,6 +59,9 @@ def _fail(req: ExistingDomainRequest, message: str, *,
 
     Inventory write is best-effort — if the DB itself is the failure
     we don't want to mask the original error with a secondary one.
+
+    Always emits a structured `workflow_failed` log event so operators
+    grepping for failures don't have to scroll Slack threads.
     """
     details = {'reason': reason}
     if task_id is not None:
@@ -71,6 +77,11 @@ def _fail(req: ExistingDomainRequest, message: str, *,
         )
     except Exception:
         pass  # original error wins; don't mask it.
+    log_event(
+        'workflow_failed', level=logging.ERROR,
+        domain=req.target_domain, reason=reason,
+        atom_task_id=task_id, failure_message=message[:500],
+    )
     return WorkflowResult(status='failed', message=message, details=details)
 
 
@@ -93,6 +104,15 @@ def run_existing_domain_workflow(
     path. /list-domains can then surface the live state of any in-
     flight deploy without polling Slack threads.
     """
+    started_wall_time = time.time()
+    log_event(
+        'workflow_started', domain=req.target_domain,
+        source_account=req.source_account,
+        source_bucket=req.source_bucket,
+        source_folders=req.source_folders or [],
+        requested_by=req.requested_by,
+    )
+
     # 1. Inventory lookup
     record = store.get_domain(req.target_domain)
     if not record:
@@ -270,6 +290,12 @@ def run_existing_domain_workflow(
         pass
 
     # 7. Done
+    duration_sec = round(time.time() - started_wall_time, 2)
+    log_event(
+        'workflow_completed',
+        domain=req.target_domain, atom_task_id=task_id,
+        live_url=live_url, duration_sec=duration_sec,
+    )
     return WorkflowResult(
         status='completed',
         message=f'Lander deployed. Live at {live_url}',
@@ -277,6 +303,7 @@ def run_existing_domain_workflow(
             'live_url': live_url,
             'setup_result': setup_result,
             'copy_result': copy_result,
+            'duration_sec': duration_sec,
         },
     )
 

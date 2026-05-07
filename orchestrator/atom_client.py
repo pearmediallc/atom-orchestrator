@@ -20,6 +20,7 @@ import time
 import requests
 
 from config import Config
+from orchestrator.log_setup import log_event
 
 
 logger = logging.getLogger(__name__)
@@ -201,15 +202,27 @@ class AtomClient:
             if location.endswith('/login') or '/login?' in location:
                 # Defensive: a 302 BACK to /login means the redirect is
                 # the post-login bounce, not the success case.
+                log_event(
+                    'atom_login_failed', level=logging.ERROR,
+                    username=username,
+                    failure_reason='redirected_back_to_login',
+                    location=location,
+                )
                 raise AtomAuthenticationError(
                     f'POST {url} returned 302 -> {location} (redirect '
                     f'back to login means credentials were rejected)'
                 )
+            log_event('atom_login_succeeded', username=username)
             return True
 
         if r.status_code == 200:
             # The form was re-rendered, which Flask-Login does on bad
             # credentials. Treat as auth failure — never as success.
+            log_event(
+                'atom_login_failed', level=logging.ERROR,
+                username=username,
+                failure_reason='form_re_rendered_http_200',
+            )
             raise AtomAuthenticationError(
                 f'POST {url} returned HTTP 200 with no redirect — '
                 f'ATOM re-rendered the login form, meaning credentials '
