@@ -26,10 +26,32 @@ def create_app() -> Flask:
 
     @app.route('/health')
     def health():
+        """Liveness + readiness combined.
+
+        Returns 200 only when the bot can both serve HTTP AND reach its
+        Postgres inventory. Returns 503 with a structured `reason` when
+        the DB is unreachable so Render's load balancer (or any external
+        monitor) can drain a pod whose data plane went away — instead of
+        sending traffic to a process that will only return 500s once it
+        tries to query inventory (2026-05-08 audit fix).
+
+        Intentionally cheap: a single `SELECT 1` plus `fetchone`. Adds
+        ~5ms typical, dominated by DB RTT.
+        """
+        try:
+            inventory_store.health_check()
+        except inventory_store.StoreUnavailable as e:
+            return jsonify({
+                'status': 'unhealthy',
+                'service': 'atom-orchestrator',
+                'reason': 'db_unavailable',
+                'error': str(e),
+            }), 503
         return jsonify({
             'status': 'healthy',
             'service': 'atom-orchestrator',
             'atom_base_url': Config.ATOM_BASE_URL,
+            'db': 'reachable',
         })
 
     return app

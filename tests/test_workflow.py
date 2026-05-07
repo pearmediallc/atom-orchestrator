@@ -168,6 +168,43 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
     assert tmp_inventory.get_domain('copy-fail.com')['setup_at'] is None
 
 
+def test_workflow_uses_configured_phase7_timeout(tmp_inventory, monkeypatch):
+    """Audit fix 2026-05-08: timeout was hardcoded to 600s, too short
+    for fresh-domain ACM cert validation. Now read from
+    Config.PHASE7_SETUP_TIMEOUT_SEC so ops can lengthen without a code
+    change. Default must remain >= 1800 sec (30 min).
+    """
+    from config import Config
+    # Confirm default is generous enough for fresh-domain runs.
+    assert Config.PHASE7_SETUP_TIMEOUT_SEC >= 1800
+
+    tmp_inventory.add_domain(
+        domain='timeout-config.com', aws_account='auto-insurance',
+    )
+    monkeypatch.setattr(Config, 'PHASE7_SETUP_TIMEOUT_SEC', 4242)
+
+    captured_timeout = {}
+
+    def fake_wait(task_id, timeout, *args, **kwargs):
+        captured_timeout['value'] = timeout
+        return _completed_status()
+
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.side_effect = fake_wait
+    client.copy_files.return_value = {'message': 'copied 1 files'}
+
+    req = ExistingDomainRequest(
+        target_domain='timeout-config.com',
+        source_account='auto-insurance',
+        source_bucket='lander-source.com',
+        source_folders=['lander-v3/'],
+    )
+    run_existing_domain_workflow(req, client=client)
+
+    assert captured_timeout['value'] == 4242
+
+
 def test_returns_failed_when_copy_files_reports_zero_files(tmp_inventory):
     """ATOM returns 200 OK with 'Successfully copied 0 files from ...' when
     the source path is empty. This was a Path A false-positive bug — the

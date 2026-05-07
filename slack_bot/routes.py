@@ -1198,12 +1198,33 @@ if _bolt_app is not None:
         # Update inventory: stamp setup_at so /list-domains shows ✅, and
         # persist the lander URL the operator submitted (Path A previously
         # left lander_url NULL on the row).
+        #
+        # mark_setup_complete is an UPDATE — when the domain isn't yet in
+        # inventory it's a benign no-op (no rows affected, no error). So
+        # we do NOT swallow exceptions here: any exception means the DB
+        # itself is unhappy (network down, schema drift, auth) and we
+        # MUST surface it. Silently passing would let the bot tell Slack
+        # "deployed ✅" while the row stayed unmodified, leaving inventory
+        # and AWS state divergent (reported in 2026-05-08 audit).
         try:
             inventory_store.mark_setup_complete(
                 target_domain, lander_url=lander_url or None,
             )
         except Exception:
-            pass  # Domain may not be in inventory yet (Phase 6 covers that)
+            logger.exception(
+                'mark_setup_complete failed for domain=%s requester=%s — '
+                'inventory and AWS state may diverge',
+                target_domain, requester,
+            )
+            client.chat_postMessage(
+                channel=channel, thread_ts=message_ts,
+                text=(':warning: Inventory update failed for '
+                      f'`{target_domain}`. The Mark Deployed click was '
+                      'recorded in Slack, but the inventory row was NOT '
+                      'updated. Check the bot logs and re-run once the '
+                      'DB is healthy.'),
+            )
+            raise
 
         # Replace the button with a "confirmed" view
         client.chat_update(
@@ -1270,6 +1291,13 @@ if _bolt_app is not None:
         # Add to inventory so /list-domains starts showing it (and so the
         # Phase 7 workflow can find it — run_existing_domain_workflow
         # rejects domains that aren't in the store).
+        #
+        # The ONLY benign DB failure here is "domain already exists"
+        # (DuplicateDomainError) — that's the user clicking Mark Purchased
+        # twice on the same row, idempotent. Every other DB error means
+        # the inventory write didn't happen, so we MUST surface it
+        # instead of silently telling Slack "purchased ✅" while the
+        # backing row was lost (2026-05-08 audit fix).
         try:
             inventory_store.add_domain(
                 domain=domain,
@@ -1278,8 +1306,27 @@ if _bolt_app is not None:
                 requested_by=f'Slack:{requester}',
                 notes='Purchased via /new-domain bot flow',
             )
+        except inventory_store.DuplicateDomainError:
+            logger.info(
+                'add_domain idempotent skip — domain=%s already in '
+                'inventory; treating as benign re-click',
+                domain,
+            )
         except Exception:
-            pass  # Already exists or other issue — non-fatal for the UX update
+            logger.exception(
+                'add_domain failed for domain=%s requester=%s — '
+                'inventory write did NOT happen', domain, requester,
+            )
+            client.chat_postMessage(
+                channel=channel, thread_ts=message_ts,
+                text=(':warning: Inventory write failed for '
+                      f'`{domain}`. Mark Purchased was recorded in '
+                      'Slack, but the new row was NOT inserted — '
+                      '/list-domains will not show this domain until '
+                      'the DB is healthy and Mark Purchased is clicked '
+                      'again. Check the bot logs.'),
+            )
+            raise
 
         # Replace the button with a "purchased" view
         phase7_note = (
@@ -1445,10 +1492,29 @@ _NEW_DOMAIN_MODAL = {
 
 @slack_bp.route('/health', methods=['GET'])
 def slack_health():
+    """Slack-blueprint-scoped health probe.
+
+    Reports both the Slack bolt-app status AND the inventory DB. The
+    Slack interaction handlers all touch the inventory (mark deployed,
+    add purchased, list domains), so a healthy slack blueprint with a
+    dead DB would still 500 on every interaction. Returning 503 here
+    keeps the signals consistent with `/health` (2026-05-08 audit fix).
+    """
+    try:
+        inventory_store.health_check()
+        db_status = 'reachable'
+    except inventory_store.StoreUnavailable as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'reason': 'db_unavailable',
+            'error': str(e),
+            'bolt_active': _bolt_app is not None,
+        }), 503
     return jsonify({
         'status': 'slack blueprint mounted',
         'phase': 2,
         'bolt_active': _bolt_app is not None,
+        'db': db_status,
     })
 
 

@@ -124,6 +124,17 @@ class Config:
     # bot without breaking the demo if ATOM is unreachable or AWS is broken.
     ENABLE_PHASE_7 = os.getenv('ENABLE_PHASE_7', 'false').lower() in ('1', 'true', 'yes', 'on')
 
+    # How long to wait for ATOM's setup_domain task to reach a terminal
+    # state (completed | failed). Default is 30 minutes — enough for a
+    # FRESH domain to go through ACM cert validation (the slow step,
+    # 5–30 min depending on DNS propagation) plus CloudFront build.
+    # Path A (idempotent reuse on already-set-up domains) typically
+    # finishes in <30 sec, so the timeout is a safety ceiling, not a
+    # baseline. The previous hardcoded 600s was too short for fresh
+    # domains and caused false "did not complete in time" failures
+    # while ATOM was still legitimately working (2026-05-08 audit).
+    PHASE7_SETUP_TIMEOUT_SEC = int(os.getenv('PHASE7_SETUP_TIMEOUT_SEC', '1800'))
+
     # Per-vertical defaults that tell run_existing_domain_workflow which
     # source bucket / folder to copy lander files from. The Slack flow only
     # collects a lander URL, not bucket+folder, so these defaults fill the

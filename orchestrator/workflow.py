@@ -98,9 +98,15 @@ def run_existing_domain_workflow(
             details={'reason': 'atom_setup_kickoff_failed'},
         )
 
-    # 3. Wait for setup to finish
+    # 3. Wait for setup to finish. Timeout is configured via
+    # Config.PHASE7_SETUP_TIMEOUT_SEC (default 30 min) — long enough
+    # for a fresh-domain ACM cert validation to complete. The previous
+    # hardcoded 600s aborted legitimate runs while cert was still
+    # propagating (2026-05-08 audit fix).
     try:
-        setup_result = client.wait_for_setup(task_id, timeout=600)
+        setup_result = client.wait_for_setup(
+            task_id, timeout=Config.PHASE7_SETUP_TIMEOUT_SEC,
+        )
     except TimeoutError as e:
         return WorkflowResult(
             status='failed',
