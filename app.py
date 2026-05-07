@@ -27,6 +27,26 @@ def create_app() -> Flask:
     # first boot after the schema bump.
     inventory_store.init_db()
 
+    # Recover Phase 7 tasks whose worker died mid-flight (e.g. Render
+    # redeploy, OOM kill). recover_stale_running_tasks() requeues any
+    # 'running' row whose heartbeat is stale and dispatches a fresh
+    # worker per task. Idempotent — no-op when the queue is empty
+    # (audit #2 fix).
+    from orchestrator import tasks
+    try:
+        recovered = tasks.recover_stale_running_tasks()
+        if recovered:
+            print(
+                f"  → recovered {len(recovered)} stale Phase 7 task(s): "
+                f"{recovered}"
+            )
+    except Exception as e:
+        # Never block the app from booting on a recovery failure —
+        # the tasks stay in 'running' and the next boot will try
+        # again. The DB itself being unreachable will fail /health,
+        # and Render's load balancer will drain the pod.
+        print(f"  → Phase 7 task recovery failed (non-fatal): {e}")
+
     app.register_blueprint(slack_bp, url_prefix='/slack')
     app.register_blueprint(inventory_bp, url_prefix='/inventory')
     app.register_blueprint(orchestrator_bp, url_prefix='/workflow')

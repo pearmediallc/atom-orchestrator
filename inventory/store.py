@@ -88,6 +88,14 @@ _VALID_STATUSES = {
 }
 
 
+# Baseline schema — CREATE TABLE only. No CREATE INDEX statements
+# for columns that may need ALTER on an existing prod table; those
+# live in _POST_LAUNCH_INDICES so they run AFTER _ensure_columns has
+# guaranteed the columns exist.
+#
+# Phase7_tasks indices stay here because the table is brand-new — if
+# the table is being created right now, all its columns exist
+# immediately and the index can be created in the same batch.
 _SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS domains (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,8 +113,26 @@ CREATE TABLE IF NOT EXISTS domains (
     updated_at      TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_domains_vertical ON domains(vertical);
-CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status);
-CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by);
+
+CREATE TABLE IF NOT EXISTS phase7_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain          TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    request_json    TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 1,
+    atom_task_id    TEXT,
+    error           TEXT,
+    worker_id       TEXT,
+    heartbeat_at    TIMESTAMP,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at      TIMESTAMP,
+    finished_at     TIMESTAMP,
+    updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_phase7_tasks_status ON phase7_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_phase7_tasks_domain ON phase7_tasks(domain);
 """
 
 _POSTGRES_SCHEMA = """
@@ -126,8 +152,26 @@ CREATE TABLE IF NOT EXISTS domains (
     updated_at      TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_domains_vertical ON domains(vertical);
-CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status);
-CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by);
+
+CREATE TABLE IF NOT EXISTS phase7_tasks (
+    id              SERIAL PRIMARY KEY,
+    domain          TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    request_json    TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 1,
+    atom_task_id    TEXT,
+    error           TEXT,
+    worker_id       TEXT,
+    heartbeat_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_phase7_tasks_status ON phase7_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_phase7_tasks_domain ON phase7_tasks(domain);
 """
 
 # Columns added post-launch — these need to be ALTER-added on existing

@@ -1252,16 +1252,21 @@ if _bolt_app is not None:
                       f'Confirmed by <@{confirmer}>.'),
             )
 
-        # Phase 7: trigger ATOM in a background thread (the workflow blocks
-        # for minutes; Slack interactions must ack within 3s).
+        # Phase 7: enqueue the workflow on the durable task queue
+        # instead of spawning a fire-and-forget daemon thread. The
+        # task row survives a process restart; if Render redeploys
+        # mid-deploy the boot-time recovery sweeper requeues it
+        # automatically (audit #2 fix).
         if Config.ENABLE_PHASE_7:
-            threading.Thread(
-                target=_phase7_run_atom_setup,
-                args=(client, channel, message_ts, target_domain,
-                      vertical, requester, lander_url),
-                daemon=True,
-                name=f'phase7-deploy-{target_domain}',
-            ).start()
+            from orchestrator.tasks_runner import enqueue_path_a
+            enqueue_path_a(
+                channel=channel,
+                message_ts=message_ts,
+                target_domain=target_domain,
+                vertical=vertical,
+                requester=requester,
+                lander_url=lander_url,
+            )
 
     @_bolt_app.action('confirm_purchased')
     def handle_confirm_purchased(ack, body, client):
@@ -1362,15 +1367,18 @@ if _bolt_app is not None:
                       f'Confirmed by <@{confirmer}>. Setup will follow.'),
             )
 
-        # Phase 7: trigger ATOM in a background thread.
+        # Phase 7: enqueue on the durable task queue (audit #2 fix —
+        # see confirm_deployed above for rationale).
         if Config.ENABLE_PHASE_7:
-            threading.Thread(
-                target=_phase7_run_atom_setup,
-                args=(client, channel, message_ts, domain,
-                      vertical, requester, lander),
-                daemon=True,
-                name=f'phase7-purchase-{domain}',
-            ).start()
+            from orchestrator.tasks_runner import enqueue_path_b
+            enqueue_path_b(
+                channel=channel,
+                message_ts=message_ts,
+                target_domain=domain,
+                vertical=vertical,
+                requester=requester,
+                lander_url=lander,
+            )
 
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
