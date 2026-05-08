@@ -31,6 +31,11 @@ from orchestrator.workflow import (
     run_existing_domain_workflow,
     suggest_new_domains,
 )
+from slack_bot.payload_signing import (
+    BadSignature,
+    sign_payload,
+    verify_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +169,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                 'action_id': 'pick_domain',
                 'text': {'type': 'plain_text', 'text': 'Pick this'},
                 'style': 'primary',
-                'value': json.dumps({
+                'value': sign_payload({
                     'domain': s['domain'],
                     'vertical': vertical,
                     'lander': lander,
@@ -181,7 +186,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
             'type': 'button',
             'action_id': 'refresh_domain_suggestions',
             'text': {'type': 'plain_text', 'text': ':arrows_counterclockwise: Show 5 more'},
-            'value': json.dumps({
+            'value': sign_payload({
                 'vertical': vertical,
                 'audience': audience,
                 'extension': extension,
@@ -451,7 +456,7 @@ if _bolt_app is not None:
                     'type': 'button',
                     'action_id': 'deploy_lander_existing',
                     'text': {'type': 'plain_text', 'text': 'Deploy lander'},
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'domain': r['domain'],
                         'vertical': r.get('vertical') or '',
                         'aws_account': r.get('aws_account') or '',
@@ -646,7 +651,7 @@ if _bolt_app is not None:
                     'action_id': 'confirm_purchased',
                     'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Purchased'},
                     'style': 'primary',
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'domain': domain,
                         'vertical': vertical,
                         'lander': lander,
@@ -671,8 +676,20 @@ if _bolt_app is not None:
         """
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         vertical = data.get('vertical', '')
@@ -735,8 +752,20 @@ if _bolt_app is not None:
         ack()
 
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         domain = data['domain']
@@ -746,7 +775,7 @@ if _bolt_app is not None:
         requester = data['requester']
 
         approver_ids = Config.APPROVER_SLACK_USER_IDS
-        button_payload = json.dumps({
+        button_payload = sign_payload({
             'domain': domain,
             'vertical': vertical,
             'lander': lander,
@@ -871,8 +900,20 @@ if _bolt_app is not None:
         """
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         domain = data['domain']
@@ -920,8 +961,20 @@ if _bolt_app is not None:
         tell the requester. No domain enters inventory."""
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         domain = data['domain']
@@ -965,8 +1018,20 @@ if _bolt_app is not None:
         """
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         target_domain = data['domain']
@@ -1134,7 +1199,7 @@ if _bolt_app is not None:
                     'action_id': 'confirm_deployed',
                     'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Deployed'},
                     'style': 'primary',
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'target_domain': target_domain,
                         'vertical': vertical,
                         'lander': lander,
@@ -1184,8 +1249,20 @@ if _bolt_app is not None:
         """
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         target_domain = data['target_domain']
@@ -1289,8 +1366,20 @@ if _bolt_app is not None:
         """
         ack()
         try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+            data = verify_payload(body['actions'][0]['value'])
+        except BadSignature as e:
+            # Tampered or wrong-secret signature → log + drop the
+            # click. Audit #14 fix: prevents an in-workspace user
+            # forging a button.value to redirect a legitimate
+            # action to the wrong domain / requester.
+            log_event(
+                'button_signature_invalid', level=logging.WARNING,
+                action_id=body.get('actions', [{}])[0].get('action_id'),
+                user=body.get('user', {}).get('id'),
+                error=str(e),
+            )
+            return
+        except (KeyError, IndexError, ValueError):
             return
 
         domain = data['domain']
