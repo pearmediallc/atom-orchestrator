@@ -19,6 +19,10 @@ State machine (see docs/flow):
     AWAITING_MDB_INVENTORY_RESPONSE — DM'd MDB on IDLE
     AWAITING_UTKARSH_RENEW          — MDB said "yes using"
     AWAITING_UTKARSH_DISABLE_RENEW  — MDB said "no, not using"
+    AWAITING_TL_OVERRIDE_USAGE      — MDB ghosted the EXPIRING DM (>48h),
+                                       SLA escalator pinged TL
+    AWAITING_TL_OVERRIDE_INVENTORY  — MDB ghosted the IDLE DM (>48h),
+                                       SLA escalator pinged TL
 
   terminal-ish (cron will re-classify on next pass):
     RENEWED         — Utkarsh marked renewed
@@ -45,6 +49,8 @@ AWAITING_MDB_USAGE_RESPONSE     = 'AWAITING_MDB_USAGE_RESPONSE'
 AWAITING_MDB_INVENTORY_RESPONSE = 'AWAITING_MDB_INVENTORY_RESPONSE'
 AWAITING_UTKARSH_RENEW          = 'AWAITING_UTKARSH_RENEW'
 AWAITING_UTKARSH_DISABLE_RENEW  = 'AWAITING_UTKARSH_DISABLE_RENEW'
+AWAITING_TL_OVERRIDE_USAGE      = 'AWAITING_TL_OVERRIDE_USAGE'
+AWAITING_TL_OVERRIDE_INVENTORY  = 'AWAITING_TL_OVERRIDE_INVENTORY'
 
 # Cron classifier never re-touches domains in these states — they're
 # waiting on a human click. Prevents re-prompting / race conditions.
@@ -53,6 +59,15 @@ AWAITING_STATES = frozenset({
     AWAITING_MDB_INVENTORY_RESPONSE,
     AWAITING_UTKARSH_RENEW,
     AWAITING_UTKARSH_DISABLE_RENEW,
+    AWAITING_TL_OVERRIDE_USAGE,
+    AWAITING_TL_OVERRIDE_INVENTORY,
+})
+
+# States the SLA escalator looks for — only the MDB-side waits get
+# escalated (the Utkarsh-side waits get a separate, gentler nudge).
+AWAITING_MDB_STATES = frozenset({
+    AWAITING_MDB_USAGE_RESPONSE,
+    AWAITING_MDB_INVENTORY_RESPONSE,
 })
 
 EXPIRING_STATES = frozenset({

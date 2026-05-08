@@ -792,6 +792,52 @@ def list_domains_for_lifecycle(
     return [dict(r) for r in rows]
 
 
+def get_awaiting_domains_past_sla(
+    *, awaiting_states: _Iterable[str], hours_ago: int,
+    limit: int = 200,
+) -> List[Dict]:
+    """Return rows whose lifecycle_state is in `awaiting_states` AND
+    whose `last_prompted_at` is older than `hours_ago` hours.
+
+    Drives the SLA escalator: any MDB DM that's gone unanswered for >48h
+    gets re-routed to TL with override buttons. Limit caps how many
+    escalations we'll fire in one cron pass — prevents an unexpected
+    backlog from spamming TL with hundreds of cards.
+
+    Rows with `last_prompted_at IS NULL` are excluded (the prompt was
+    never sent, so the SLA clock hasn't started).
+    """
+    states = list(awaiting_states)
+    if not states:
+        return []
+    placeholders = ','.join(['?'] * len(states))
+
+    if _is_postgres():
+        sql = (
+            f'SELECT * FROM domains '
+            f'WHERE lifecycle_state IN ({placeholders}) '
+            f'  AND last_prompted_at IS NOT NULL '
+            f"  AND last_prompted_at < NOW() - INTERVAL '{int(hours_ago)} hours' "
+            f'ORDER BY last_prompted_at ASC '
+            f'LIMIT ?'
+        )
+    else:
+        sql = (
+            f'SELECT * FROM domains '
+            f'WHERE lifecycle_state IN ({placeholders}) '
+            f'  AND last_prompted_at IS NOT NULL '
+            f"  AND last_prompted_at < datetime('now', '-{int(hours_ago)} hours') "
+            f'ORDER BY last_prompted_at ASC '
+            f'LIMIT ?'
+        )
+    with _conn() as c:
+        cur = _execute(c, sql, tuple(states) + (limit,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
 def get_domains_due_for_namecheap_sync(
     *, max_age_days: int = 7, near_expiry_days: int = 60, limit: int = 50,
 ) -> List[Dict]:

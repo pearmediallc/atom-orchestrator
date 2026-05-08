@@ -352,3 +352,143 @@ def _expiring_card(domain: str, assigned: Optional[str],
              'style': 'danger', 'value': payload},
         ]},
     ]
+
+
+# ─── SLA escalator ────────────────────────────────────────────────────────
+# Second cron pass — scans rows in AWAITING_MDB_* whose last_prompted_at is
+# older than LIFECYCLE_MDB_RESPONSE_SLA_HOURS, and DMs TL with override
+# buttons. After escalation the row's state moves to AWAITING_TL_OVERRIDE_*
+# so we don't re-escalate on the next run.
+
+def run_sla_escalation(slack_client=None) -> Dict[str, int]:
+    """Walk every MDB-side AWAITING row past SLA and DM TL with the
+    override card. Returns counters for the cron's stdout log."""
+    if slack_client is None:
+        slack_client = _make_slack_client()
+
+    sla_h = Config.LIFECYCLE_MDB_RESPONSE_SLA_HOURS
+    rows = store.get_awaiting_domains_past_sla(
+        awaiting_states=S.AWAITING_MDB_STATES, hours_ago=sla_h,
+    )
+    logger.info(
+        'sla escalator starting — %d rows past SLA (%dh), dry_run=%s',
+        len(rows), sla_h, Config.LIFECYCLE_DRY_RUN,
+    )
+
+    counters = {'escalated': 0, 'errors': 0}
+    for row in rows:
+        try:
+            _escalate_to_tl(slack_client, row)
+            counters['escalated'] += 1
+        except Exception:
+            logger.exception(
+                'sla escalation failed for domain=%s', row.get('domain'),
+            )
+            counters['errors'] += 1
+
+    logger.info('sla escalator finished — %s', counters)
+    return counters
+
+
+def _escalate_to_tl(slack_client, row) -> None:
+    """Post the matching TL override card. Branches on the current
+    AWAITING_MDB_* state to know which 2 buttons to offer."""
+    domain = row['domain']
+    current = row.get('lifecycle_state')
+
+    if current == S.AWAITING_MDB_USAGE_RESPONSE:
+        new_state = S.AWAITING_TL_OVERRIDE_USAGE
+        blocks = _tl_override_usage_card(row)
+    elif current == S.AWAITING_MDB_INVENTORY_RESPONSE:
+        new_state = S.AWAITING_TL_OVERRIDE_INVENTORY
+        blocks = _tl_override_inventory_card(row)
+    else:
+        logger.warning(
+            'sla escalator saw domain=%s in unexpected state=%s — skipping',
+            domain, current,
+        )
+        return
+
+    sent = _dm.dm(
+        slack_client, real_recipient=Config.TL_SLACK_USER_ID,
+        text=(f':alarm_clock: MDB has not responded about `{domain}` in '
+              f'{Config.LIFECYCLE_MDB_RESPONSE_SLA_HOURS}h. your call.'),
+        blocks=blocks,
+        dry_run_label=f'tl_escalation:{domain}',
+    )
+    if sent is None:
+        logger.warning(
+            'sla escalator could not DM TL for %s (no TL_SLACK_USER_ID?)',
+            domain,
+        )
+        return
+
+    store.set_lifecycle_state(domain, new_state)
+    store.bump_last_prompted_at(domain)
+    store.record_event(
+        domain, 'escalated_to_tl', actor='cron',
+        from_state=current, to_state=new_state,
+        metadata={
+            'sla_hours': Config.LIFECYCLE_MDB_RESPONSE_SLA_HOURS,
+            'previous_assigned_to': row.get('assigned_to'),
+        },
+    )
+
+
+def _tl_override_usage_card(row) -> list:
+    """Card posted when an MDB ghosts an EXPIRING DM. TL picks renew or
+    let-it-lapse."""
+    domain = row['domain']
+    payload = json.dumps({
+        'domain': domain,
+        'assigned_to': row.get('assigned_to') or '',
+    })
+    expire_at = row.get('expire_at')
+    return [
+        {'type': 'section', 'text': {
+            'type': 'mrkdwn',
+            'text': (
+                f':alarm_clock: *MDB ghosted: `{domain}`*\n'
+                f'• Was assigned to: <@{_dm.normalise_slack_id(row.get("assigned_to")) or "unknown"}>\n'
+                f'• Expires: `{expire_at}`\n\n'
+                'They had 48h to confirm. Decide for them:'
+            ),
+        }},
+        {'type': 'actions', 'elements': [
+            {'type': 'button', 'action_id': 'lifecycle_tl_force_renew',
+             'text': {'type': 'plain_text', 'text': ':moneybag: Tell Utkarsh to renew'},
+             'style': 'primary', 'value': payload},
+            {'type': 'button', 'action_id': 'lifecycle_tl_force_disable_renew',
+             'text': {'type': 'plain_text', 'text': ':no_entry_sign: Let it lapse'},
+             'style': 'danger', 'value': payload},
+        ]},
+    ]
+
+
+def _tl_override_inventory_card(row) -> list:
+    """Card posted when an MDB ghosts an IDLE DM. TL picks push or
+    snooze 30."""
+    domain = row['domain']
+    payload = json.dumps({
+        'domain': domain,
+        'assigned_to': row.get('assigned_to') or '',
+    })
+    return [
+        {'type': 'section', 'text': {
+            'type': 'mrkdwn',
+            'text': (
+                f':alarm_clock: *MDB ghosted: `{domain}`*\n'
+                f'• Was assigned to: <@{_dm.normalise_slack_id(row.get("assigned_to")) or "unknown"}>\n'
+                '• Has had no spend in last 30d.\n\n'
+                'They had 48h to respond. Decide for them:'
+            ),
+        }},
+        {'type': 'actions', 'elements': [
+            {'type': 'button', 'action_id': 'lifecycle_tl_force_push',
+             'text': {'type': 'plain_text', 'text': ':package: Push to inventory'},
+             'style': 'primary', 'value': payload},
+            {'type': 'button', 'action_id': 'lifecycle_tl_force_keep_30',
+             'text': {'type': 'plain_text', 'text': ':zzz: Force keep 30 days'},
+             'value': payload},
+        ]},
+    ]

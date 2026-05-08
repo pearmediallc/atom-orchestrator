@@ -469,10 +469,14 @@ def register(app) -> None:
             _ephemeral_not_for_you(client, body['channel']['id'], actor, 'TL')
             return
         domain = data['domain']
+        # SLA escalator may have advanced state to AWAITING_TL_OVERRIDE_USAGE,
+        # OR TL might be clicking before MDB responded — read whatever's
+        # there so the audit log reflects the real transition.
+        from_state = (store.get_domain(domain) or {}).get('lifecycle_state')
         store.set_lifecycle_state(domain, S.AWAITING_UTKARSH_RENEW)
         store.record_event(
             domain, 'tl_forced_renew', actor=actor,
-            from_state=S.AWAITING_MDB_USAGE_RESPONSE,
+            from_state=from_state,
             to_state=S.AWAITING_UTKARSH_RENEW,
         )
         _replace_card(
@@ -508,10 +512,11 @@ def register(app) -> None:
             _ephemeral_not_for_you(client, body['channel']['id'], actor, 'TL')
             return
         domain = data['domain']
+        from_state = (store.get_domain(domain) or {}).get('lifecycle_state')
         store.set_lifecycle_state(domain, S.AWAITING_UTKARSH_DISABLE_RENEW)
         store.record_event(
             domain, 'tl_forced_disable_renew', actor=actor,
-            from_state=S.AWAITING_MDB_USAGE_RESPONSE,
+            from_state=from_state,
             to_state=S.AWAITING_UTKARSH_DISABLE_RENEW,
         )
         _replace_card(
@@ -548,11 +553,12 @@ def register(app) -> None:
             return
         domain = data['domain']
         prev = data.get('assigned_to') or ''
+        from_state = (store.get_domain(domain) or {}).get('lifecycle_state')
         store.assign_to(domain, None)
         store.set_lifecycle_state(domain, S.INVENTORY)
         store.record_event(
             domain, 'tl_forced_push_inventory', actor=actor,
-            from_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
+            from_state=from_state,
             to_state=S.INVENTORY,
             metadata={'previous_assigned_to': prev},
         )
@@ -573,10 +579,11 @@ def register(app) -> None:
             _ephemeral_not_for_you(client, body['channel']['id'], actor, 'TL')
             return
         domain = data['domain']
+        from_state = (store.get_domain(domain) or {}).get('lifecycle_state')
         store.set_lifecycle_state(domain, S.EXTENDED_30)
         store.record_event(
             domain, 'tl_forced_keep_30', actor=actor,
-            from_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
+            from_state=from_state,
             to_state=S.EXTENDED_30,
         )
         _replace_card(
