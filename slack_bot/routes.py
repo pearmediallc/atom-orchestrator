@@ -98,6 +98,76 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
     _handler = SlackRequestHandler(_bolt_app)
 
 
+# ─── Shared helpers for interactive button click handlers ─────────────────
+
+
+def _verify_button_click(body: dict):
+    """Verify HMAC on a Slack interactive button click.
+
+    Centralises the seven-place repeat of the same sign-check
+    boilerplate (parse + verify + log on tamper + drop on malformed).
+
+    Returns:
+      • parsed payload dict on success
+      • None when the click should be silently dropped (malformed
+        JSON, missing fields, OR tampered signature). Tampered
+        clicks are logged as `button_signature_invalid`; drops
+        from malformed input are silent (matches pre-batch-5
+        behaviour).
+    """
+    try:
+        return verify_payload(body['actions'][0]['value'])
+    except BadSignature as e:
+        # Tampered or wrong-secret signature → log + drop the click.
+        # Audit #14: prevents an in-workspace user forging a
+        # button.value to redirect a legitimate action to a
+        # different domain / requester.
+        log_event(
+            'button_signature_invalid', level=logging.WARNING,
+            action_id=body.get('actions', [{}])[0].get('action_id'),
+            user=body.get('user', {}).get('id'),
+            error=str(e),
+        )
+        return None
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
+def _build_confirmed_card(*, action_label: str, target: str,
+                          confirmer_id: str,
+                          extra_context: str = '') -> list:
+    """Block Kit blocks for a 'Confirmed X: target' chat_update.
+
+    Used by Path A's Mark Deployed click and Path B's Mark Purchased
+    click — both rendered the same header + context blocks before
+    this refactor (audit #13 cleanup). Centralising the layout
+    prevents the two Slack cards from drifting apart when a future
+    change touches one of them.
+
+    Args:
+      action_label: post-action verb shown in the green-tick header,
+                    e.g. 'Deployed' / 'Purchased' / 'Approved'.
+      target: domain name (or whatever else identifies what was
+              acted on) shown after the action label.
+      confirmer_id: Slack user id of the operator who clicked the
+                    button. Used in the @mention.
+      extra_context: optional sentence appended to the standard
+                     'Confirmed by <@user>.' context line.
+    """
+    context_text = f'Confirmed by <@{confirmer_id}>.'
+    if extra_context:
+        context_text += ' ' + extra_context
+    return [
+        {'type': 'header', 'text': {
+            'type': 'plain_text',
+            'text': f':white_check_mark: {action_label}: {target}',
+        }},
+        {'type': 'context', 'elements': [{
+            'type': 'mrkdwn', 'text': context_text,
+        }]},
+    ]
+
+
 # ─── /new-domain shortlist builder (shared by modal submission + refresh) ─
 
 def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
@@ -675,21 +745,8 @@ if _bolt_app is not None:
         shortlist when ready.
         """
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         vertical = data.get('vertical', '')
@@ -750,22 +807,8 @@ if _bolt_app is not None:
         through humans (TL approval, then Utkarsh manual buy).
         """
         ack()
-
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -899,21 +942,8 @@ if _bolt_app is not None:
         "Approved by @TL" view so the same TL can't approve twice.
         """
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -960,21 +990,8 @@ if _bolt_app is not None:
         """TL clicked Reject on a Path B approval card. Stop the flow,
         tell the requester. No domain enters inventory."""
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -1017,21 +1034,8 @@ if _bolt_app is not None:
           • asks for the source lander URL to deploy
         """
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         target_domain = data['domain']
@@ -1248,21 +1252,8 @@ if _bolt_app is not None:
         message; final status is DM'd to the requester.
         """
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         target_domain = data['target_domain']
@@ -1311,21 +1302,18 @@ if _bolt_app is not None:
             )
             raise
 
-        # Replace the button with a "confirmed" view
+        # Replace the button with a "confirmed" view (audit #13:
+        # shared with confirm_purchased via _build_confirmed_card so
+        # the two paths can't drift apart).
         client.chat_update(
             channel=channel,
             ts=message_ts,
             text=f'Confirmed deployed: {target_domain}',
-            blocks=[
-                {'type': 'header', 'text': {
-                    'type': 'plain_text',
-                    'text': f':white_check_mark: Deployed: {target_domain}',
-                }},
-                {'type': 'context', 'elements': [{
-                    'type': 'mrkdwn',
-                    'text': f'Confirmed by <@{confirmer}>.',
-                }]},
-            ],
+            blocks=_build_confirmed_card(
+                action_label='Deployed',
+                target=target_domain,
+                confirmer_id=confirmer,
+            ),
         )
 
         # Notify the requester (skip if requester == confirmer to avoid
@@ -1343,8 +1331,10 @@ if _bolt_app is not None:
         # mid-deploy the boot-time recovery sweeper requeues it
         # automatically (audit #2 fix).
         if Config.ENABLE_PHASE_7:
-            from orchestrator.tasks_runner import enqueue_path_a
-            enqueue_path_a(
+            from orchestrator import tasks
+            from orchestrator.tasks_runner import enqueue_phase7
+            enqueue_phase7(
+                kind=tasks.TASK_KIND_PATH_A,
                 channel=channel,
                 message_ts=message_ts,
                 target_domain=target_domain,
@@ -1365,21 +1355,8 @@ if _bolt_app is not None:
         domain gets full setup_domain + lander copy automatically.
         """
         ack()
-        try:
-            data = verify_payload(body['actions'][0]['value'])
-        except BadSignature as e:
-            # Tampered or wrong-secret signature → log + drop the
-            # click. Audit #14 fix: prevents an in-workspace user
-            # forging a button.value to redirect a legitimate
-            # action to the wrong domain / requester.
-            log_event(
-                'button_signature_invalid', level=logging.WARNING,
-                action_id=body.get('actions', [{}])[0].get('action_id'),
-                user=body.get('user', {}).get('id'),
-                error=str(e),
-            )
-            return
-        except (KeyError, IndexError, ValueError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -1440,7 +1417,9 @@ if _bolt_app is not None:
             )
             raise
 
-        # Replace the button with a "purchased" view
+        # Replace the button with a "purchased" view (audit #13:
+        # shared with confirm_deployed via _build_confirmed_card so
+        # the two paths can't drift apart).
         phase7_note = (
             'Triggering ATOM setup now — watch this thread for progress.'
             if Config.ENABLE_PHASE_7
@@ -1450,17 +1429,12 @@ if _bolt_app is not None:
             channel=channel,
             ts=message_ts,
             text=f'Confirmed purchased: {domain}',
-            blocks=[
-                {'type': 'header', 'text': {
-                    'type': 'plain_text',
-                    'text': f':white_check_mark: Purchased: {domain}',
-                }},
-                {'type': 'context', 'elements': [{
-                    'type': 'mrkdwn',
-                    'text': (f'Confirmed by <@{confirmer}>. Added to '
-                             f'inventory. {phase7_note}'),
-                }]},
-            ],
+            blocks=_build_confirmed_card(
+                action_label='Purchased',
+                target=domain,
+                confirmer_id=confirmer,
+                extra_context=f'Added to inventory. {phase7_note}',
+            ),
         )
 
         # Notify the requester
@@ -1474,8 +1448,10 @@ if _bolt_app is not None:
         # Phase 7: enqueue on the durable task queue (audit #2 fix —
         # see confirm_deployed above for rationale).
         if Config.ENABLE_PHASE_7:
-            from orchestrator.tasks_runner import enqueue_path_b
-            enqueue_path_b(
+            from orchestrator import tasks
+            from orchestrator.tasks_runner import enqueue_phase7
+            enqueue_phase7(
+                kind=tasks.TASK_KIND_PATH_B,
                 channel=channel,
                 message_ts=message_ts,
                 target_domain=domain,

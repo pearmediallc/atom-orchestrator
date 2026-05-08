@@ -75,10 +75,10 @@ def _run_task(task_id: int) -> None:
         hb = tasks.HeartbeatThread(task_id)
         hb.start()
         try:
-            if claimed.kind == tasks.TASK_KIND_PATH_A:
-                _run_path_a(claimed)
-            elif claimed.kind == tasks.TASK_KIND_PATH_B:
-                _run_path_b(claimed)
+            if claimed.kind in (
+                tasks.TASK_KIND_PATH_A, tasks.TASK_KIND_PATH_B,
+            ):
+                _run_phase7(claimed)
             else:
                 tasks.mark_failed(
                     task_id,
@@ -124,12 +124,23 @@ def _build_slack_client():
     return WebClient(token=Config.SLACK_BOT_TOKEN)
 
 
-# ─── Per-kind runners ──────────────────────────────────────────────────────
+# ─── Per-kind runner ───────────────────────────────────────────────────────
 
-def _run_path_a(claimed: tasks.ClaimedTask) -> None:
-    """Path A — Mark Deployed click. The serialized request payload
-    carries everything the existing _phase7_run_atom_setup function
-    in slack_bot/routes.py needs."""
+def _run_phase7(claimed: tasks.ClaimedTask) -> None:
+    """Run a Phase 7 deploy task — same code path for Path A
+    (Mark Deployed) and Path B (Mark Purchased).
+
+    Both paths invoke the SAME _phase7_run_atom_setup function in
+    slack_bot/routes.py (it's idempotent, so reusing already-set-up
+    AWS resources for Path A on a known domain is a fast no-op,
+    while Path B on a fresh domain runs the full 7-step build).
+
+    Audit #13 cleanup: previously two near-identical _run_path_a /
+    _run_path_b functions; merged here because the only difference
+    was the docstring. Leaving the kind discriminator on the task
+    row preserves observability — `task_kind` is grep-able in logs
+    + queryable in inventory.
+    """
     # Lazy import to avoid the routes.py → tasks_runner cycle.
     from slack_bot.routes import _phase7_run_atom_setup
 
@@ -146,37 +157,34 @@ def _run_path_a(claimed: tasks.ClaimedTask) -> None:
     )
 
 
-def _run_path_b(claimed: tasks.ClaimedTask) -> None:
-    """Path B — Mark Purchased click. Same _phase7_run_atom_setup
-    function as Path A; the only difference is that Path B's
-    inventory row was inserted moments ago via add_domain.
-    """
-    from slack_bot.routes import _phase7_run_atom_setup
-
-    p = claimed.request
-    client = _build_slack_client()
-    _phase7_run_atom_setup(
-        client,
-        p['channel'],
-        p['message_ts'],
-        p['target_domain'],
-        p.get('vertical', ''),
-        p['requester'],
-        p.get('lander_url', ''),
-    )
+# Backward-compat aliases — the dispatcher in _run_task and any
+# external callers still reference _run_path_a / _run_path_b. Both
+# point at the unified runner; new code should call _run_phase7
+# directly.
+_run_path_a = _run_phase7
+_run_path_b = _run_phase7
 
 
-# ─── Public enqueue helpers used by routes.py ──────────────────────────────
+# ─── Public enqueue helper used by routes.py ───────────────────────────────
 
-def enqueue_path_a(*, channel: str, message_ts: str, target_domain: str,
-                   vertical: str, requester: str,
+def enqueue_phase7(*, kind: str, channel: str, message_ts: str,
+                   target_domain: str, vertical: str, requester: str,
                    lander_url: str) -> int:
-    """Enqueue a Path A 'Mark Deployed' workflow and dispatch a worker
-    immediately. Returns the task id.
+    """Enqueue a Phase 7 task and dispatch a worker immediately.
+
+    Returns the task id. `kind` is one of tasks.TASK_KIND_PATH_A
+    (Mark Deployed) or tasks.TASK_KIND_PATH_B (Mark Purchased). The
+    discriminator is recorded on the task row so grepping logs by
+    kind shows which click triggered the deploy without inspecting
+    the request payload.
+
+    Audit #13 cleanup: replaces the previous enqueue_path_a +
+    enqueue_path_b functions, which had identical bodies except for
+    the kind constant.
     """
     task_id = tasks.enqueue(
         domain=target_domain,
-        kind=tasks.TASK_KIND_PATH_A,
+        kind=kind,
         request={
             'channel': channel,
             'message_ts': message_ts,
@@ -190,23 +198,11 @@ def enqueue_path_a(*, channel: str, message_ts: str, target_domain: str,
     return task_id
 
 
-def enqueue_path_b(*, channel: str, message_ts: str, target_domain: str,
-                   vertical: str, requester: str,
-                   lander_url: str) -> int:
-    """Enqueue a Path B 'Mark Purchased' workflow and dispatch a worker
-    immediately. Returns the task id.
-    """
-    task_id = tasks.enqueue(
-        domain=target_domain,
-        kind=tasks.TASK_KIND_PATH_B,
-        request={
-            'channel': channel,
-            'message_ts': message_ts,
-            'target_domain': target_domain,
-            'vertical': vertical,
-            'requester': requester,
-            'lander_url': lander_url,
-        },
-    )
-    dispatch_worker_for(task_id)
-    return task_id
+# Backward-compat shims so existing imports (and any in-flight
+# tests) keep working while callers migrate to enqueue_phase7.
+def enqueue_path_a(**kwargs) -> int:
+    return enqueue_phase7(kind=tasks.TASK_KIND_PATH_A, **kwargs)
+
+
+def enqueue_path_b(**kwargs) -> int:
+    return enqueue_phase7(kind=tasks.TASK_KIND_PATH_B, **kwargs)
