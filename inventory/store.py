@@ -133,6 +133,23 @@ CREATE TABLE IF NOT EXISTS phase7_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_phase7_tasks_status ON phase7_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_phase7_tasks_domain ON phase7_tasks(domain);
+
+-- domain_events: append-only audit log for the lifecycle classifier and
+-- Slack handlers. Every assignment / renewal / extension / inventory move
+-- writes a row. Future /domain-history <domain> command will replay the
+-- timeline. Metadata is JSON text on SQLite, JSONB on Postgres.
+CREATE TABLE IF NOT EXISTS domain_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain       TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    actor        TEXT,
+    from_state   TEXT,
+    to_state     TEXT,
+    metadata     TEXT,
+    occurred_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_domain_events_domain      ON domain_events(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_events_occurred_at ON domain_events(occurred_at DESC);
 """
 
 _POSTGRES_SCHEMA = """
@@ -172,6 +189,19 @@ CREATE TABLE IF NOT EXISTS phase7_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_phase7_tasks_status ON phase7_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_phase7_tasks_domain ON phase7_tasks(domain);
+
+CREATE TABLE IF NOT EXISTS domain_events (
+    id           SERIAL PRIMARY KEY,
+    domain       TEXT        NOT NULL,
+    event_type   TEXT        NOT NULL,
+    actor        TEXT,
+    from_state   TEXT,
+    to_state     TEXT,
+    metadata     JSONB,
+    occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_domain_events_domain      ON domain_events(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_events_occurred_at ON domain_events(occurred_at DESC);
 """
 
 # Columns added post-launch — these need to be ALTER-added on existing
@@ -180,17 +210,28 @@ CREATE INDEX IF NOT EXISTS idx_phase7_tasks_domain ON phase7_tasks(domain);
 # boot and adds anything missing from the live schema. Idempotent —
 # safe to run repeatedly.
 _POST_LAUNCH_COLUMNS = {
-    'status':         ('TEXT', 'TEXT'),                  # (sqlite_type, postgres_type)
-    'latest_task_id': ('TEXT', 'TEXT'),
-    'latest_error':   ('TEXT', 'TEXT'),
-    'updated_at':     ('TIMESTAMP', 'TIMESTAMPTZ'),
+    'status':                 ('TEXT',      'TEXT'),       # (sqlite_type, postgres_type)
+    'latest_task_id':         ('TEXT',      'TEXT'),
+    'latest_error':           ('TEXT',      'TEXT'),
+    'updated_at':             ('TIMESTAMP', 'TIMESTAMPTZ'),
+    # Phase A (lifecycle bot) — daily classifier + Slack handlers fill these.
+    'assigned_to':            ('TEXT',      'TEXT'),
+    'expire_at':              ('TIMESTAMP', 'TIMESTAMPTZ'),
+    'auto_renew_enabled':     ('INTEGER',   'BOOLEAN'),
+    'last_active_at':         ('TIMESTAMP', 'TIMESTAMPTZ'),
+    'last_prompted_at':       ('TIMESTAMP', 'TIMESTAMPTZ'),
+    'last_namecheap_sync_at': ('TIMESTAMP', 'TIMESTAMPTZ'),
+    'lifecycle_state':        ('TEXT',      'TEXT'),
 }
 
 # Indices added post-launch (separate from column adds because Postgres
 # CREATE INDEX IF NOT EXISTS is sufficient and idempotent).
 _POST_LAUNCH_INDICES = {
-    'idx_domains_status':       'CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status)',
-    'idx_domains_requested_by': 'CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by)',
+    'idx_domains_status':          'CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status)',
+    'idx_domains_requested_by':    'CREATE INDEX IF NOT EXISTS idx_domains_requested_by ON domains(requested_by)',
+    'idx_domains_lifecycle_state': 'CREATE INDEX IF NOT EXISTS idx_domains_lifecycle_state ON domains(lifecycle_state)',
+    'idx_domains_expire_at':       'CREATE INDEX IF NOT EXISTS idx_domains_expire_at ON domains(expire_at)',
+    'idx_domains_assigned_to':     'CREATE INDEX IF NOT EXISTS idx_domains_assigned_to ON domains(assigned_to)',
 }
 
 
@@ -308,6 +349,32 @@ def _ensure_indices(c) -> None:
         _execute(c, ddl)
 
 
+def _backfill_assigned_to_from_requested_by(c) -> None:
+    """Seed lifecycle's `assigned_to` column from `requested_by` on rows
+    where it's still NULL.
+
+    Why: the lifecycle classifier needs an MDB to DM. Pre-Phase-A rows
+    only have `requested_by` (set on Path B Mark Purchased + by the CSV
+    import). Copying that into `assigned_to` gives the bot something
+    to work with from day one.
+
+    `requested_by` values from confirm_purchased look like
+    'Slack:U_ABCDEF' (see slack_bot.routes._send_purchase…). Lifecycle's
+    DM helper strips that prefix at send time — we keep the value
+    verbatim here so requested_by stays the source of truth.
+
+    Idempotent: subsequent runs match 0 rows because assigned_to is
+    populated.
+    """
+    _execute(
+        c,
+        'UPDATE domains SET assigned_to = requested_by '
+        "WHERE assigned_to IS NULL "
+        "AND requested_by IS NOT NULL "
+        "AND requested_by <> ''"
+    )
+
+
 def _backfill_legacy_aws_account(c) -> None:
     """Set aws_account = 'auto-insurance' on rows where it is NULL or
     empty.
@@ -364,6 +431,9 @@ def init_db() -> None:
     with _conn() as c:
         _backfill_legacy_aws_account(c)
 
+    with _conn() as c:
+        _backfill_assigned_to_from_requested_by(c)
+
 
 def health_check() -> None:
     """Cheap read against the DB to confirm connectivity.
@@ -391,7 +461,8 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                lander_url: Optional[str] = None,
                requested_by: Optional[str] = None,
                notes: Optional[str] = None,
-               status: Optional[str] = None) -> int:
+               status: Optional[str] = None,
+               assigned_to: Optional[str] = None) -> int:
     """Insert a new domain; returns its row id.
 
     Both backends timestamp purchased_at AND updated_at to NOW().
@@ -401,6 +472,13 @@ def add_domain(domain: str, vertical: Optional[str] = None,
     transition it to STATUS_DEPLOYING then STATUS_DEPLOYED / FAILED.
     Bulk imports (import_csv) and tests pass None to keep status NULL —
     those rows are treated as 'unknown' by the runtime.
+
+    `assigned_to` is the Slack ID (or 'Slack:Uxxx' string) of the MDB
+    this domain belongs to. The lifecycle classifier DMs this user when
+    the domain expires or goes idle. Phase B's Slack flow passes this
+    on Mark Purchased so new rows have an owner from day one. Falls
+    back to NULL for legacy CSV imports — the boot-time backfill copies
+    requested_by → assigned_to for those.
 
     Raises DuplicateDomainError if the domain is already in inventory —
     the only DB failure the bot's button handlers should treat as
@@ -413,8 +491,9 @@ def add_domain(domain: str, vertical: Optional[str] = None,
         )
     insert_sql = (
         'INSERT INTO domains (domain, vertical, aws_account, lander_url, '
-        'requested_by, notes, status, purchased_at, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
+        'requested_by, notes, status, assigned_to, '
+        'purchased_at, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
     )
     try:
         with _conn() as c:
@@ -422,13 +501,13 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                 cur = c.cursor()
                 cur.execute(_q(insert_sql) + ' RETURNING id',
                             (domain, vertical, aws_account, lander_url,
-                             requested_by, notes, status))
+                             requested_by, notes, status, assigned_to))
                 row = cur.fetchone()
                 cur.close()
                 return row['id']
             cur = c.execute(insert_sql,
                             (domain, vertical, aws_account, lander_url,
-                             requested_by, notes, status))
+                             requested_by, notes, status, assigned_to))
             return cur.lastrowid
     except sqlite3.IntegrityError as e:
         # SQLite raises IntegrityError on UNIQUE violations.
@@ -539,3 +618,217 @@ def mark_setup_complete(domain: str, lander_url: Optional[str] = None) -> None:
             )
         if _is_postgres():
             cur.close()
+
+
+# ─── Phase A — lifecycle helpers ───────────────────────────────────────────
+# Used by lifecycle/scan.py (daily classifier) and lifecycle/handlers.py
+# (Slack button handlers in Phase B). All silent on missing rows: callers
+# already know whether the row should exist.
+
+import datetime as _dt
+import json as _json
+from typing import Iterable as _Iterable
+
+
+def set_lifecycle_state(domain: str, state: Optional[str]) -> None:
+    """Move a domain into a new lifecycle_state. None clears the column
+    (used when a domain returns to ACTIVE/IDLE and we want the cron to
+    re-classify cleanly on next pass)."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET lifecycle_state = ?, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (state, domain),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def bump_last_prompted_at(domain: str) -> None:
+    """Stamp last_prompted_at = NOW(). Drives the 23h dedup guard so the
+    classifier won't re-DM the same MDB twice in one day."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET last_prompted_at = CURRENT_TIMESTAMP, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (domain,),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def update_namecheap_sync(
+    domain: str,
+    expire_at: Optional[_dt.datetime],
+    auto_renew_enabled: Optional[bool],
+) -> None:
+    """Persist the result of a Namecheap domains.getInfo call. Always
+    stamps last_namecheap_sync_at so the classifier can avoid re-syncing
+    a domain it just looked up."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET expire_at = ?, auto_renew_enabled = ?, '
+            'last_namecheap_sync_at = CURRENT_TIMESTAMP, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (expire_at, auto_renew_enabled, domain),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def mark_active(domain: str) -> None:
+    """Stamp last_active_at = NOW(). Called when the classifier sees
+    spend > threshold for a domain. Used by future reporting + as a
+    tiebreaker on rotation reuse decisions."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET last_active_at = CURRENT_TIMESTAMP, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (domain,),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def assign_to(domain: str, mdb_slack_id: Optional[str]) -> None:
+    """Set or clear the MDB the domain belongs to. Pass None to release
+    a domain into the inventory pool. Caller is responsible for writing
+    the matching domain_events row."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET assigned_to = ?, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (mdb_slack_id, domain),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def record_event(
+    domain: str, event_type: str, *,
+    actor: Optional[str] = None,
+    from_state: Optional[str] = None,
+    to_state: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+) -> None:
+    """Append a row to domain_events. Always pair with the state-changing
+    UPDATE that the event describes — record_event does NOT mutate the
+    domains row itself.
+
+    `actor` is a Slack user ID, 'cron', or None for system actions.
+    `metadata` is any JSON-serializable dict (RedTrack stats, button
+    payload, error details). Stored as JSONB on Postgres / TEXT on SQLite.
+    """
+    meta_json = _json.dumps(metadata) if metadata is not None else None
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'INSERT INTO domain_events '
+            '(domain, event_type, actor, from_state, to_state, metadata) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (domain, event_type, actor, from_state, to_state, meta_json),
+        )
+        if _is_postgres():
+            cur.close()
+
+
+def list_domain_events(domain: str, limit: int = 100) -> List[Dict]:
+    """Read back the event timeline for one domain, newest first.
+    Powers a future /domain-history slash command and lets tests
+    assert that handlers wrote the right events.
+
+    Metadata is JSON-decoded for caller convenience (Postgres' RealDictCursor
+    returns it as a dict already; SQLite returns the raw TEXT)."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'SELECT * FROM domain_events WHERE domain = ? '
+            'ORDER BY occurred_at DESC, id DESC LIMIT ?',
+            (domain, limit),
+        )
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    out: List[Dict] = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get('metadata'), str):
+            try:
+                d['metadata'] = _json.loads(d['metadata'])
+            except (ValueError, TypeError):
+                pass
+        out.append(d)
+    return out
+
+
+def list_domains_for_lifecycle(
+    *, exclude_states: Optional[_Iterable[str]] = None,
+) -> List[Dict]:
+    """Return every domain with its lifecycle columns hydrated. The
+    classifier walks this list every cron run.
+
+    `exclude_states` skips domains the cron must not re-classify (e.g.
+    AWAITING_* states — those are waiting on a human click and the
+    classifier pulling them out from under that flow would re-prompt).
+    """
+    sql = 'SELECT * FROM domains'
+    params: tuple = ()
+    excluded = list(exclude_states or [])
+    if excluded:
+        placeholders = ','.join(['?'] * len(excluded))
+        sql += (f' WHERE lifecycle_state IS NULL '
+                f'OR lifecycle_state NOT IN ({placeholders})')
+        params = tuple(excluded)
+    with _conn() as c:
+        cur = _execute(c, sql, params)
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
+def get_domains_due_for_namecheap_sync(
+    *, max_age_days: int = 7, near_expiry_days: int = 60, limit: int = 50,
+) -> List[Dict]:
+    """Return the next batch of domains the Namecheap sync should refresh.
+
+    Picks rows that are:
+      • never synced (last_namecheap_sync_at IS NULL), or
+      • near expiry (expire_at within the next near_expiry_days), or
+      • stale (synced > max_age_days ago).
+
+    Oldest sync first so we make even progress through the inventory.
+    Bounded by `limit` to stay under Namecheap's ~50 req/min ceiling
+    (one cron pass = one batch).
+    """
+    if _is_postgres():
+        sql = (
+            'SELECT * FROM domains WHERE '
+            '  last_namecheap_sync_at IS NULL '
+            "  OR (expire_at IS NOT NULL "
+            f"      AND expire_at < NOW() + INTERVAL '{int(near_expiry_days)} days') "
+            f"  OR last_namecheap_sync_at < NOW() - INTERVAL '{int(max_age_days)} days' "
+            'ORDER BY last_namecheap_sync_at ASC NULLS FIRST '
+            'LIMIT ?'
+        )
+    else:
+        sql = (
+            'SELECT * FROM domains WHERE '
+            '  last_namecheap_sync_at IS NULL '
+            "  OR (expire_at IS NOT NULL "
+            f"      AND expire_at < datetime('now', '+{int(near_expiry_days)} days')) "
+            f"  OR last_namecheap_sync_at < datetime('now', '-{int(max_age_days)} days') "
+            'ORDER BY last_namecheap_sync_at ASC '
+            'LIMIT ?'
+        )
+    with _conn() as c:
+        cur = _execute(c, sql, (limit,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]

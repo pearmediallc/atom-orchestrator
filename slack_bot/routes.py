@@ -97,6 +97,12 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
     )
     _handler = SlackRequestHandler(_bolt_app)
 
+    # Phase A — register lifecycle bot's button handlers onto the same
+    # bolt app. Kept in lifecycle/handlers.py so this file doesn't grow
+    # another 500 lines.
+    from lifecycle import handlers as _lifecycle_handlers
+    _lifecycle_handlers.register(_bolt_app)
+
 
 # ─── Shared helpers for interactive button click handlers ─────────────────
 
@@ -1394,6 +1400,11 @@ if _bolt_app is not None:
                 # State machine starts here — Phase 7 worker will move
                 # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
                 status=inventory_store.STATUS_PENDING,
+                # Lifecycle ownership starts on day one — classifier needs
+                # an MDB to DM when this domain expires or goes idle.
+                # Legacy CSV-imported rows get this via the boot-time
+                # backfill in store.init_db().
+                assigned_to=requester,
             )
         except inventory_store.DuplicateDomainError:
             logger.info(

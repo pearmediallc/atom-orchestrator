@@ -185,3 +185,50 @@ class Config:
             'source_folders': by_vert.get('source_folders') or cls.PHASE7_DEFAULT_SOURCE_FOLDERS,
             'source_files': by_vert.get('source_files') or [],
         }
+
+    # ─── Phase A — domain lifecycle bot ────────────────────────
+    # Daily cron classifier + Slack flows for domains that are expiring
+    # soon or have gone idle. See lifecycle/ and redtrack_client/.
+
+    # RedTrack API — bulk spend/revenue lookup. Auth is `?api_key=…` as a
+    # query param (NOT a header). Empty → redtrack_client returns empty
+    # stub data (every domain looks idle), useful for tests.
+    REDTRACK_API_KEY = (os.getenv('REDTRACK_API_KEY', '') or '').strip()
+    REDTRACK_BASE_URL = (
+        os.getenv('REDTRACK_BASE_URL', 'https://api.redtrack.io') or ''
+    ).strip()
+
+    # TL Slack ID — escalation target when an MDB ghosts a prompt or
+    # contradiction guard fires. Reuses the same DEV_REROUTE_DMS_TO seam
+    # via Config.route_recipient(), so dev/test never spams the real TL.
+    TL_SLACK_USER_ID = os.getenv('TL_SLACK_USER_ID', '').strip()
+
+    # Classifier tuning knobs — all configurable so behavior can be
+    # tweaked without a code change. See the design doc for rationale on
+    # each default.
+    LIFECYCLE_ACTIVE_SPEND_USD = float(
+        os.getenv('LIFECYCLE_ACTIVE_SPEND_USD', '1.0')
+    )
+    LIFECYCLE_ASSIGNMENT_GRACE_DAYS = int(
+        os.getenv('LIFECYCLE_ASSIGNMENT_GRACE_DAYS', '14')
+    )
+    LIFECYCLE_MDB_RESPONSE_SLA_HOURS = int(
+        os.getenv('LIFECYCLE_MDB_RESPONSE_SLA_HOURS', '48')
+    )
+    LIFECYCLE_PROMPT_DEDUP_HOURS = int(
+        os.getenv('LIFECYCLE_PROMPT_DEDUP_HOURS', '23')
+    )
+    # Comma-separated, parsed to a sorted-descending list of ints.
+    # Default: warn at 30, 14, 7, 1 days before expiry.
+    LIFECYCLE_EXPIRY_CASCADE_DAYS = sorted(
+        (int(x) for x in os.getenv(
+            'LIFECYCLE_EXPIRY_CASCADE_DAYS', '30,14,7,1'
+        ).split(',') if x.strip()),
+        reverse=True,
+    )
+    # When True, classifier logs intent but never sends DMs / mutates
+    # state. Flip on for the first 48h after deploy to verify the
+    # classifier's decisions on real data without spamming MDBs.
+    LIFECYCLE_DRY_RUN = os.getenv(
+        'LIFECYCLE_DRY_RUN', 'true'
+    ).lower() in ('1', 'true', 'yes', 'on')
