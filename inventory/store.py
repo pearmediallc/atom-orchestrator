@@ -866,6 +866,38 @@ def get_awaiting_domains_past_sla(
     return [dict(r) for r in rows]
 
 
+def list_unassigned_domains(*, limit: int = 200) -> List[Dict]:
+    """Return domains with no assigned MDB — the rotation pool.
+
+    Used by the daily #developers inventory digest. Sort: NULL expire_at
+    last (unknowns are likely zombies — show them at the bottom), then
+    by expire_at ascending (nearest expiry first within owned domains
+    so they get prioritised for reuse).
+    """
+    if _is_postgres():
+        sql = (
+            'SELECT * FROM domains '
+            "WHERE assigned_to IS NULL OR assigned_to = '' "
+            'ORDER BY expire_at ASC NULLS LAST '
+            'LIMIT ?'
+        )
+    else:
+        sql = (
+            'SELECT * FROM domains '
+            "WHERE assigned_to IS NULL OR assigned_to = '' "
+            'ORDER BY '
+            '  CASE WHEN expire_at IS NULL THEN 1 ELSE 0 END, '
+            '  expire_at ASC '
+            'LIMIT ?'
+        )
+    with _conn() as c:
+        cur = _execute(c, sql, (limit,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
 def get_domains_due_for_namecheap_sync(
     *, max_age_days: int = 7, near_expiry_days: int = 60, limit: int = 50,
 ) -> List[Dict]:

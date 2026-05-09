@@ -53,15 +53,22 @@ def main() -> int:
 
         from inventory import store
         from lifecycle.scan import run_scan, run_sla_escalation
+        from lifecycle.inventory_digest import run_inventory_digest
 
         store.init_db()
         # 1. Classify every domain (ACTIVE / IDLE / EXPIRING_* / etc.)
         scan_counters = run_scan()
         # 2. Walk MDB-side AWAITING rows past SLA and DM TL with override
-        # buttons. Runs in the same process — uses the same Slack
-        # WebClient instance scan.py created.
+        # buttons.
         sla_counters = run_sla_escalation()
-        print({'scan': scan_counters, 'sla': sla_counters})
+        # 3. Post the daily "available domains" digest to the developers
+        # channel. Opt-in via DEVELOPERS_CHANNEL_ID — empty disables.
+        digest_counters = run_inventory_digest()
+        print({
+            'scan': scan_counters,
+            'sla': sla_counters,
+            'digest': digest_counters,
+        })
         return 0
     except Exception:
         logging.getLogger(__name__).exception('lifecycle scan crashed')

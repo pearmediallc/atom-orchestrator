@@ -232,3 +232,9 @@ class Config:
     LIFECYCLE_DRY_RUN = os.getenv(
         'LIFECYCLE_DRY_RUN', 'true'
     ).lower() in ('1', 'true', 'yes', 'on')
+
+    # Optional public channel where the daily cron posts an "available
+    # in inventory" digest — domains with no assigned MDB, listed so
+    # the team can self-serve from the rotation pool without DMing
+    # Utkarsh. Empty disables the digest cleanly.
+    DEVELOPERS_CHANNEL_ID = os.getenv('DEVELOPERS_CHANNEL_ID', '').strip()
