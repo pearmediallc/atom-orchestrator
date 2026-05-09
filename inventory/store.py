@@ -462,7 +462,9 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                requested_by: Optional[str] = None,
                notes: Optional[str] = None,
                status: Optional[str] = None,
-               assigned_to: Optional[str] = None) -> int:
+               assigned_to: Optional[str] = None,
+               event_source: Optional[str] = None,
+               event_metadata: Optional[Dict] = None) -> int:
     """Insert a new domain; returns its row id.
 
     Both backends timestamp purchased_at AND updated_at to NOW().
@@ -479,6 +481,13 @@ def add_domain(domain: str, vertical: Optional[str] = None,
     on Mark Purchased so new rows have an owner from day one. Falls
     back to NULL for legacy CSV imports — the boot-time backfill copies
     requested_by → assigned_to for those.
+
+    `event_source`, when provided, writes an 'added' row to
+    domain_events so /domain-history shows when + how the domain
+    entered inventory. Bulk CSV imports leave it None to avoid 743
+    events with the same timestamp; the slash command flow + HTTP
+    API set it. Failure to record the event does NOT roll back the
+    insert — the audit row is informational, not load-bearing.
 
     Raises DuplicateDomainError if the domain is already in inventory —
     the only DB failure the bot's button handlers should treat as
@@ -504,11 +513,12 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                              requested_by, notes, status, assigned_to))
                 row = cur.fetchone()
                 cur.close()
-                return row['id']
-            cur = c.execute(insert_sql,
-                            (domain, vertical, aws_account, lander_url,
-                             requested_by, notes, status, assigned_to))
-            return cur.lastrowid
+                new_id = row['id']
+            else:
+                cur = c.execute(insert_sql,
+                                (domain, vertical, aws_account, lander_url,
+                                 requested_by, notes, status, assigned_to))
+                new_id = cur.lastrowid
     except sqlite3.IntegrityError as e:
         # SQLite raises IntegrityError on UNIQUE violations.
         raise DuplicateDomainError(
@@ -524,6 +534,24 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                 f'Domain {domain!r} already exists in inventory'
             ) from e
         raise
+
+    # Best-effort 'added' event for /domain-history. Failure here must
+    # not break add_domain — the row already exists, the event is
+    # informational. Caller passes event_source=None to suppress (e.g.
+    # CSV bulk imports that would write 743 events with the same ts).
+    if event_source:
+        meta = {'source': event_source}
+        if event_metadata:
+            meta.update(event_metadata)
+        try:
+            record_event(
+                domain, 'added', actor=requested_by,
+                from_state=None, to_state=None, metadata=meta,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return new_id
 
 
 def transition_status(domain: str, *, to_status: str,

@@ -376,7 +376,32 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
                   '_Tip: use the form `https://<bucket>/<folder>/` in the lander '
                   'URL field next time and the bot will figure out the rest._'),
         )
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_skipped', actor='cron',
+                metadata={'reason': url_err or 'no_source_bucket',
+                          'lander_url': lander_url},
+            )
+        except Exception:
+            logger.exception('record_event(phase7_skipped) failed')
         return
+
+    # Phase 7 audit: started. Captures the resolved source so an operator
+    # debugging a failed deploy via /domain-history sees the inputs ATOM
+    # was handed.
+    try:
+        inventory_store.record_event(
+            target_domain, 'phase7_started', actor='cron',
+            metadata={
+                'source_bucket': source_bucket,
+                'source_folders': source_folders,
+                'source_account': source_account,
+                'source_origin': source_origin,
+                'requester': requester,
+            },
+        )
+    except Exception:
+        logger.exception('record_event(phase7_started) failed')
 
     client.chat_postMessage(
         channel=channel, thread_ts=message_ts,
@@ -401,6 +426,13 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
         result = run_existing_domain_workflow(req)
     except Exception as e:
         logger.exception('Phase 7 worker crashed for %s', target_domain)
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_crashed', actor='cron',
+                metadata={'exception': type(e).__name__, 'message': str(e)[:500]},
+            )
+        except Exception:
+            pass
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=f':x: *ATOM workflow crashed:* `{type(e).__name__}: {e}`',
@@ -414,6 +446,13 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
 
     if result.status == 'completed':
         live = result.details.get('live_url') or f'https://{target_domain}'
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_succeeded', actor='cron',
+                metadata={'live_url': live, 'message': result.message[:500]},
+            )
+        except Exception:
+            logger.exception('record_event(phase7_succeeded) failed')
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':white_check_mark: *ATOM finished.* {result.message}\n'
@@ -427,6 +466,17 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     else:
         failed_step = (result.details.get('setup_result') or {}).get(
             'failed_at_step', '?')
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_failed', actor='cron',
+                metadata={
+                    'failed_at_step': failed_step,
+                    'reason': (result.details or {}).get('reason'),
+                    'message': result.message[:500],
+                },
+            )
+        except Exception:
+            logger.exception('record_event(phase7_failed) failed')
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
@@ -1377,6 +1427,20 @@ if _bolt_app is not None:
             )
             raise
 
+        # Audit event for /domain-history. Best-effort — never fail the
+        # whole click handler over an event-write blip.
+        try:
+            inventory_store.record_event(
+                target_domain, 'mark_deployed',
+                actor=confirmer,
+                metadata={'requester': requester, 'lander_url': lander_url,
+                          'vertical': vertical, 'flow': 'path_a'},
+            )
+        except Exception:
+            logger.exception(
+                'record_event(mark_deployed) failed for %s', target_domain,
+            )
+
         # Replace the button with a "confirmed" view (audit #13:
         # shared with confirm_purchased via _build_confirmed_card so
         # the two paths can't drift apart).
@@ -1474,6 +1538,11 @@ if _bolt_app is not None:
                 # Legacy CSV-imported rows get this via the boot-time
                 # backfill in store.init_db().
                 assigned_to=requester,
+                # Audit trail for /domain-history. Captures who clicked
+                # Mark Purchased, plus the lander URL it'll be deployed to.
+                event_source='path_b_mark_purchased',
+                event_metadata={'lander_url': lander, 'vertical': vertical,
+                                'confirmer': confirmer},
             )
         except inventory_store.DuplicateDomainError:
             logger.info(

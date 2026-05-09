@@ -123,8 +123,19 @@ def help_keywords() -> str:
 # than crashing the slash command.
 
 EVENT_EMOJI = {
-    # Initial / classifier events
-    'added_via_path_b':            '🛒',
+    # Inventory entry — every domain gets one of these as its first row.
+    'added':                       '🛒',
+    'added_via_path_b':            '🛒',  # legacy name, retained for back-compat
+    # Path A / Path B click handlers
+    'mark_purchased':              '🛒',
+    'mark_deployed':               '🚀',
+    # Phase 7 worker (ATOM setup_domain + copy_files)
+    'phase7_started':              '🛠',
+    'phase7_succeeded':            '🟢',
+    'phase7_failed':               '🔥',
+    'phase7_crashed':              '💥',
+    'phase7_skipped':              '⏭️',
+    # Cron classifier
     'classified_active':           '🟢',
     'classified_idle':             '💤',
     'classified_inventory':        '📦',

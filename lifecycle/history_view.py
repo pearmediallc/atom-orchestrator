@@ -191,9 +191,11 @@ def _fmt_metadata(metadata) -> str:
     """One-liner summary of the metadata blob.
 
     Real-world metadata can be large (full ATOM error dumps, RedTrack
-    spend dicts). We only surface the keys most useful in a timeline:
-    spend amounts, days_until_expiry, recent_cost (contradiction guard).
-    Everything else is truncated.
+    spend dicts). We surface the keys most useful in a timeline:
+    spend, recent_cost, days_until_expiry, snooze_days,
+    previous_assigned_to, source (path_b_mark_purchased / etc.),
+    lander_url / live_url, source_bucket, failed_at_step, exception.
+    Everything else is dropped — better than dumping raw JSON.
 
     Pure: never mutates the input.
     """
@@ -201,6 +203,7 @@ def _fmt_metadata(metadata) -> str:
         return ''
 
     parts = []
+
     spend = metadata.get('spend')
     if isinstance(spend, dict):
         cost = spend.get('cost')
@@ -221,6 +224,27 @@ def _fmt_metadata(metadata) -> str:
 
     if 'previous_assigned_to' in metadata and metadata['previous_assigned_to']:
         parts.append(f'was: {metadata["previous_assigned_to"]}')
+
+    # Path A/B + Phase 7 audit fields.
+    if 'source' in metadata and metadata['source']:
+        parts.append(f'via {metadata["source"]}')
+
+    if metadata.get('lander_url'):
+        parts.append(f'lander: {metadata["lander_url"]}')
+
+    if metadata.get('live_url'):
+        parts.append(f'live: {metadata["live_url"]}')
+
+    if metadata.get('source_bucket'):
+        parts.append(f's3://{metadata["source_bucket"]}')
+
+    if metadata.get('failed_at_step'):
+        parts.append(f'failed at step `{metadata["failed_at_step"]}`')
+
+    if metadata.get('exception'):
+        msg = metadata.get('message', '')
+        snippet = f': {msg[:60]}' if msg else ''
+        parts.append(f'{metadata["exception"]}{snippet}')
 
     if not parts:
         return ''

@@ -277,6 +277,69 @@ def test_metadata_previous_assigned_to_renders():
     assert 'was: U_OLD_OWNER' in text
 
 
+def test_metadata_source_renders_via_label():
+    """`event_source` from add_domain shows up as 'via path_b_mark_purchased'
+    so /domain-history makes the entry path obvious."""
+    ev = _event('added', metadata={'source': 'path_b_mark_purchased'})
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 'via path_b_mark_purchased' in text
+
+
+def test_metadata_lander_url_renders():
+    ev = _event('mark_deployed', metadata={
+        'lander_url': 'https://safetyfirstauto.pro/h-insure-c/'})
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 'lander: https://safetyfirstauto.pro/h-insure-c/' in text
+
+
+def test_metadata_phase7_succeeded_shows_live_url():
+    ev = _event('phase7_succeeded', metadata={
+        'live_url': 'https://mybusiness.com/lander/',
+        'message': 'Lander deployed.',
+    })
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 'live: https://mybusiness.com/lander/' in text
+
+
+def test_metadata_phase7_failed_shows_step():
+    ev = _event('phase7_failed', metadata={
+        'failed_at_step': 'cloudfront',
+        'reason': 'atom_setup_failed',
+    })
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 'failed at step `cloudfront`' in text
+
+
+def test_metadata_phase7_crashed_shows_exception():
+    ev = _event('phase7_crashed', metadata={
+        'exception': 'TimeoutError',
+        'message': 'Setup task abc-123 did not complete within 1800s',
+    })
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 'TimeoutError' in text
+
+
+def test_metadata_phase7_started_shows_source_bucket():
+    ev = _event('phase7_started', metadata={
+        'source_bucket': 'pearmedia-default-lander-auto',
+        'source_folders': ['lander/'],
+    })
+    text = _all_text(history_view.render_timeline(
+        domain_row=_row(), events=[ev], today=TODAY,
+    ))
+    assert 's3://pearmedia-default-lander-auto' in text
+
+
 def test_metadata_unknown_keys_are_silently_dropped():
     """If an event has metadata we don't know how to render, don't
     crash and don't dump raw JSON into the timeline."""

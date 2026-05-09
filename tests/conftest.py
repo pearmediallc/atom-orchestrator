@@ -52,6 +52,35 @@ def logged_in_client(atom_running):
     return c
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_production_db(tmp_path, monkeypatch, request):
+    """Belt-and-braces guard: clear DATABASE_URL and point INVENTORY_DB_PATH
+    at a per-test SQLite file for EVERY test, automatically.
+
+    Why: tests that don't explicitly use the `tmp_inventory` fixture used
+    to be DB-free in practice. After Phase D added `record_event` calls
+    inside the Phase 7 worker, even those tests can now write to the
+    DB — and without this guard, DATABASE_URL from .env would point them
+    at production Postgres. Each accidental write is a real prod row +
+    a 1-2s round-trip per call (caught 2026-05-10 when the suite slowed
+    from ~5s to ~30s).
+
+    `tmp_inventory` itself still works — it overrides the same vars
+    AND calls init_db, so tests that want a real schema get one.
+
+    Tests that legitimately need to talk to a real database can opt
+    out by adding `pytestmark = pytest.mark.uses_real_db` (none today,
+    but the marker is documented in pytest.ini).
+    """
+    if request.node.get_closest_marker('uses_real_db'):
+        return
+    monkeypatch.setattr('config.Config.DATABASE_URL', '')
+    monkeypatch.setattr(
+        'config.Config.INVENTORY_DB_PATH',
+        str(tmp_path / '_isolated_inventory.db'),
+    )
+
+
 @pytest.fixture
 def tmp_inventory(tmp_path, monkeypatch):
     """Per-test SQLite inventory at a temp path. Tests using this fixture

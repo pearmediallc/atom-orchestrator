@@ -125,6 +125,47 @@ def test_assign_to_set_and_clear(tmp_inventory):
 
 # ─── domain_events ─────────────────────────────────────────────────────────
 
+def test_add_domain_writes_added_event_when_event_source_set(tmp_inventory):
+    """Path B + HTTP API should produce an audit event so /domain-history
+    can show how the domain entered inventory."""
+    store.add_domain(
+        domain='new.com', vertical='Auto Insurance',
+        requested_by='Slack:U_NEERAJ',
+        event_source='path_b_mark_purchased',
+        event_metadata={'lander_url': 'https://x/y/'},
+    )
+    events = store.list_domain_events('new.com')
+    assert len(events) == 1
+    e = events[0]
+    assert e['event_type'] == 'added'
+    assert e['actor'] == 'Slack:U_NEERAJ'
+    assert e['metadata']['source'] == 'path_b_mark_purchased'
+    assert e['metadata']['lander_url'] == 'https://x/y/'
+
+
+def test_add_domain_writes_no_event_when_event_source_none(tmp_inventory):
+    """CSV bulk imports + tests pass event_source=None to avoid writing
+    743 events with the same timestamp at boot."""
+    store.add_domain(domain='quiet.com', vertical='Auto Insurance')
+    events = store.list_domain_events('quiet.com')
+    assert events == []
+
+
+def test_add_domain_event_failure_does_not_break_insert(tmp_inventory, monkeypatch):
+    """Audit event is best-effort — if record_event raises, the row
+    still ends up in the domains table."""
+    def boom(*args, **kwargs):
+        raise RuntimeError('synthetic event-write failure')
+    monkeypatch.setattr(store, 'record_event', boom)
+    new_id = store.add_domain(
+        domain='resilient.com', vertical='auto',
+        event_source='path_b_mark_purchased',
+    )
+    assert new_id is not None
+    # Domain row exists even though the event write blew up.
+    assert tmp_inventory.get_domain('resilient.com') is not None
+
+
 def test_record_event_writes_row(tmp_inventory):
     store.record_event(
         'ex.com', 'renewed',
