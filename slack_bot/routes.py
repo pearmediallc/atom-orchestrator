@@ -580,6 +580,49 @@ if _bolt_app is not None:
             'text': header_text,  # fallback for clients without block support
         })
 
+    @_bolt_app.command('/domain-history')
+    def handle_domain_history(ack, respond, command):
+        """Replay the lifecycle audit timeline for one domain.
+
+            /domain-history mybusiness.com
+
+        Shows current state + the last 25 events from `domain_events`
+        (the table the cron + Slack handlers write to on every state
+        transition). Read-only, ephemeral reply.
+        """
+        ack()
+        from lifecycle.history_view import render_timeline
+
+        domain = (command.get('text') or '').strip().lower()
+        if not domain:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (
+                    'Usage: `/domain-history <domain>` — e.g. '
+                    '`/domain-history safetyfirstauto.pro`. Replays the '
+                    "lifecycle bot's audit log for that domain."
+                ),
+            })
+            return
+
+        # Strip http(s):// + www. + path so users can paste a URL too.
+        for prefix in ('https://', 'http://', 'www.'):
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+        domain = domain.split('/')[0]
+
+        row = inventory_store.get_domain(domain)
+        events = inventory_store.list_domain_events(domain) if row else []
+
+        blocks = render_timeline(
+            row, events, requested_domain=domain,
+        )
+        respond({
+            'response_type': 'ephemeral',
+            'blocks': blocks,
+            'text': f'Timeline for {domain}',
+        })
+
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
         """Open the new-domain modal."""
@@ -1669,6 +1712,12 @@ def slash_new_domain():
 @slack_bp.route('/slash/list-domains', methods=['POST'])
 def slash_list_domains():
     return _bolt_or_stub('Coming soon: /list-domains (Phase 3). '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
+@slack_bp.route('/slash/domain-history', methods=['POST'])
+def slash_domain_history():
+    return _bolt_or_stub('Coming soon: /domain-history (Phase D). '
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 

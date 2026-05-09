@@ -111,3 +111,50 @@ def help_keywords() -> str:
     """Comma-separated list of state-filter keywords for the slash
     command help text."""
     return ', '.join(f'`:{k}`' for k in _FILTER_KEYWORDS)
+
+
+# ─── Event-type → emoji (for /domain-history timeline) ────────────────────
+# Different concern from state badges above: an event_type is what
+# happened (verb), a state is where the row IS (noun). We use a separate
+# map so the visual cue for the verb stays distinct from the state.
+#
+# Unknown event types fall through to the default '·' so a future event
+# type added without updating this map degrades gracefully — better
+# than crashing the slash command.
+
+EVENT_EMOJI = {
+    # Initial / classifier events
+    'added_via_path_b':            '🛒',
+    'classified_active':           '🟢',
+    'classified_idle':             '💤',
+    'classified_inventory':        '📦',
+    'classified_expiring':         '⚠️',
+    'expired':                     '❌',
+    # Prompts the cron sends
+    'prompted_mdb_usage':          '⏰',
+    'prompted_mdb_idle':           '⏰',
+    # MDB button clicks
+    'mdb_said_using_yes':          '✅',
+    'mdb_said_using_no':           '❌',
+    'mdb_no_but_recent_spend':     '⚠️',  # contradiction guard
+    'mdb_extended_30':             '🔁',
+    'mdb_extended_15':             '🔁',
+    'pushed_to_inventory':         '📦',
+    # Utkarsh button clicks
+    'renewed':                     '💰',
+    'auto_renew_disabled':         '🚫',
+    # SLA escalation + TL overrides
+    'escalated_to_tl':             '🚨',
+    'tl_forced_renew':             '⚖️',
+    'tl_forced_disable_renew':     '⚖️',
+    'tl_forced_push_inventory':    '⚖️',
+    'tl_forced_keep_30':           '⚖️',
+    # Manual / admin
+    'assigned':                    '👤',
+    'unassigned':                  '👤',
+}
+
+
+def event_emoji(event_type: str) -> str:
+    """Single-glyph emoji for an event_type. '·' for unrecognised types."""
+    return EVENT_EMOJI.get(event_type, '·')
