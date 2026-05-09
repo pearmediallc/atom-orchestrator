@@ -24,8 +24,15 @@ def _setup(monkeypatch, *, sla_hours=48):
 
 
 def _set_prompted_at(domain: str, days_ago: int):
-    """Manually backdate last_prompted_at so tests don't actually wait."""
-    when = (dt.datetime.now() - dt.timedelta(days=days_ago)).isoformat()
+    """Manually backdate last_prompted_at so tests don't actually wait.
+
+    Pass the datetime object directly — sqlite3's default adapter formats
+    it with a SPACE separator, matching what `CURRENT_TIMESTAMP` produces
+    in production. Avoids the `.isoformat()` 'T'-separator pitfall that
+    breaks lexicographic compares against SQLite's `datetime('now', …)`
+    threshold (caught 2026-05-10 when IST midnight aligned date prefixes).
+    """
+    when = dt.datetime.now() - dt.timedelta(days=days_ago)
     with store._conn() as c:
         c.execute(
             "UPDATE domains SET last_prompted_at = ? WHERE domain = ?",

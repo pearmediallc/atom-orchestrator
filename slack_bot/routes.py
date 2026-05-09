@@ -447,20 +447,28 @@ if _bolt_app is not None:
     def handle_list_domains(ack, respond, command):
         """Reply with the owned-domain inventory as a clickable card.
 
-        Optional argument: substring filter that searches across the
-        domain name, the vertical, AND the requester. Lets you find
-        a specific domain quickly even when there are hundreds.
+        Two filter modes:
 
-            /list-domains                → top results across everything
-            /list-domains auto           → matches vertical 'Auto Insurance'
-            /list-domains flashburn      → matches domains like
-                                            'instantflashburn.com'
-            /list-domains anurag         → matches anything by Anurag
+          • substring (default) — matches domain / vertical / requester.
+            /list-domains              → top results across everything
+            /list-domains auto         → matches vertical 'Auto Insurance'
+            /list-domains anurag       → matches anything by Anurag
+
+          • state filter (`:keyword`) — matches by lifecycle_state group.
+            /list-domains :expiring    → all EXPIRING_30/14/7/1
+            /list-domains :idle        → state == IDLE
+            /list-domains :awaiting    → all AWAITING_* (waiting on a click)
+            /list-domains :inventory   → released to the rotation pool
+            (full keyword list in the message footer)
 
         Each domain has a "Deploy lander" button that starts Path A
-        (deploy a lander to that existing owned domain).
+        (deploy a lander to that existing owned domain). Each row also
+        shows two badges: setup status (✅/⏳) and lifecycle state
+        (🟢 active / 💤 idle / ⚠️ expiring / etc.).
         """
         ack()
+        from lifecycle import badges as _badges
+
         filter_text = (command.get('text') or '').strip().lower()
         all_rows = inventory_store.list_domains()
         if not all_rows:
@@ -470,9 +478,16 @@ if _bolt_app is not None:
             })
             return
 
-        # Substring filter across domain / vertical / requester. Most
-        # useful columns for "find the domain I'm thinking of".
-        if filter_text:
+        # State filter takes precedence when the text starts with `:`.
+        # Otherwise fall through to the substring search.
+        state_pred = (
+            _badges.state_filter(filter_text) if filter_text.startswith(':')
+            else None
+        )
+        if state_pred is not None:
+            rows = [r for r in all_rows if state_pred(r)]
+            filter_label = filter_text  # keep the leading colon in the header
+        elif filter_text:
             def _matches(r: dict) -> bool:
                 haystacks = (
                     (r.get('domain') or ''),
@@ -481,15 +496,21 @@ if _bolt_app is not None:
                 )
                 return any(filter_text in h.lower() for h in haystacks)
             rows = [r for r in all_rows if _matches(r)]
+            filter_label = filter_text
         else:
             rows = all_rows
+            filter_label = ''
 
         if not rows:
+            hint = (
+                'Try a state keyword like '
+                f'{_badges.help_keywords()}, a domain substring, '
+                'a vertical, or an owner name — or run `/list-domains` '
+                'with no filter.'
+            )
             respond({
                 'response_type': 'ephemeral',
-                'text': (f'*No domains match `{filter_text}`.* Try part of a '
-                         f'domain name, vertical, or owner — or run '
-                         f'`/list-domains` with no filter.'),
+                'text': (f'*No domains match `{filter_label}`.*\n{hint}'),
             })
             return
 
@@ -501,7 +522,7 @@ if _bolt_app is not None:
 
         header_text = (
             f'Owned domains — {len(shown)} of {len(all_rows)}'
-            + (f' (filtered by "{filter_text}")' if filter_text else '')
+            + (f' (filtered by "{filter_label}")' if filter_label else '')
         )
 
         blocks: list = [
@@ -509,10 +530,11 @@ if _bolt_app is not None:
              'text': {'type': 'plain_text', 'text': header_text}},
             {'type': 'context', 'elements': [{
                 'type': 'mrkdwn',
-                'text': ('Click *Deploy lander* to send a redeployment '
-                         'request to Utkarsh. '
-                         'Filter by any text: `/list-domains flashburn` '
-                         '· `/list-domains medicare` · `/list-domains anurag`.'),
+                'text': (
+                    'Click *Deploy lander* to send a redeployment request '
+                    'to Utkarsh. Filter: substring (`/list-domains medicare`) '
+                    f'or state keyword ({_badges.help_keywords()}).'
+                ),
             }]},
             {'type': 'divider'},
         ]
@@ -520,12 +542,16 @@ if _bolt_app is not None:
         for r in shown:
             vert = r.get('vertical') or '_no vertical_'
             requested_by = r.get('requested_by') or '_unknown_'
-            stat_emoji = '✅' if r.get('setup_at') else '⏳'
+            setup_emoji = '✅' if r.get('setup_at') else '⏳'
+            lc_state = r.get('lifecycle_state')
+            lc_emoji = _badges.emoji(lc_state)
+            lc_label = _badges.label(lc_state)
             blocks.append({
                 'type': 'section',
                 'text': {
                     'type': 'mrkdwn',
-                    'text': (f'{stat_emoji} `{r["domain"]}`\n'
+                    'text': (f'{setup_emoji}{lc_emoji} `{r["domain"]}` '
+                             f'_{lc_label}_\n'
                              f'_{vert}_  ·  by `{requested_by}`'),
                 },
                 'accessory': {
