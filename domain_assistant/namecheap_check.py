@@ -1,8 +1,9 @@
-"""Namecheap domain-availability + pricing.
+"""Namecheap domain-availability + pricing + per-domain info.
 
-Two endpoints we use:
-  • `namecheap.domains.check`   — availability for a list of domains in one call.
+Endpoints we use:
+  • `namecheap.domains.check`    — availability for a list of domains in one call.
   • `namecheap.users.getPricing` — registration price for each TLD.
+  • `namecheap.domains.getInfo`  — per-domain details (Phase A: expire date).
 
 Both go through Oxylabs HTTPS proxy because Namecheap whitelists ATOM's
 proxy IP (the bot's laptop / Render IP isn't whitelisted). Mirrors ATOM's
@@ -244,3 +245,82 @@ def check_availability_and_price(
         }
         for d in domains
     ]
+
+
+# ─── Per-domain info (Phase A) ─────────────────────────────────────────────
+# Used by the lifecycle classifier to populate domains.expire_at on each
+# row. Per-domain calls are paced under Namecheap's ~50 req/min rate
+# limit by the cron's batch-of-50 selection logic in
+# inventory.store.get_domains_due_for_namecheap_sync.
+
+import datetime as _dt
+
+
+def get_domain_info(domain: str) -> Optional[Dict]:
+    """Look up the registration details for one owned domain.
+
+    Returns:
+      {'expire_at': datetime, 'auto_renew_enabled': None}     on success
+      None                                                    on any failure
+                                                              (transport, not-found,
+                                                              not-owned-by-this-user)
+
+    `auto_renew_enabled` is intentionally None for now — `domains.getInfo`
+    doesn't return that field; it lives in `domains.getList` and is
+    fetched separately by the Slack "disable auto-renew" handler in
+    Phase C. None signals "unknown, ask Utkarsh to verify".
+
+    Returns None (not raises) on failure so the classifier can skip a
+    bad row without aborting the whole cron pass.
+    """
+    if not _has_namecheap_creds():
+        return None
+
+    root = _request_namecheap({
+        'Command': 'namecheap.domains.getInfo',
+        'DomainName': domain,
+    })
+    if root is None:
+        return None
+
+    # The DomainGetInfoResult element wraps the per-domain block. When
+    # the domain isn't in this Namecheap account, Namecheap returns the
+    # element with Status="Failed" or simply no DomainDetails child.
+    expire_at: Optional[_dt.datetime] = None
+    for el in root.iter():
+        if _local_name(el.tag) == 'DomainDetails':
+            for child in el:
+                if _local_name(child.tag) == 'ExpiredDate':
+                    expire_at = _parse_namecheap_date(child.text)
+                    break
+            break
+
+    if expire_at is None:
+        # Either the call returned an error block, the domain isn't
+        # owned by us, or Namecheap changed its response shape.
+        # Don't speculate — just signal unknown.
+        logger.info(
+            'Namecheap getInfo returned no ExpiredDate for %s', domain,
+        )
+        return None
+
+    return {
+        'expire_at': expire_at,
+        'auto_renew_enabled': None,
+    }
+
+
+def _parse_namecheap_date(text: Optional[str]) -> Optional[_dt.datetime]:
+    """Parse Namecheap's MM/DD/YYYY date strings. Returns None on bad
+    input rather than raising — caller treats unknown the same as
+    transport failure."""
+    if not text:
+        return None
+    text = text.strip()
+    for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%m/%d/%Y %H:%M:%S'):
+        try:
+            return _dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    logger.warning('Unparseable Namecheap date: %r', text)
+    return None

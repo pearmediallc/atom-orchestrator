@@ -24,6 +24,19 @@ class Config:
     SLACK_SIGNING_SECRET = os.getenv('SLACK_SIGNING_SECRET')
     SLACK_APP_TOKEN = os.getenv('SLACK_APP_TOKEN')
 
+    # Local-dev convenience: when true, app.py boots a Slack Socket Mode
+    # connection instead of (or alongside) HTTP webhooks. Slack pushes
+    # slash commands + interactions directly over a WebSocket using
+    # SLACK_APP_TOKEN — no ngrok / public URL required.
+    #
+    # IMPORTANT: a Slack app can only deliver events via ONE transport at
+    # a time. While this is enabled locally, your Render deployment will
+    # NOT receive Slack events. Pause Render (or run this against a
+    # separate dev Slack app) before testing.
+    SLACK_USE_SOCKET_MODE = os.getenv(
+        'SLACK_USE_SOCKET_MODE', ''
+    ).strip().lower() in ('1', 'true', 'yes', 'on')
+
     # Phase 3 — inventory
     # SQLite is the default for local dev / tests (zero setup, one file).
     INVENTORY_DB_PATH = os.getenv('INVENTORY_DB_PATH', './inventory.db')
@@ -108,6 +121,32 @@ class Config:
     # Empty in real use.
     DEV_REROUTE_DMS_TO = os.getenv('DEV_REROUTE_DMS_TO', '').strip()
 
+    # Identifies the deployment environment. Drives the production
+    # safeguards below — set to 'production' on the live Render
+    # service so misconfiguration (e.g. forgetting to clear
+    # DEV_REROUTE_DMS_TO after a solo test) refuses to boot instead
+    # of silently absorbing real users' approvals (audit #15).
+    ENVIRONMENT = os.getenv('ENVIRONMENT', '').strip().lower()
+
+    @classmethod
+    def assert_production_safe(cls) -> None:
+        """Refuse to boot with dev-only knobs left on in production.
+
+        Called once from create_app() at startup. Any failure here is a
+        fatal misconfiguration — better to die loudly than serve traffic
+        with TL approvals routed to one developer.
+        """
+        if cls.ENVIRONMENT != 'production':
+            return
+        if cls.DEV_REROUTE_DMS_TO:
+            raise RuntimeError(
+                'DEV_REROUTE_DMS_TO is set in a production deployment. '
+                'This redirects TL approvals + Utkarsh DMs to a single '
+                'user, which would silently break the workflow for real '
+                'users. Unset DEV_REROUTE_DMS_TO in the production '
+                'environment, then redeploy.'
+            )
+
     @classmethod
     def route_recipient(cls, real_recipient: str) -> str:
         """Return DEV_REROUTE_DMS_TO if set, else the real recipient unchanged.
@@ -124,6 +163,17 @@ class Config:
     # bot without breaking the demo if ATOM is unreachable or AWS is broken.
     ENABLE_PHASE_7 = os.getenv('ENABLE_PHASE_7', 'false').lower() in ('1', 'true', 'yes', 'on')
 
+    # How long to wait for ATOM's setup_domain task to reach a terminal
+    # state (completed | failed). Default is 30 minutes — enough for a
+    # FRESH domain to go through ACM cert validation (the slow step,
+    # 5–30 min depending on DNS propagation) plus CloudFront build.
+    # Path A (idempotent reuse on already-set-up domains) typically
+    # finishes in <30 sec, so the timeout is a safety ceiling, not a
+    # baseline. The previous hardcoded 600s was too short for fresh
+    # domains and caused false "did not complete in time" failures
+    # while ATOM was still legitimately working (2026-05-08 audit).
+    PHASE7_SETUP_TIMEOUT_SEC = int(os.getenv('PHASE7_SETUP_TIMEOUT_SEC', '1800'))
+
     # Per-vertical defaults that tell run_existing_domain_workflow which
     # source bucket / folder to copy lander files from. The Slack flow only
     # collects a lander URL, not bucket+folder, so these defaults fill the
@@ -133,6 +183,20 @@ class Config:
 
     # Single global fallback used when a vertical isn't in the JSON map above.
     PHASE7_DEFAULT_SOURCE_ACCOUNT = os.getenv('PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
+
+    # AWS accounts the /new-domain modal lets MDBs pick from for the TARGET
+    # account (where the new domain's R53 zone + ACM cert + S3 bucket +
+    # CloudFront distribution get provisioned). Comma-separated. ATOM
+    # decides how each account key maps to real AWS creds — the orchestrator
+    # only passes the string through. Examples:
+    #   AWS_ACCOUNT_OPTIONS=auto-insurance,home-insurance,medicare,medsupp
+    # Falls back to the single PHASE7_DEFAULT_SOURCE_ACCOUNT value so an
+    # operator who hasn't set this env var still sees a usable picker
+    # rather than an empty dropdown.
+    AWS_ACCOUNT_OPTIONS = [
+        a.strip() for a in os.getenv('AWS_ACCOUNT_OPTIONS', '').split(',')
+        if a.strip()
+    ] or [PHASE7_DEFAULT_SOURCE_ACCOUNT]
     PHASE7_DEFAULT_SOURCE_BUCKET = os.getenv('PHASE7_DEFAULT_SOURCE_BUCKET', '').strip()
     PHASE7_DEFAULT_SOURCE_FOLDERS = [
         f.strip() for f in os.getenv('PHASE7_DEFAULT_SOURCE_FOLDERS', '').split(',') if f.strip()
@@ -148,3 +212,56 @@ class Config:
             'source_folders': by_vert.get('source_folders') or cls.PHASE7_DEFAULT_SOURCE_FOLDERS,
             'source_files': by_vert.get('source_files') or [],
         }
+
+    # ─── Phase A — domain lifecycle bot ────────────────────────
+    # Daily cron classifier + Slack flows for domains that are expiring
+    # soon or have gone idle. See lifecycle/ and redtrack_client/.
+
+    # RedTrack API — bulk spend/revenue lookup. Auth is `?api_key=…` as a
+    # query param (NOT a header). Empty → redtrack_client returns empty
+    # stub data (every domain looks idle), useful for tests.
+    REDTRACK_API_KEY = (os.getenv('REDTRACK_API_KEY', '') or '').strip()
+    REDTRACK_BASE_URL = (
+        os.getenv('REDTRACK_BASE_URL', 'https://api.redtrack.io') or ''
+    ).strip()
+
+    # TL Slack ID — escalation target when an MDB ghosts a prompt or
+    # contradiction guard fires. Reuses the same DEV_REROUTE_DMS_TO seam
+    # via Config.route_recipient(), so dev/test never spams the real TL.
+    TL_SLACK_USER_ID = os.getenv('TL_SLACK_USER_ID', '').strip()
+
+    # Classifier tuning knobs — all configurable so behavior can be
+    # tweaked without a code change. See the design doc for rationale on
+    # each default.
+    LIFECYCLE_ACTIVE_SPEND_USD = float(
+        os.getenv('LIFECYCLE_ACTIVE_SPEND_USD', '1.0')
+    )
+    LIFECYCLE_ASSIGNMENT_GRACE_DAYS = int(
+        os.getenv('LIFECYCLE_ASSIGNMENT_GRACE_DAYS', '14')
+    )
+    LIFECYCLE_MDB_RESPONSE_SLA_HOURS = int(
+        os.getenv('LIFECYCLE_MDB_RESPONSE_SLA_HOURS', '48')
+    )
+    LIFECYCLE_PROMPT_DEDUP_HOURS = int(
+        os.getenv('LIFECYCLE_PROMPT_DEDUP_HOURS', '23')
+    )
+    # Comma-separated, parsed to a sorted-descending list of ints.
+    # Default: warn at 30, 14, 7, 1 days before expiry.
+    LIFECYCLE_EXPIRY_CASCADE_DAYS = sorted(
+        (int(x) for x in os.getenv(
+            'LIFECYCLE_EXPIRY_CASCADE_DAYS', '30,14,7,1'
+        ).split(',') if x.strip()),
+        reverse=True,
+    )
+    # When True, classifier logs intent but never sends DMs / mutates
+    # state. Flip on for the first 48h after deploy to verify the
+    # classifier's decisions on real data without spamming MDBs.
+    LIFECYCLE_DRY_RUN = os.getenv(
+        'LIFECYCLE_DRY_RUN', 'true'
+    ).lower() in ('1', 'true', 'yes', 'on')
+
+    # Optional public channel where the daily cron posts an "available
+    # in inventory" digest — domains with no assigned MDB, listed so
+    # the team can self-serve from the rotation pool without DMing
+    # Utkarsh. Empty disables the digest cleanly.
+    DEVELOPERS_CHANNEL_ID = os.getenv('DEVELOPERS_CHANNEL_ID', '').strip()

@@ -73,6 +73,60 @@ def test_empty_key_not_real(monkeypatch):
     assert chatgpt._is_real_openai_key(None) is False
 
 
+# ─── chatgpt._build_prompt (post-Phase-8.x debias work) ───────────────────
+
+def test_prompt_does_not_hardcode_auto_insurance_brands():
+    """The default prompt must NOT anchor on auto-insurance brand names —
+    that's what biased Utkarsh's medicare suggestions in 2026-05-08."""
+    prompt = chatgpt._build_prompt(
+        vertical='medicare', audience='', extension='.com', count=5,
+    )
+    forbidden = ['carguardianpro', 'safetyfirstauto', 'fixyourhomenow',
+                 'drivesafetyhub', 'instapolicy', 'flexicover',
+                 'swiftquoter', 'easyrater']
+    for f in forbidden:
+        assert f not in prompt, (
+            f'Old hardcoded auto-insurance example {f!r} leaked into '
+            f'a generic prompt — anchors LLM on wrong vertical.'
+        )
+
+
+def test_prompt_includes_user_examples_when_provided():
+    prompt = chatgpt._build_prompt(
+        vertical='medicare', audience='seniors',
+        extension='.com', count=5,
+        examples=['mymedicareexperts.online', 'seniorhealthhub.com'],
+    )
+    assert 'mymedicareexperts.online' in prompt
+    assert 'seniorhealthhub.com' in prompt
+    # The prompt must instruct NOT to reuse the examples verbatim.
+    assert 'do NOT reuse' in prompt or 'NOT reuse' in prompt
+
+
+def test_prompt_falls_back_to_generic_pattern_when_no_examples():
+    """Without examples, the prompt should describe SHAPE patterns
+    (compounds, brandable invented words) and explicitly tie the
+    vocabulary to the *vertical*, not to auto-insurance."""
+    prompt = chatgpt._build_prompt(
+        vertical='legal-aid', audience='', extension='.com', count=5,
+    )
+    assert 'legal-aid' in prompt
+    # Should reference the vertical's vocabulary explicitly
+    assert ('vocabulary must come from' in prompt.lower()
+            or 'words native to the vertical' in prompt.lower())
+
+
+def test_chatgpt_stub_passes_through_examples_param(monkeypatch):
+    """The new `examples` kwarg must be accepted on the stub path
+    without error so workflow can pass it through unconditionally."""
+    monkeypatch.setattr(Config, 'OPENAI_API_KEY', '')
+    out = chatgpt.suggest_domains(
+        vertical='auto-insurance', audience='', extension='.com', count=3,
+        examples=['carguardianpro.com', 'safetyfirstauto.com'],
+    )
+    assert len(out) == 3
+
+
 # ─── chatgpt._parse_model_response (parses OpenAI replies) ────────────────
 
 def test_parse_strips_numbering_prefixes():

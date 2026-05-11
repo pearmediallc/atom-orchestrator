@@ -1,6 +1,9 @@
 .env
 .DS_Store
 
+# One-shot audit output (lifecycle/audit_inventory.py)
+audit/
+
 # Python
 venv/
 __pycache__/

@@ -25,10 +25,16 @@ from flask import Blueprint, jsonify, request
 
 from config import Config
 from inventory import store as inventory_store
+from orchestrator.log_setup import log_event
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
     suggest_new_domains,
+)
+from slack_bot.payload_signing import (
+    BadSignature,
+    sign_payload,
+    verify_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,18 +97,109 @@ if Config.SLACK_BOT_TOKEN and Config.SLACK_SIGNING_SECRET:
     )
     _handler = SlackRequestHandler(_bolt_app)
 
+    # Phase A — register lifecycle bot's button handlers onto the same
+    # bolt app. Kept in lifecycle/handlers.py so this file doesn't grow
+    # another 500 lines.
+    from lifecycle import handlers as _lifecycle_handlers
+    _lifecycle_handlers.register(_bolt_app)
+
+
+# ─── Shared helpers for interactive button click handlers ─────────────────
+
+
+def _verify_button_click(body: dict):
+    """Verify HMAC on a Slack interactive button click.
+
+    Centralises the seven-place repeat of the same sign-check
+    boilerplate (parse + verify + log on tamper + drop on malformed).
+
+    Returns:
+      • parsed payload dict on success
+      • None when the click should be silently dropped (malformed
+        JSON, missing fields, OR tampered signature). Tampered
+        clicks are logged as `button_signature_invalid`; drops
+        from malformed input are silent (matches pre-batch-5
+        behaviour).
+    """
+    try:
+        return verify_payload(body['actions'][0]['value'])
+    except BadSignature as e:
+        # Tampered or wrong-secret signature → log + drop the click.
+        # Audit #14: prevents an in-workspace user forging a
+        # button.value to redirect a legitimate action to a
+        # different domain / requester.
+        log_event(
+            'button_signature_invalid', level=logging.WARNING,
+            action_id=body.get('actions', [{}])[0].get('action_id'),
+            user=body.get('user', {}).get('id'),
+            error=str(e),
+        )
+        return None
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
+def _build_confirmed_card(*, action_label: str, target: str,
+                          confirmer_id: str,
+                          extra_context: str = '') -> list:
+    """Block Kit blocks for a 'Confirmed X: target' chat_update.
+
+    Used by Path A's Mark Deployed click and Path B's Mark Purchased
+    click — both rendered the same header + context blocks before
+    this refactor (audit #13 cleanup). Centralising the layout
+    prevents the two Slack cards from drifting apart when a future
+    change touches one of them.
+
+    Args:
+      action_label: post-action verb shown in the green-tick header,
+                    e.g. 'Deployed' / 'Purchased' / 'Approved'.
+      target: domain name (or whatever else identifies what was
+              acted on) shown after the action label.
+      confirmer_id: Slack user id of the operator who clicked the
+                    button. Used in the @mention.
+      extra_context: optional sentence appended to the standard
+                     'Confirmed by <@user>.' context line.
+    """
+    context_text = f'Confirmed by <@{confirmer_id}>.'
+    if extra_context:
+        context_text += ' ' + extra_context
+    return [
+        {'type': 'header', 'text': {
+            'type': 'plain_text',
+            'text': f':white_check_mark: {action_label}: {target}',
+        }},
+        {'type': 'context', 'elements': [{
+            'type': 'mrkdwn', 'text': context_text,
+        }]},
+    ]
+
 
 # ─── /new-domain shortlist builder (shared by modal submission + refresh) ─
 
 def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
-                                       extension, lander, requester):
+                                       extension, lander, requester,
+                                       examples=None, aws_account=''):
     """Render the /new-domain shortlist as Slack Block Kit blocks.
 
     Used by both the initial modal submission and the "Show 5 more"
     refresh handler. Each domain row gets a Pick this button; the
     bottom of the message gets a Show-5-more button that re-runs
     the same query with fresh LLM output.
+
+    `examples` is the user-supplied list of stylistic anchor domains
+    from the modal. Carried through the Show-5-more button so the
+    refresh worker can produce names in the same family.
+
+    `aws_account` is the AWS account the new domain will be provisioned
+    in (R53 zone, ACM cert, S3 bucket, CloudFront). Threaded into every
+    Pick-this button payload so the choice survives all hops down to
+    the inventory write at Mark Purchased.
+
+    `lander` may be empty — when so, the Pick payload carries empty
+    string and the downstream deploy worker will skip the file-copy
+    step and only run ATOM setup.
     """
+    examples = examples or []
     if extension == 'any':
         cap_label = (
             'Mixed extensions — sorted cheapest first. '
@@ -118,6 +215,8 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
         ext_display = extension
 
     audience_line = f'  ·  Audience: _{audience}_' if audience else ''
+    lander_line = f'  ·  Lander: {lander}' if lander else '  ·  Lander: _none (setup-only)_'
+    aws_line = f'  ·  AWS: `{aws_account}`' if aws_account else ''
 
     blocks = [
         {
@@ -132,7 +231,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
             'elements': [{
                 'type': 'mrkdwn',
                 'text': (f'Vertical: *{vertical}*  ·  Extension: `{ext_display}`'
-                         f'{audience_line}  ·  Lander: {lander}\n_{cap_label}_'),
+                         f'{aws_line}{audience_line}{lander_line}\n_{cap_label}_'),
             }],
         },
         {'type': 'divider'},
@@ -157,12 +256,13 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                 'action_id': 'pick_domain',
                 'text': {'type': 'plain_text', 'text': 'Pick this'},
                 'style': 'primary',
-                'value': json.dumps({
+                'value': sign_payload({
                     'domain': s['domain'],
                     'vertical': vertical,
                     'lander': lander,
                     'extension': per_domain_extension,
                     'requester': requester,
+                    'aws_account': aws_account,
                 }),
             },
         })
@@ -174,12 +274,14 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
             'type': 'button',
             'action_id': 'refresh_domain_suggestions',
             'text': {'type': 'plain_text', 'text': ':arrows_counterclockwise: Show 5 more'},
-            'value': json.dumps({
+            'value': sign_payload({
                 'vertical': vertical,
                 'audience': audience,
                 'extension': extension,
                 'lander': lander,
                 'requester': requester,
+                'examples': examples,
+                'aws_account': aws_account,
             }),
         }],
     })
@@ -188,7 +290,8 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
 
 def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
                                 vertical, audience, extension,
-                                lander, requester):
+                                lander, requester, examples=None,
+                                aws_account=''):
     """Worker that regenerates the /new-domain shortlist. Runs in a
     daemon thread so the original Slack action click can ack within 3s
     while the LLM + Namecheap calls take 15–30s.
@@ -196,12 +299,14 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
     Edits the placeholder message in-place to either show the new
     shortlist or surface a clear failure reason.
     """
+    examples = examples or []
     try:
         suggestions = suggest_new_domains(
             vertical=vertical,
             audience=audience,
             extension=extension,
             count=5,
+            examples=examples,
         )
     except Exception as e:
         logger.exception('Phase 8 refresh failed for vertical=%s', vertical)
@@ -227,6 +332,8 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         extension=extension,
         lander=lander,
         requester=requester,
+        examples=examples,
+        aws_account=aws_account,
     )
     client.chat_update(
         channel=channel,
@@ -234,6 +341,90 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         blocks=new_blocks,
         text=f'{len(suggestions)} fresh domains for {vertical}',
     )
+
+
+# ─── ATOM setup live-progress reporter ────────────────────────────────────
+#
+# ATOM's setup_domain runs 9 sequential steps server-side. While they
+# execute we poll ATOM's /api/status/{task_id} every 5 seconds and edit
+# the original progress message in-place with a Slack checklist so the
+# requester can SEE the deploy progressing rather than staring at silence
+# for 5-20 minutes. Step keys + display labels mirror aws_automation's
+# canonical order in aws_automation.py (~line 982 onward).
+
+_ATOM_STEP_ORDER = [
+    ('initialization',          'Initializing setup'),
+    ('certificate',             'Requesting SSL certificate'),
+    ('namecheap_cname',         'Adding CNAME validation records to Namecheap'),
+    ('route53_zone',            'Creating Route 53 hosted zone'),
+    ('s3_buckets',              'Creating S3 buckets'),
+    ('certificate_validation',  'Waiting for SSL certificate validation'),
+    ('cloudfront',              'Creating CloudFront distribution'),
+    ('route53_records',         'Creating Route 53 alias records'),
+    ('nameserver_update',       'Updating Namecheap nameservers'),
+]
+
+
+def _render_progress_checklist(steps: dict) -> str:
+    """Render ATOM's per-step status map as a Slack-friendly checklist.
+
+    ``steps`` is the ``steps`` field from ATOM's status response — a dict
+    keyed by step_key with values like ``{'status': 'completed'}``. Empty
+    dict (pre-first-poll) renders all rows as pending so the requester
+    sees the full 9-row outline immediately.
+    """
+    glyphs = {
+        'completed':   ':white_check_mark:',
+        'in_progress': ':hourglass_flowing_sand:',
+        'failed':      ':x:',
+    }
+    lines = ['*Setup progress:*']
+    for key, label in _ATOM_STEP_ORDER:
+        step = steps.get(key) or {}
+        state = (step.get('status') or '').lower()
+        glyph = glyphs.get(state, ':white_large_square:')
+        lines.append(f'{glyph} {label}')
+    return '\n'.join(lines)
+
+
+def _make_atom_progress_callback(*, client, channel, message_ts,
+                                 header_text, target_domain):
+    """Build the callback ``wait_for_setup`` invokes on each poll.
+
+    Closure state: the last rendered checklist string. We only call
+    chat_update when the rendered output actually changes — Slack
+    rate-limits message edits, and unchanged updates would waste both
+    quota and the requester's "new activity" indicators.
+
+    Resilient by design: if message_ts is missing (the initial
+    chat_postMessage failed) or chat_update raises, we log + swallow.
+    Progress reporting is decorative; it must never derail the real
+    workflow.
+    """
+    state = {'last_rendered': _render_progress_checklist({})}
+
+    def on_progress(status: dict) -> None:
+        if not message_ts:
+            return
+        steps = status.get('steps') or {}
+        rendered = _render_progress_checklist(steps)
+        if rendered == state['last_rendered']:
+            return
+        state['last_rendered'] = rendered
+        try:
+            client.chat_update(
+                channel=channel,
+                ts=message_ts,
+                text=header_text + '\n\n' + rendered,
+            )
+        except Exception:
+            logger.exception(
+                'progress chat_update failed for %s (ts=%s); '
+                'continuing the wait',
+                target_domain, message_ts,
+            )
+
+    return on_progress
 
 
 # ─── Phase 7 worker (module-level so tests can import it) ──────────────────
@@ -284,17 +475,86 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
                   '_Tip: use the form `https://<bucket>/<folder>/` in the lander '
                   'URL field next time and the bot will figure out the rest._'),
         )
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_skipped', actor='cron',
+                metadata={'reason': url_err or 'no_source_bucket',
+                          'lander_url': lander_url},
+            )
+        except Exception:
+            logger.exception('record_event(phase7_skipped) failed')
         return
 
-    client.chat_postMessage(
-        channel=channel, thread_ts=message_ts,
-        text=(f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
-              f'• source bucket: `{source_bucket}`\n'
-              f'• source folders: `{source_folders or "—"}`\n'
-              f'• source resolved from: _{source_origin}_\n'
-              '_This usually takes 5–20 minutes (cert validation + '
-              'CloudFront)._'),
-    )
+    # Phase 7 audit: started. Captures the resolved source so an operator
+    # debugging a failed deploy via /domain-history sees the inputs ATOM
+    # was handed.
+    try:
+        inventory_store.record_event(
+            target_domain, 'phase7_started', actor='cron',
+            metadata={
+                'source_bucket': source_bucket,
+                'source_folders': source_folders,
+                'source_account': source_account,
+                'source_origin': source_origin,
+                'requester': requester,
+            },
+        )
+    except Exception:
+        logger.exception('record_event(phase7_started) failed')
+
+    # Decide what message to post BEFORE the workflow runs. The
+    # 9-step "Setup progress" checklist only makes sense on a fresh
+    # domain — when `setup_at` is already populated the workflow's
+    # skip-setup branch goes straight to copy_files and the checklist
+    # would stay all-pending forever, confusing the requester (audit
+    # 2026-05-11). Look up the row here so the header reflects what
+    # will actually happen.
+    try:
+        record_now = inventory_store.get_domain(target_domain) or {}
+    except Exception:
+        record_now = {}
+    already_setup = bool(record_now.get('setup_at'))
+
+    if already_setup:
+        header_text = (
+            f':package: *Deploying lander to* `{target_domain}`\n'
+            f'• source bucket: `{source_bucket}`\n'
+            f'• source folders: `{source_folders or "—"}`\n'
+            f'• source resolved from: _{source_origin}_\n'
+            f'• ATOM setup: _already complete '
+            f'(skipping cert / R53 / CloudFront — only copying files)_\n'
+            '_This usually takes 1–2 minutes — file copy only._'
+        )
+        progress_msg = client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=header_text,
+        )
+        # No live checklist on the skip-setup path. The workflow's
+        # wait_for_setup is never called, so the callback would never
+        # fire — leaving the checklist stuck at all-pending and
+        # making the requester think ATOM hung.
+        progress_callback = None
+    else:
+        header_text = (
+            f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
+            f'• source bucket: `{source_bucket}`\n'
+            f'• source folders: `{source_folders or "—"}`\n'
+            f'• source resolved from: _{source_origin}_\n'
+            '_This usually takes 5–20 minutes (cert validation + '
+            'CloudFront)._'
+        )
+        # Post the progress message as a thread reply and remember its
+        # ts — the progress callback edits THIS message in-place
+        # rather than spamming the channel with one update per step.
+        progress_msg = client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=header_text + '\n\n' + _render_progress_checklist({}),
+        )
+        progress_ts = progress_msg.get('ts')
+        progress_callback = _make_atom_progress_callback(
+            client=client, channel=channel, message_ts=progress_ts,
+            header_text=header_text, target_domain=target_domain,
+        )
 
     req = ExistingDomainRequest(
         target_domain=target_domain,
@@ -306,9 +566,18 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     )
 
     try:
-        result = run_existing_domain_workflow(req)
+        result = run_existing_domain_workflow(
+            req, progress_callback=progress_callback,
+        )
     except Exception as e:
         logger.exception('Phase 7 worker crashed for %s', target_domain)
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_crashed', actor='cron',
+                metadata={'exception': type(e).__name__, 'message': str(e)[:500]},
+            )
+        except Exception:
+            pass
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=f':x: *ATOM workflow crashed:* `{type(e).__name__}: {e}`',
@@ -322,6 +591,13 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
 
     if result.status == 'completed':
         live = result.details.get('live_url') or f'https://{target_domain}'
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_succeeded', actor='cron',
+                metadata={'live_url': live, 'message': result.message[:500]},
+            )
+        except Exception:
+            logger.exception('record_event(phase7_succeeded) failed')
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':white_check_mark: *ATOM finished.* {result.message}\n'
@@ -335,6 +611,17 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     else:
         failed_step = (result.details.get('setup_result') or {}).get(
             'failed_at_step', '?')
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_failed', actor='cron',
+                metadata={
+                    'failed_at_step': failed_step,
+                    'reason': (result.details or {}).get('reason'),
+                    'message': result.message[:500],
+                },
+            )
+        except Exception:
+            logger.exception('record_event(phase7_failed) failed')
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
@@ -355,20 +642,28 @@ if _bolt_app is not None:
     def handle_list_domains(ack, respond, command):
         """Reply with the owned-domain inventory as a clickable card.
 
-        Optional argument: substring filter that searches across the
-        domain name, the vertical, AND the requester. Lets you find
-        a specific domain quickly even when there are hundreds.
+        Two filter modes:
 
-            /list-domains                → top results across everything
-            /list-domains auto           → matches vertical 'Auto Insurance'
-            /list-domains flashburn      → matches domains like
-                                            'instantflashburn.com'
-            /list-domains anurag         → matches anything by Anurag
+          • substring (default) — matches domain / vertical / requester.
+            /list-domains              → top results across everything
+            /list-domains auto         → matches vertical 'Auto Insurance'
+            /list-domains anurag       → matches anything by Anurag
+
+          • state filter (`:keyword`) — matches by lifecycle_state group.
+            /list-domains :expiring    → all EXPIRING_30/14/7/1
+            /list-domains :idle        → state == IDLE
+            /list-domains :awaiting    → all AWAITING_* (waiting on a click)
+            /list-domains :inventory   → released to the rotation pool
+            (full keyword list in the message footer)
 
         Each domain has a "Deploy lander" button that starts Path A
-        (deploy a lander to that existing owned domain).
+        (deploy a lander to that existing owned domain). Each row also
+        shows two badges: setup status (✅/⏳) and lifecycle state
+        (🟢 active / 💤 idle / ⚠️ expiring / etc.).
         """
         ack()
+        from lifecycle import badges as _badges
+
         filter_text = (command.get('text') or '').strip().lower()
         all_rows = inventory_store.list_domains()
         if not all_rows:
@@ -378,9 +673,16 @@ if _bolt_app is not None:
             })
             return
 
-        # Substring filter across domain / vertical / requester. Most
-        # useful columns for "find the domain I'm thinking of".
-        if filter_text:
+        # State filter takes precedence when the text starts with `:`.
+        # Otherwise fall through to the substring search.
+        state_pred = (
+            _badges.state_filter(filter_text) if filter_text.startswith(':')
+            else None
+        )
+        if state_pred is not None:
+            rows = [r for r in all_rows if state_pred(r)]
+            filter_label = filter_text  # keep the leading colon in the header
+        elif filter_text:
             def _matches(r: dict) -> bool:
                 haystacks = (
                     (r.get('domain') or ''),
@@ -389,15 +691,21 @@ if _bolt_app is not None:
                 )
                 return any(filter_text in h.lower() for h in haystacks)
             rows = [r for r in all_rows if _matches(r)]
+            filter_label = filter_text
         else:
             rows = all_rows
+            filter_label = ''
 
         if not rows:
+            hint = (
+                'Try a state keyword like '
+                f'{_badges.help_keywords()}, a domain substring, '
+                'a vertical, or an owner name — or run `/list-domains` '
+                'with no filter.'
+            )
             respond({
                 'response_type': 'ephemeral',
-                'text': (f'*No domains match `{filter_text}`.* Try part of a '
-                         f'domain name, vertical, or owner — or run '
-                         f'`/list-domains` with no filter.'),
+                'text': (f'*No domains match `{filter_label}`.*\n{hint}'),
             })
             return
 
@@ -409,7 +717,7 @@ if _bolt_app is not None:
 
         header_text = (
             f'Owned domains — {len(shown)} of {len(all_rows)}'
-            + (f' (filtered by "{filter_text}")' if filter_text else '')
+            + (f' (filtered by "{filter_label}")' if filter_label else '')
         )
 
         blocks: list = [
@@ -417,10 +725,11 @@ if _bolt_app is not None:
              'text': {'type': 'plain_text', 'text': header_text}},
             {'type': 'context', 'elements': [{
                 'type': 'mrkdwn',
-                'text': ('Click *Deploy lander* to send a redeployment '
-                         'request to Utkarsh. '
-                         'Filter by any text: `/list-domains flashburn` '
-                         '· `/list-domains medicare` · `/list-domains anurag`.'),
+                'text': (
+                    'Click *Deploy lander* to send a redeployment request '
+                    'to Utkarsh. Filter: substring (`/list-domains medicare`) '
+                    f'or state keyword ({_badges.help_keywords()}).'
+                ),
             }]},
             {'type': 'divider'},
         ]
@@ -428,19 +737,23 @@ if _bolt_app is not None:
         for r in shown:
             vert = r.get('vertical') or '_no vertical_'
             requested_by = r.get('requested_by') or '_unknown_'
-            stat_emoji = '✅' if r.get('setup_at') else '⏳'
+            setup_emoji = '✅' if r.get('setup_at') else '⏳'
+            lc_state = r.get('lifecycle_state')
+            lc_emoji = _badges.emoji(lc_state)
+            lc_label = _badges.label(lc_state)
             blocks.append({
                 'type': 'section',
                 'text': {
                     'type': 'mrkdwn',
-                    'text': (f'{stat_emoji} `{r["domain"]}`\n'
+                    'text': (f'{setup_emoji}{lc_emoji} `{r["domain"]}` '
+                             f'_{lc_label}_\n'
                              f'_{vert}_  ·  by `{requested_by}`'),
                 },
                 'accessory': {
                     'type': 'button',
                     'action_id': 'deploy_lander_existing',
                     'text': {'type': 'plain_text', 'text': 'Deploy lander'},
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'domain': r['domain'],
                         'vertical': r.get('vertical') or '',
                         'aws_account': r.get('aws_account') or '',
@@ -462,13 +775,56 @@ if _bolt_app is not None:
             'text': header_text,  # fallback for clients without block support
         })
 
+    @_bolt_app.command('/domain-history')
+    def handle_domain_history(ack, respond, command):
+        """Replay the lifecycle audit timeline for one domain.
+
+            /domain-history mybusiness.com
+
+        Shows current state + the last 25 events from `domain_events`
+        (the table the cron + Slack handlers write to on every state
+        transition). Read-only, ephemeral reply.
+        """
+        ack()
+        from lifecycle.history_view import render_timeline
+
+        domain = (command.get('text') or '').strip().lower()
+        if not domain:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (
+                    'Usage: `/domain-history <domain>` — e.g. '
+                    '`/domain-history safetyfirstauto.pro`. Replays the '
+                    "lifecycle bot's audit log for that domain."
+                ),
+            })
+            return
+
+        # Strip http(s):// + www. + path so users can paste a URL too.
+        for prefix in ('https://', 'http://', 'www.'):
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+        domain = domain.split('/')[0]
+
+        row = inventory_store.get_domain(domain)
+        events = inventory_store.list_domain_events(domain) if row else []
+
+        blocks = render_timeline(
+            row, events, requested_domain=domain,
+        )
+        respond({
+            'response_type': 'ephemeral',
+            'blocks': blocks,
+            'text': f'Timeline for {domain}',
+        })
+
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
         """Open the new-domain modal."""
         ack()
         client.views_open(
             trigger_id=body['trigger_id'],
-            view=_NEW_DOMAIN_MODAL,
+            view=_build_new_domain_modal(),
         )
 
     @_bolt_app.view('new_domain_modal')
@@ -491,22 +847,79 @@ if _bolt_app is not None:
         values = view['state']['values']
         vertical = (values['vertical_block']['vertical_input']['value'] or '').strip()
         audience = (values['audience_block']['audience_input']['value'] or '').strip()
-        lander = (values['lander_block']['lander_input']['value'] or '').strip()
+        # Lander is OPTIONAL — blank means "provision AWS infrastructure
+        # but skip the file copy step." Empty-string sentinel propagates
+        # all the way to the deploy worker.
+        lander = ((values.get('lander_block') or {})
+                  .get('lander_input', {}).get('value') or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
+        # AWS account is REQUIRED (no more implicit auto-insurance default).
+        # The modal's static_select always returns a value, but be
+        # defensive in case Slack sends a weird payload.
+        aws_account = (
+            values.get('aws_account_block', {})
+                  .get('aws_account_select', {})
+                  .get('selected_option', {})
+                  .get('value')
+            or (Config.AWS_ACCOUNT_OPTIONS[0] if Config.AWS_ACCOUNT_OPTIONS else '')
+        )
 
-        requester = body['user']['id']
+        # Optional Example domains — multiline text input, one name per line.
+        # Anchors the AI's stylistic feel when the prompt's generic defaults
+        # don't match the vertical (re-introduced post-Phase-8.1 as an
+        # opt-in steering knob alongside Audience).
+        examples_raw = (
+            (values.get('examples_block') or {})
+            .get('examples_input', {})
+            .get('value') or ''
+        )
+        examples = [
+            line.strip().lower()
+            for line in examples_raw.split('\n')
+            if line.strip()
+        ]
 
-        # 1. Confirm receipt up-front so the user knows we're working.
+        # Resolve the effective MDB. When an operator (e.g. Utkarsh during the
+        # trial-run period) submits on behalf of someone else, the MDB picker
+        # holds that person's user ID. Otherwise the operator IS the MDB.
+        operator = body['user']['id']
+        mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
+        picked_mdb = mdb_select.get('selected_user') or ''
+        requester = picked_mdb or operator
+        on_behalf = bool(picked_mdb and picked_mdb != operator)
+
+        # 1. Confirm receipt up-front so MDB knows we're working.
+        examples_summary = (
+            f"• Style examples: `{', '.join(examples)}`\n" if examples else ''
+        )
+        lander_line = (
+            f'• Lander URL: {lander}\n'
+            if lander
+            else '• Lander URL: _none — setup-only run, no file copy_\n'
+        )
         receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
-            f'• Requested by: <@{requester}>\n'
+            f'• Requested by: <@{requester}>'
+            + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
+            + f'\n'
             f'• Vertical: `{vertical}`\n'
+            f'• AWS account: `{aws_account}`\n'
             + (f"• Audience / angle: _{audience}_\n" if audience else '')
-            + f'• Lander URL: {lander}\n'
-            f'• Extension: `{extension}`\n'
+            + examples_summary
+            + lander_line
+            + f'• Extension: `{extension}`\n'
             ':mag: Generating suggestions and checking Namecheap availability…'
         )
         client.chat_postMessage(channel=requester, text=receipt)
+        # When the operator is acting on behalf of the MDB, also DM the
+        # operator a short ack so they know the request landed.
+        if on_behalf:
+            client.chat_postMessage(
+                channel=operator,
+                text=(f':envelope_with_arrow: Submitted new-domain request on '
+                      f'behalf of <@{requester}>. They\'ll see suggestions in '
+                      'their DMs shortly.'),
+            )
 
         # 2. Call the suggestion engine. It already filters to available +
         # price-capped (.com <$15, other extensions <=$5 per TL 2026-05-05).
@@ -517,6 +930,7 @@ if _bolt_app is not None:
                 audience=audience,
                 extension=extension,
                 count=5,
+                examples=examples,
             )
         except Exception as e:
             client.chat_postMessage(
@@ -551,6 +965,8 @@ if _bolt_app is not None:
             extension=extension,
             lander=lander,
             requester=requester,
+            examples=examples,
+            aws_account=aws_account,
         )
         client.chat_postMessage(
             channel=requester,
@@ -559,25 +975,47 @@ if _bolt_app is not None:
         )
 
     def _send_purchase_request_to_utkarsh(client, *, domain, vertical, lander,
-                                          extension, requester):
+                                          extension, requester,
+                                          aws_account=''):
         """DM Utkarsh (with dev-reroute applied) the purchase request card.
 
         Extracted from handle_pick_domain so TL approval can call it after
         the TL clicks Approve. Returns the resolved purchaser id (after
         DEV_REROUTE_DMS_TO override) so callers can name them in UI text.
+
+        Note: `requester` here is already the EFFECTIVE MDB (could be the
+        original /new-domain submitter, or the user picked in the MDB
+        users_select on the modal). Caller doesn't need to know about
+        operator-vs-MDB — that distinction is preserved upstream and
+        already shown in the TL approval card.
+
+        `aws_account` is threaded into the Mark Purchased button payload
+        so when Utkarsh clicks it the inventory row is created with the
+        explicit account choice from the modal (no silent default).
+
+        `lander` may be empty — when so, the Mark Purchased card explains
+        this is a "setup-only" run and the deploy worker will skip the
+        file-copy step.
         """
         real_purchaser = Config.UTKARSH_SLACK_USER_ID or requester
         purchaser = Config.route_recipient(real_purchaser)
+
+        lander_line = (
+            f'• Lander to deploy: {lander}\n' if lander
+            else '• Lander to deploy: _none — setup-only (no file copy)_\n'
+        )
+        aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
 
         utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
             f'• Requester: <@{requester}>\n'
             f'• Domain to buy: `{domain}`\n'
             f'• Vertical: `{vertical}`\n'
-            f'• Extension: `{extension}`\n'
-            f'• Lander to deploy: {lander}\n\n'
-            ':point_right: Please buy this on Namecheap, then click '
-            '*Mark Purchased* below.'
+            + aws_line
+            + f'• Extension: `{extension}`\n'
+            + lander_line
+            + '\n:point_right: Please buy this on Namecheap, then click '
+              '*Mark Purchased* below.'
         )
         client.chat_postMessage(
             channel=purchaser,
@@ -590,11 +1028,12 @@ if _bolt_app is not None:
                     'action_id': 'confirm_purchased',
                     'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Purchased'},
                     'style': 'primary',
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'domain': domain,
                         'vertical': vertical,
                         'lander': lander,
                         'requester': requester,
+                        'aws_account': aws_account,
                     }),
                 }]},
             ],
@@ -614,9 +1053,8 @@ if _bolt_app is not None:
         shortlist when ready.
         """
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         vertical = data.get('vertical', '')
@@ -624,6 +1062,8 @@ if _bolt_app is not None:
         extension = data.get('extension', 'any')
         lander = data.get('lander', '')
         requester = data['requester']
+        examples = data.get('examples') or []
+        aws_account = data.get('aws_account', '')
         channel = body['channel']['id']
         old_ts = body['message']['ts']
 
@@ -654,7 +1094,8 @@ if _bolt_app is not None:
             kwargs={
                 'vertical': vertical, 'audience': audience,
                 'extension': extension, 'lander': lander,
-                'requester': requester,
+                'requester': requester, 'examples': examples,
+                'aws_account': aws_account,
             },
             daemon=True,
             name=f'phase8-refresh-{vertical}',
@@ -676,10 +1117,8 @@ if _bolt_app is not None:
         through humans (TL approval, then Utkarsh manual buy).
         """
         ack()
-
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -687,15 +1126,23 @@ if _bolt_app is not None:
         lander = data['lander']
         extension = data['extension']
         requester = data['requester']
+        aws_account = data.get('aws_account', '')
 
         approver_ids = Config.APPROVER_SLACK_USER_IDS
-        button_payload = json.dumps({
+        button_payload = sign_payload({
             'domain': domain,
             'vertical': vertical,
             'lander': lander,
             'extension': extension,
             'requester': requester,
+            'aws_account': aws_account,
         })
+
+        lander_line = (
+            f'• Lander to deploy: {lander}\n' if lander
+            else '• Lander to deploy: _none — setup-only (no file copy)_\n'
+        )
+        aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
 
         if approver_ids:
             # Phase 7.5: send TL approval card to each configured approver
@@ -705,10 +1152,11 @@ if _bolt_app is not None:
                 f'• Requester: <@{requester}>\n'
                 f'• Domain: `{domain}`\n'
                 f'• Vertical: `{vertical}`\n'
-                f'• Extension: `{extension}`\n'
-                f'• Lander to deploy: {lander}\n\n'
-                ':point_right: Approve to forward this to Utkarsh for '
-                'purchase, or Reject to cancel.'
+                + aws_line
+                + f'• Extension: `{extension}`\n'
+                + lander_line
+                + '\n:point_right: Approve to forward this to Utkarsh for '
+                  'purchase, or Reject to cancel.'
             )
             approval_blocks = [
                 {'type': 'section',
@@ -771,6 +1219,7 @@ if _bolt_app is not None:
             client,
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
+            aws_account=aws_account,
         )
         purchaser_is_requester = (purchaser == requester)
 
@@ -813,9 +1262,8 @@ if _bolt_app is not None:
         "Approved by @TL" view so the same TL can't approve twice.
         """
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -823,6 +1271,7 @@ if _bolt_app is not None:
         lander = data['lander']
         extension = data.get('extension') or '.com'
         requester = data['requester']
+        aws_account = data.get('aws_account', '')
         approver = body['user']['id']
 
         # Forward to Utkarsh
@@ -830,6 +1279,7 @@ if _bolt_app is not None:
             client,
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
+            aws_account=aws_account,
         )
 
         # Replace the approval card so it can't be re-approved
@@ -862,9 +1312,8 @@ if _bolt_app is not None:
         """TL clicked Reject on a Path B approval card. Stop the flow,
         tell the requester. No domain enters inventory."""
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
@@ -907,9 +1356,8 @@ if _bolt_app is not None:
           • asks for the source lander URL to deploy
         """
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         target_domain = data['domain']
@@ -954,6 +1402,24 @@ if _bolt_app is not None:
                     },
                 },
                 {'type': 'divider'},
+                {
+                    'type': 'input',
+                    'block_id': 'mdb_block',
+                    'optional': True,
+                    'label': {'type': 'plain_text',
+                              'text': 'Requesting MDB (leave blank if this is for you)'},
+                    'hint': {
+                        'type': 'plain_text',
+                        'text': ('Pick the marketer you\'re running this on '
+                                 'behalf of. The final "deployed" notification '
+                                 'goes to them instead of you when set.'),
+                    },
+                    'element': {
+                        'type': 'users_select',
+                        'action_id': 'mdb_select',
+                        'placeholder': {'type': 'plain_text', 'text': 'Pick an MDB'},
+                    },
+                },
                 {
                     'type': 'input',
                     'block_id': 'lander_block',
@@ -1021,7 +1487,14 @@ if _bolt_app is not None:
 
         ack()
 
-        requester = body['user']['id']
+        # Resolve the effective MDB. Operator (Utkarsh during the trial-run
+        # period) may submit on behalf of someone else via the MDB picker.
+        operator = body['user']['id']
+        mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
+        picked_mdb = mdb_select.get('selected_user') or ''
+        requester = picked_mdb or operator
+        on_behalf = bool(picked_mdb and picked_mdb != operator)
+
         real_recipient = Config.UTKARSH_SLACK_USER_ID or requester
         recipient = Config.route_recipient(real_recipient)
         recipient_is_requester = (recipient == requester)
@@ -1030,7 +1503,9 @@ if _bolt_app is not None:
         # with a Mark Deployed button so he can close the loop in one click.
         utkarsh_text = (
             ':rocket: *Lander deployment request* :rocket:\n'
-            f'• Requester: <@{requester}>\n'
+            f'• Requester: <@{requester}>'
+            + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
+            + f'\n'
             f'• Target domain: `{target_domain}`\n'
             f'• Vertical: `{vertical}`\n'
             f'• Lander to deploy: {lander}\n'
@@ -1050,7 +1525,7 @@ if _bolt_app is not None:
                     'action_id': 'confirm_deployed',
                     'text': {'type': 'plain_text', 'text': ':white_check_mark: Mark Deployed'},
                     'style': 'primary',
-                    'value': json.dumps({
+                    'value': sign_payload({
                         'target_domain': target_domain,
                         'vertical': vertical,
                         'lander': lander,
@@ -1060,7 +1535,7 @@ if _bolt_app is not None:
             ],
         )
 
-        # 2. Confirm to the requester
+        # 2. Confirm to the MDB (the effective requester)
         if recipient_is_requester:
             client.chat_postMessage(
                 channel=requester,
@@ -1073,6 +1548,14 @@ if _bolt_app is not None:
                 channel=requester,
                 text=(f':envelope: Deploy request for `{target_domain}` sent '
                       f'to <@{recipient}>. He\'ll confirm here when done.'),
+            )
+        # 3. When operator is acting on behalf of MDB, also DM the operator
+        # so they know the request was submitted.
+        if on_behalf:
+            client.chat_postMessage(
+                channel=operator,
+                text=(f':envelope_with_arrow: Submitted deploy request for '
+                      f'`{target_domain}` on behalf of <@{requester}>.'),
             )
 
     # ─── Loop closers: Utkarsh clicks "Mark Done" ────────────────────────
@@ -1091,9 +1574,8 @@ if _bolt_app is not None:
         message; final status is DM'd to the requester.
         """
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         target_domain = data['target_domain']
@@ -1104,27 +1586,70 @@ if _bolt_app is not None:
         channel = body['channel']['id']
         message_ts = body['message']['ts']
 
-        # Update inventory: stamp setup_at so /list-domains shows ✅
-        try:
-            inventory_store.mark_setup_complete(target_domain)
-        except Exception:
-            pass  # Domain may not be in inventory yet (Phase 6 covers that)
+        log_event(
+            'slack_button_clicked', button='confirm_deployed',
+            domain=target_domain, vertical=vertical,
+            requester=requester, confirmer=confirmer,
+            lander_url=lander_url,
+        )
 
-        # Replace the button with a "confirmed" view
+        # Update inventory: stamp setup_at so /list-domains shows ✅, and
+        # persist the lander URL the operator submitted (Path A previously
+        # left lander_url NULL on the row).
+        #
+        # mark_setup_complete is an UPDATE — when the domain isn't yet in
+        # inventory it's a benign no-op (no rows affected, no error). So
+        # we do NOT swallow exceptions here: any exception means the DB
+        # itself is unhappy (network down, schema drift, auth) and we
+        # MUST surface it. Silently passing would let the bot tell Slack
+        # "deployed ✅" while the row stayed unmodified, leaving inventory
+        # and AWS state divergent (reported in 2026-05-08 audit).
+        try:
+            inventory_store.mark_setup_complete(
+                target_domain, lander_url=lander_url or None,
+            )
+        except Exception:
+            logger.exception(
+                'mark_setup_complete failed for domain=%s requester=%s — '
+                'inventory and AWS state may diverge',
+                target_domain, requester,
+            )
+            client.chat_postMessage(
+                channel=channel, thread_ts=message_ts,
+                text=(':warning: Inventory update failed for '
+                      f'`{target_domain}`. The Mark Deployed click was '
+                      'recorded in Slack, but the inventory row was NOT '
+                      'updated. Check the bot logs and re-run once the '
+                      'DB is healthy.'),
+            )
+            raise
+
+        # Audit event for /domain-history. Best-effort — never fail the
+        # whole click handler over an event-write blip.
+        try:
+            inventory_store.record_event(
+                target_domain, 'mark_deployed',
+                actor=confirmer,
+                metadata={'requester': requester, 'lander_url': lander_url,
+                          'vertical': vertical, 'flow': 'path_a'},
+            )
+        except Exception:
+            logger.exception(
+                'record_event(mark_deployed) failed for %s', target_domain,
+            )
+
+        # Replace the button with a "confirmed" view (audit #13:
+        # shared with confirm_purchased via _build_confirmed_card so
+        # the two paths can't drift apart).
         client.chat_update(
             channel=channel,
             ts=message_ts,
             text=f'Confirmed deployed: {target_domain}',
-            blocks=[
-                {'type': 'header', 'text': {
-                    'type': 'plain_text',
-                    'text': f':white_check_mark: Deployed: {target_domain}',
-                }},
-                {'type': 'context', 'elements': [{
-                    'type': 'mrkdwn',
-                    'text': f'Confirmed by <@{confirmer}>.',
-                }]},
-            ],
+            blocks=_build_confirmed_card(
+                action_label='Deployed',
+                target=target_domain,
+                confirmer_id=confirmer,
+            ),
         )
 
         # Notify the requester (skip if requester == confirmer to avoid
@@ -1136,16 +1661,23 @@ if _bolt_app is not None:
                       f'Confirmed by <@{confirmer}>.'),
             )
 
-        # Phase 7: trigger ATOM in a background thread (the workflow blocks
-        # for minutes; Slack interactions must ack within 3s).
+        # Phase 7: enqueue the workflow on the durable task queue
+        # instead of spawning a fire-and-forget daemon thread. The
+        # task row survives a process restart; if Render redeploys
+        # mid-deploy the boot-time recovery sweeper requeues it
+        # automatically (audit #2 fix).
         if Config.ENABLE_PHASE_7:
-            threading.Thread(
-                target=_phase7_run_atom_setup,
-                args=(client, channel, message_ts, target_domain,
-                      vertical, requester, lander_url),
-                daemon=True,
-                name=f'phase7-deploy-{target_domain}',
-            ).start()
+            from orchestrator import tasks
+            from orchestrator.tasks_runner import enqueue_phase7
+            enqueue_phase7(
+                kind=tasks.TASK_KIND_PATH_A,
+                channel=channel,
+                message_ts=message_ts,
+                target_domain=target_domain,
+                vertical=vertical,
+                requester=requester,
+                lander_url=lander_url,
+            )
 
     @_bolt_app.action('confirm_purchased')
     def handle_confirm_purchased(ack, body, client):
@@ -1159,34 +1691,104 @@ if _bolt_app is not None:
         domain gets full setup_domain + lander copy automatically.
         """
         ack()
-        try:
-            data = json.loads(body['actions'][0]['value'])
-        except (KeyError, json.JSONDecodeError, IndexError):
+        data = _verify_button_click(body)
+        if data is None:
             return
 
         domain = data['domain']
         vertical = data.get('vertical') or ''
         lander = data.get('lander') or ''
         requester = data['requester']
+        aws_account = data.get('aws_account', '').strip()
+        # Backwards compat: old in-flight buttons (signed before the modal
+        # added the picker) carry no aws_account key. Fall back to the
+        # first configured option, which preserves the previous implicit
+        # default (auto-insurance via init_db backfill). Logged as an info
+        # so operators can see when legacy buttons are being consumed.
+        if not aws_account:
+            aws_account = (
+                Config.AWS_ACCOUNT_OPTIONS[0]
+                if Config.AWS_ACCOUNT_OPTIONS else ''
+            )
+            logger.info(
+                'confirm_purchased: legacy button without aws_account — '
+                'defaulting to %r for domain=%s', aws_account, domain,
+            )
         confirmer = body['user']['id']
         channel = body['channel']['id']
         message_ts = body['message']['ts']
 
+        log_event(
+            'slack_button_clicked', button='confirm_purchased',
+            domain=domain, vertical=vertical, aws_account=aws_account,
+            requester=requester, confirmer=confirmer,
+            lander_url=lander,
+        )
+
         # Add to inventory so /list-domains starts showing it (and so the
         # Phase 7 workflow can find it — run_existing_domain_workflow
         # rejects domains that aren't in the store).
+        #
+        # The ONLY benign DB failure here is "domain already exists"
+        # (DuplicateDomainError) — that's the user clicking Mark Purchased
+        # twice on the same row, idempotent. Every other DB error means
+        # the inventory write didn't happen, so we MUST surface it
+        # instead of silently telling Slack "purchased ✅" while the
+        # backing row was lost (2026-05-08 audit fix).
         try:
             inventory_store.add_domain(
                 domain=domain,
                 vertical=vertical,
-                lander_url=lander,
+                # AWS account explicit choice from the /new-domain modal.
+                # Previously this column was NULL on insert and silently
+                # backfilled to 'auto-insurance' by init_db — making the
+                # provisioning account essentially un-configurable. Now
+                # the MDB picks it in the modal and the value flows here.
+                aws_account=aws_account or None,
+                lander_url=lander or None,
                 requested_by=f'Slack:{requester}',
                 notes='Purchased via /new-domain bot flow',
+                # State machine starts here — Phase 7 worker will move
+                # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
+                status=inventory_store.STATUS_PENDING,
+                # Lifecycle ownership starts on day one — classifier needs
+                # an MDB to DM when this domain expires or goes idle.
+                # Legacy CSV-imported rows get this via the boot-time
+                # backfill in store.init_db().
+                assigned_to=requester,
+                # Audit trail for /domain-history. Captures who clicked
+                # Mark Purchased, plus the lander URL (if any) and the
+                # AWS account it'll be deployed to.
+                event_source='path_b_mark_purchased',
+                event_metadata={'lander_url': lander, 'vertical': vertical,
+                                'aws_account': aws_account,
+                                'confirmer': confirmer},
+            )
+        except inventory_store.DuplicateDomainError:
+            logger.info(
+                'add_domain idempotent skip — domain=%s already in '
+                'inventory; treating as benign re-click',
+                domain,
             )
         except Exception:
-            pass  # Already exists or other issue — non-fatal for the UX update
+            logger.exception(
+                'add_domain failed for domain=%s requester=%s — '
+                'inventory write did NOT happen', domain, requester,
+            )
+            client.chat_postMessage(
+                channel=channel, thread_ts=message_ts,
+                text=(':warning: Inventory write failed for '
+                      f'`{domain}`. Mark Purchased was recorded in '
+                      'Slack, but the new row was NOT inserted — '
+                      '/list-domains will not show this domain until '
+                      'the DB is healthy and Mark Purchased is clicked '
+                      'again. Check the bot logs.'),
+            )
+            raise
 
-        # Replace the button with a "purchased" view
+        # Replace the button with a "purchased" view (audit #13:
+        # shared with confirm_deployed via _build_confirmed_card so
+        # the two paths can't drift apart).
         phase7_note = (
             'Triggering ATOM setup now — watch this thread for progress.'
             if Config.ENABLE_PHASE_7
@@ -1196,17 +1798,12 @@ if _bolt_app is not None:
             channel=channel,
             ts=message_ts,
             text=f'Confirmed purchased: {domain}',
-            blocks=[
-                {'type': 'header', 'text': {
-                    'type': 'plain_text',
-                    'text': f':white_check_mark: Purchased: {domain}',
-                }},
-                {'type': 'context', 'elements': [{
-                    'type': 'mrkdwn',
-                    'text': (f'Confirmed by <@{confirmer}>. Added to '
-                             f'inventory. {phase7_note}'),
-                }]},
-            ],
+            blocks=_build_confirmed_card(
+                action_label='Purchased',
+                target=domain,
+                confirmer_id=confirmer,
+                extra_context=f'Added to inventory. {phase7_note}',
+            ),
         )
 
         # Notify the requester
@@ -1217,103 +1814,216 @@ if _bolt_app is not None:
                       f'Confirmed by <@{confirmer}>. Setup will follow.'),
             )
 
-        # Phase 7: trigger ATOM in a background thread.
+        # Phase 7: enqueue on the durable task queue (audit #2 fix —
+        # see confirm_deployed above for rationale).
         if Config.ENABLE_PHASE_7:
-            threading.Thread(
-                target=_phase7_run_atom_setup,
-                args=(client, channel, message_ts, domain,
-                      vertical, requester, lander),
-                daemon=True,
-                name=f'phase7-purchase-{domain}',
-            ).start()
+            from orchestrator import tasks
+            from orchestrator.tasks_runner import enqueue_phase7
+            enqueue_phase7(
+                kind=tasks.TASK_KIND_PATH_B,
+                channel=channel,
+                message_ts=message_ts,
+                target_domain=domain,
+                vertical=vertical,
+                requester=requester,
+                lander_url=lander,
+            )
 
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
 
-_NEW_DOMAIN_MODAL = {
-    'type': 'modal',
-    'callback_id': 'new_domain_modal',
-    'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
-    'submit': {'type': 'plain_text', 'text': 'Continue'},
-    'close': {'type': 'plain_text', 'text': 'Cancel'},
-    'blocks': [
-        {
-            'type': 'input',
-            'block_id': 'vertical_block',
-            'label': {'type': 'plain_text', 'text': 'Vertical'},
-            'element': {
-                'type': 'plain_text_input',
-                'action_id': 'vertical_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'e.g. auto-insurance'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'audience_block',
-            'optional': True,
-            'label': {'type': 'plain_text',
-                      'text': 'Audience or angle (optional)'},
-            'hint': {
-                'type': 'plain_text',
-                'text': ('Who are you targeting and how. The bot will use '
-                         'this to match name style to the campaign. Leave '
-                         'blank if the vertical alone is enough.'),
-            },
-            'element': {
-                'type': 'plain_text_input',
-                'action_id': 'audience_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'lander_block',
-            'label': {'type': 'plain_text',
-                      'text': 'Lander URL (which page to deploy)'},
-            'element': {
-                'type': 'url_text_input',
-                'action_id': 'lander_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'https://example.com/landing-page'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'extension_block',
-            'label': {'type': 'plain_text', 'text': 'Domain extension'},
-            'element': {
-                'type': 'static_select',
-                'action_id': 'extension_select',
-                'initial_option': {
-                    'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'},
-                    'value': 'any',
+def _build_new_domain_modal() -> dict:
+    """Build the /new-domain modal payload.
+
+    Built as a function (not a module-level constant) because the AWS
+    account picker reads `Config.AWS_ACCOUNT_OPTIONS` at modal-open time —
+    operators can adjust which accounts appear without restarting the bot.
+
+    Two design choices worth flagging:
+      • The AWS account picker is REQUIRED. The previous implicit default
+        of `auto-insurance` (via init_db NULL-backfill) silently routed
+        every new domain into one account; making the choice explicit
+        means MDBs can provision in medicare / medsupp / etc. without a
+        config change (audit 2026-05-11).
+      • The lander URL is OPTIONAL. Sometimes the team only wants to
+        provision the AWS infrastructure (R53 zone, ACM cert, S3 bucket,
+        CloudFront) and deploy the lander later. Blank → ATOM setup runs,
+        file-copy step is skipped.
+    """
+    account_options = [
+        {'text': {'type': 'plain_text', 'text': acct}, 'value': acct}
+        for acct in Config.AWS_ACCOUNT_OPTIONS
+    ]
+    return {
+        'type': 'modal',
+        'callback_id': 'new_domain_modal',
+        'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
+        'submit': {'type': 'plain_text', 'text': 'Continue'},
+        'close': {'type': 'plain_text', 'text': 'Cancel'},
+        'blocks': [
+            {
+                'type': 'input',
+                'block_id': 'mdb_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Requesting MDB (leave blank if this is for you)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Pick the marketer you\'re running this on behalf of. '
+                             'When set, all bot DMs (suggestions, approval status, '
+                             'final deploy notification) go to them instead of you.'),
                 },
-                'options': [
-                    {'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'}, 'value': 'any'},
-                    {'text': {'type': 'plain_text', 'text': '.com  (under $15)'},    'value': '.com'},
-                    {'text': {'type': 'plain_text', 'text': '.pro  (~$4)'},          'value': '.pro'},
-                    {'text': {'type': 'plain_text', 'text': '.info (~$4)'},          'value': '.info'},
-                    {'text': {'type': 'plain_text', 'text': '.site (~$1)'},          'value': '.site'},
-                    {'text': {'type': 'plain_text', 'text': '.live (~$3)'},          'value': '.live'},
-                    {'text': {'type': 'plain_text', 'text': '.top  (~$3)'},          'value': '.top'},
-                    {'text': {'type': 'plain_text', 'text': '.icu  (~$3)'},          'value': '.icu'},
-                ],
+                'element': {
+                    'type': 'users_select',
+                    'action_id': 'mdb_select',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'Pick an MDB'},
+                },
             },
-        },
-    ],
-}
+            {
+                'type': 'input',
+                'block_id': 'vertical_block',
+                'label': {'type': 'plain_text', 'text': 'Vertical'},
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'vertical_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. auto-insurance'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'aws_account_block',
+                'label': {'type': 'plain_text', 'text': 'AWS account (target)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Which AWS account this domain\'s R53 zone, ACM '
+                             'cert, S3 bucket, and CloudFront distribution '
+                             'should live in. Configure the list of options '
+                             'via the AWS_ACCOUNT_OPTIONS env var.'),
+                },
+                'element': {
+                    'type': 'static_select',
+                    'action_id': 'aws_account_select',
+                    'initial_option': account_options[0],
+                    'options': account_options,
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'audience_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Audience or angle (optional)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Who are you targeting and how. The bot will use '
+                             'this to match name style to the campaign. Leave '
+                             'blank if the vertical alone is enough.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'audience_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'examples_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Example domain names (optional)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('One per line. The bot anchors the AI on the STYLE '
+                             'of these names (word count, tone, compounding) — '
+                             'it will NOT reuse them. Use this when the vertical '
+                             'is unusual or the AI\'s defaults don\'t match.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'examples_input',
+                    'multiline': True,
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'mymedicareexperts.online\nseniorhealthhub.com\nmedicarequotefinder.pro'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'lander_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Lander URL (optional — leave blank for setup-only)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('When set, the bot copies the lander\'s S3 contents '
+                             'to the new domain\'s bucket after ATOM setup. '
+                             'When blank, only AWS infrastructure is provisioned '
+                             '(R53 zone, ACM cert, S3 bucket, CloudFront) — you '
+                             'can deploy a lander later via /list-domains.'),
+                },
+                'element': {
+                    'type': 'url_text_input',
+                    'action_id': 'lander_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'https://example.com/landing-page (or leave blank)'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'extension_block',
+                'label': {'type': 'plain_text', 'text': 'Domain extension'},
+                'element': {
+                    'type': 'static_select',
+                    'action_id': 'extension_select',
+                    'initial_option': {
+                        'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'},
+                        'value': 'any',
+                    },
+                    'options': [
+                        {'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'}, 'value': 'any'},
+                        {'text': {'type': 'plain_text', 'text': '.com  (under $15)'},    'value': '.com'},
+                        {'text': {'type': 'plain_text', 'text': '.pro  (~$4)'},          'value': '.pro'},
+                        {'text': {'type': 'plain_text', 'text': '.info (~$4)'},          'value': '.info'},
+                        {'text': {'type': 'plain_text', 'text': '.site (~$1)'},          'value': '.site'},
+                        {'text': {'type': 'plain_text', 'text': '.live (~$3)'},          'value': '.live'},
+                        {'text': {'type': 'plain_text', 'text': '.top  (~$3)'},          'value': '.top'},
+                        {'text': {'type': 'plain_text', 'text': '.icu  (~$3)'},          'value': '.icu'},
+                    ],
+                },
+            },
+        ],
+    }
 
 
 # ─── Flask routes (forward everything to bolt) ─────────────────────────────
 
 @slack_bp.route('/health', methods=['GET'])
 def slack_health():
+    """Slack-blueprint-scoped health probe.
+
+    Reports both the Slack bolt-app status AND the inventory DB. The
+    Slack interaction handlers all touch the inventory (mark deployed,
+    add purchased, list domains), so a healthy slack blueprint with a
+    dead DB would still 500 on every interaction. Returning 503 here
+    keeps the signals consistent with `/health` (2026-05-08 audit fix).
+    """
+    try:
+        inventory_store.health_check()
+        db_status = 'reachable'
+    except inventory_store.StoreUnavailable as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'reason': 'db_unavailable',
+            'error': str(e),
+            'bolt_active': _bolt_app is not None,
+        }), 503
     return jsonify({
         'status': 'slack blueprint mounted',
         'phase': 2,
         'bolt_active': _bolt_app is not None,
+        'db': db_status,
     })
 
 
@@ -1340,6 +2050,12 @@ def slash_new_domain():
 @slack_bp.route('/slash/list-domains', methods=['POST'])
 def slash_list_domains():
     return _bolt_or_stub('Coming soon: /list-domains (Phase 3). '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
+@slack_bp.route('/slash/domain-history', methods=['POST'])
+def slash_domain_history():
+    return _bolt_or_stub('Coming soon: /domain-history (Phase D). '
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 
