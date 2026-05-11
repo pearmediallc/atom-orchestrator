@@ -17,6 +17,9 @@ from orchestrator.log_setup import log_event
 from domain_assistant import chatgpt, namecheap_check
 
 
+logger = logging.getLogger(__name__)
+
+
 # ---------- Request / Result types ----------
 
 @dataclass
@@ -50,9 +53,46 @@ class WorkflowResult:
 
 # ---------- Workflows ----------
 
+def _resolve_real_aws_account(client, target_domain: str,
+                              configured_account: str):
+    """Discover which AWS account actually owns ``target_domain``'s
+    bucket by listing buckets in each configured account via ATOM.
+
+    Returns ``(real_account, drifted)``:
+      • real_account     — the account_key that owns the bucket. Falls
+                           back to configured_account when ATOM doesn't
+                           recognise the bucket in any account (likely
+                           a transient list-buckets failure or a domain
+                           in a third unknown account).
+      • drifted          — True when real_account differs from
+                           configured_account, signalling the caller
+                           should self-heal the inventory column.
+
+    Resilient by design: a single account's list_buckets failure (auth,
+    network, etc.) doesn't abort the resolution — we just continue to
+    the next account. Workflow correctness depends on at least ONE
+    account being reachable, which is the same baseline ATOM itself
+    requires to deploy.
+    """
+    for account_key in Config.AWS_ACCOUNT_OPTIONS:
+        try:
+            names = client.list_buckets(account_key)
+        except Exception:
+            logger.warning(
+                'list_buckets failed for account=%s while resolving '
+                'real owner of %s — skipping this account',
+                account_key, target_domain,
+            )
+            continue
+        if target_domain in names:
+            return account_key, account_key != configured_account
+    return configured_account, False
+
+
 def _fail(req: ExistingDomainRequest, message: str, *,
           reason: str, task_id: Optional[str] = None,
-          extra_details: Optional[dict] = None) -> WorkflowResult:
+          extra_details: Optional[dict] = None,
+          log_fields: Optional[dict] = None) -> WorkflowResult:
     """Build a WorkflowResult(status='failed') and stamp the inventory
     row with STATUS_FAILED + latest_error so /list-domains and any
     future re-deploy logic can see the last failure cause.
@@ -62,6 +102,13 @@ def _fail(req: ExistingDomainRequest, message: str, *,
 
     Always emits a structured `workflow_failed` log event so operators
     grepping for failures don't have to scroll Slack threads.
+
+    ``log_fields`` are merged as top-level keys into the JSON log line
+    (None values are dropped to keep lines uncluttered). Use it to
+    surface structured diagnostics like ATOM's ``failed_at_step`` and
+    AWS error code so operators can root-cause from logs alone — the
+    rich ``setup_result`` blob lives in ``extra_details`` and is only
+    embedded in the in-process WorkflowResult, never logged.
     """
     details = {'reason': reason}
     if task_id is not None:
@@ -77,10 +124,12 @@ def _fail(req: ExistingDomainRequest, message: str, *,
         )
     except Exception:
         pass  # original error wins; don't mask it.
+    extras = {k: v for k, v in (log_fields or {}).items() if v is not None}
     log_event(
         'workflow_failed', level=logging.ERROR,
         domain=req.target_domain, reason=reason,
         atom_task_id=task_id, failure_message=message[:500],
+        **extras,
     )
     return WorkflowResult(status='failed', message=message, details=details)
 
@@ -88,6 +137,7 @@ def _fail(req: ExistingDomainRequest, message: str, *,
 def run_existing_domain_workflow(
     req: ExistingDomainRequest,
     client: Optional[AtomClient] = None,
+    progress_callback=None,
 ) -> WorkflowResult:
     """Path A — MDB picked a domain we already own. Deploy the lander.
 
@@ -165,19 +215,76 @@ def run_existing_domain_workflow(
     except Exception:
         pass  # status is observability only; never block the deploy on it.
 
-    # 2. Trigger ATOM domain setup
-    try:
-        setup_response = client.setup_domain(
-            req.target_domain,
-            account_key=target_account,
+    # 2. Trigger ATOM domain setup — UNLESS the domain has already been
+    # set up. The docstring above claims ATOM's setup_domain is
+    # "idempotent," but in practice the `s3_buckets` step calls
+    # PutBucketWebsite, which fails with AccessDenied when the bucket
+    # already exists under different ownership. Worse: even when it
+    # works, re-running setup wastes 30–90s polling steps that have
+    # nothing to do (cert already valid, zone already in Route53, etc.)
+    # so skipping is also a latency win.
+    #
+    # `setup_at` is only ever written by mark_setup_complete() after a
+    # full successful ATOM run, so a non-null value is a reliable
+    # "infrastructure already provisioned for this domain" signal. We
+    # log a structured `atom_setup_skipped` event so /domain-history
+    # explains why no ATOM task_id was generated for this deploy.
+    if record.get('setup_at'):
+        log_event(
+            'atom_setup_skipped',
+            domain=req.target_domain,
+            reason='already_setup',
+            setup_at=str(record.get('setup_at')),
         )
-        task_id = setup_response['tasks'][0]['task_id']
-    except Exception as e:
-        return _fail(
-            req,
-            f'Could not start ATOM domain setup: {e}',
-            reason='atom_setup_kickoff_failed',
+        task_id = None  # no ATOM task on this run; copy_files only
+
+        # Ground-truth the AWS account by asking ATOM which account
+        # actually owns this bucket. Inventory's aws_account column has
+        # historically drifted (Path B confirm_purchased inserted NULL,
+        # init_db silently backfilled to 'auto-insurance' for every
+        # row regardless of where the bucket actually lived) — that
+        # drift is what caused the 2026-05-11 silent-AccessDenied
+        # storm on mymedicareexperts.online and ~408 similar domains.
+        #
+        # ATOM's UI doesn't have this problem because the user manually
+        # picks the target account from a dropdown. We do the equivalent
+        # here: ask ATOM for the truth and self-heal the inventory
+        # column when it disagrees. Only matters on the already-setup
+        # path — for fresh domains (setup_at NULL) we're about to
+        # create the bucket so inventory is by definition correct.
+        resolved, drifted = _resolve_real_aws_account(
+            client, req.target_domain, target_account,
         )
+        if drifted:
+            log_event(
+                'aws_account_drift_corrected',
+                domain=req.target_domain,
+                inventory_was=target_account,
+                actual=resolved,
+                note='Inventory aws_account did not match the bucket\'s '
+                     'real owning account in AWS. Healed automatically.',
+            )
+            target_account = resolved
+            try:
+                store.set_aws_account(req.target_domain, resolved)
+            except Exception:
+                logger.exception(
+                    'set_aws_account failed for %s — drift will be '
+                    're-resolved on next deploy', req.target_domain,
+                )
+    else:
+        try:
+            setup_response = client.setup_domain(
+                req.target_domain,
+                account_key=target_account,
+            )
+            task_id = setup_response['tasks'][0]['task_id']
+        except Exception as e:
+            return _fail(
+                req,
+                f'Could not start ATOM domain setup: {e}',
+                reason='atom_setup_kickoff_failed',
+            )
 
     # Now record the real ATOM task_id on the row so it's correlatable
     # with ATOM's logs / status endpoint without re-deriving it.
@@ -195,86 +302,174 @@ def run_existing_domain_workflow(
     # for a fresh-domain ACM cert validation to complete. The previous
     # hardcoded 600s aborted legitimate runs while cert was still
     # propagating (2026-05-08 audit fix).
-    try:
-        setup_result = client.wait_for_setup(
-            task_id, timeout=Config.PHASE7_SETUP_TIMEOUT_SEC,
-        )
-    except TimeoutError as e:
-        return _fail(
-            req,
-            f'ATOM setup did not complete in time: {e}',
-            reason='atom_setup_timeout', task_id=task_id,
-        )
+    #
+    # Skipped entirely when task_id is None (already-setup branch above).
+    if task_id is None:
+        setup_result = {'status': 'completed', 'skipped': True}
+    else:
+        try:
+            setup_result = client.wait_for_setup(
+                task_id, timeout=Config.PHASE7_SETUP_TIMEOUT_SEC,
+                on_progress=progress_callback,
+            )
+        except TimeoutError as e:
+            return _fail(
+                req,
+                f'ATOM setup did not complete in time: {e}',
+                reason='atom_setup_timeout', task_id=task_id,
+            )
 
     if setup_result.get('status') != 'completed':
         # Forward ATOM's structured error so the caller sees AWS error code,
-        # request id, etc.
+        # request id, etc. ATOM's failed-status shape (see
+        # tests/test_atom_client.py::test_setup_domain_returns_structured_error):
+        #   { status: 'failed', failed_at_step, completed_steps,
+        #     error: { step_key, message, exception, aws_error_code?, ... } }
+        # Older/edge failure modes may omit fields entirely — be defensive.
+        err = setup_result.get('error')
+        err = err if isinstance(err, dict) else {}
+        step = (
+            setup_result.get('failed_at_step')
+            or err.get('step_key')
+            or 'unknown'
+        )
+        err_msg = err.get('message') if isinstance(err.get('message'), str) else None
+        err_exc = err.get('exception') if isinstance(err.get('exception'), str) else None
+        aws_code = err.get('aws_error_code') if isinstance(err.get('aws_error_code'), str) else None
+
+        # Human message: lead with step, append AWS code + ATOM's exception
+        # message when available so the Slack reply and DB latest_error
+        # row both carry the real cause, not the literal 'unknown'.
+        parts = [f"ATOM domain setup failed at step '{step}'."]
+        if aws_code:
+            parts.append(f'[{aws_code}]')
+        if err_msg:
+            parts.append(err_msg)
+        full_message = ' '.join(parts)
+
         return _fail(
             req,
-            "ATOM domain setup failed at step "
-            f"'{setup_result.get('failed_at_step', 'unknown')}'.",
+            full_message,
             reason='atom_setup_failed', task_id=task_id,
             extra_details={'setup_result': setup_result},
+            log_fields={
+                'failed_at_step': step,
+                'completed_steps': setup_result.get('completed_steps') or [],
+                'aws_error_code': aws_code,
+                'atom_error_message': (err_msg or '')[:500] or None,
+                # Stack traces from ATOM can be huge — cap to keep the
+                # Render log line readable (1KB is enough for the head
+                # of any traceback, which is what we actually need).
+                'atom_error_exception': (err_exc or '')[:1000] or None,
+            },
         )
 
-    # 4. Copy lander files from source → target with domain rewrite
-    if not (req.source_folders or req.source_files):
-        return _fail(
-            req,
-            'No source_folders or source_files specified — nothing to copy.',
-            reason='no_source_specified', task_id=task_id,
-        )
+    # 4. Copy lander files from source → target with domain rewrite.
+    #
+    # `no source` is NOT an error — it means the caller submitted a
+    # setup-only run (new-domain modal left "Lander URL" blank, e.g.
+    # because the team wants to provision the AWS infrastructure now
+    # and deploy a lander later). In that case we mark the row complete
+    # and return success without calling copy_files.
+    setup_only = not (req.source_folders or req.source_files)
 
-    try:
-        copy_result = client.copy_files(
-            source_account=req.source_account,
-            source_bucket=req.source_bucket,
-            target_account=target_account,
-            target_bucket=req.target_domain,
-            selected_folders=req.source_folders,
-            selected_files=req.source_files,
+    if setup_only:
+        log_event(
+            'copy_files_skipped',
+            domain=req.target_domain,
+            reason='no_source_specified',
+            note='setup-only run — AWS infrastructure provisioned, '
+                 'no lander deployed',
         )
-    except Exception as e:
-        return _fail(
-            req,
-            f'File copy failed: {e}',
-            reason='copy_files_exception', task_id=task_id,
-        )
-
-    if copy_result.get('error'):
-        return _fail(
-            req,
-            f"File copy reported an error: {copy_result['error']}",
-            reason='copy_files_error', task_id=task_id,
-            extra_details={'copy_result': copy_result},
-        )
-
-    # ATOM returns 200 with "Successfully copied 0 files from ..." when the
-    # source path has no content. Treat that as failure — otherwise the bot
-    # reports "deployed" on a no-op (caught 2026-05-06 on safetyfirstauto.pro).
-    msg = copy_result.get('message', '')
-    m = re.search(r'copied\s+(\d+)\s+files', msg, re.IGNORECASE)
-    if m and int(m.group(1)) == 0:
-        return _fail(
-            req,
-            f'File copy returned 0 files — source has no content at '
-            f"folders={req.source_folders or '(none)'} files={req.source_files or '(none)'} "
-            f'in s3://{req.source_bucket}.',
-            reason='copy_files_zero', task_id=task_id,
-            extra_details={'copy_result': copy_result},
-        )
-
-    # Build the live URL with the folder path included. The lander typically
-    # lives under the first source folder (e.g. https://target.com/h-insure-c/),
-    # not the apex.
-    if req.source_folders:
-        folder = req.source_folders[0].strip('/')
-        live_url = f'https://{req.target_domain}/{folder}/' if folder else f'https://{req.target_domain}'
-    else:
+        copy_result = {'skipped': True, 'reason': 'no_source_specified'}
         live_url = f'https://{req.target_domain}'
+    else:
+        try:
+            copy_result = client.copy_files(
+                source_account=req.source_account,
+                source_bucket=req.source_bucket,
+                target_account=target_account,
+                target_bucket=req.target_domain,
+                selected_folders=req.source_folders,
+                selected_files=req.source_files,
+            )
+        except Exception as e:
+            return _fail(
+                req,
+                f'File copy failed: {e}',
+                reason='copy_files_exception', task_id=task_id,
+            )
 
-    # 5. Mark complete in inventory + persist the lander URL we just deployed
-    store.mark_setup_complete(req.target_domain, lander_url=live_url)
+        if copy_result.get('error'):
+            return _fail(
+                req,
+                f"File copy reported an error: {copy_result['error']}",
+                reason='copy_files_error', task_id=task_id,
+                extra_details={'copy_result': copy_result},
+            )
+
+        # Partial failures: ATOM (post-2026-05-11) returns 200 with
+        # `failed_count > 0` when some PutObject calls were AccessDenied
+        # or otherwise failed mid-flight. Surfacing this as failure is
+        # correct — the bucket is in a partially-deployed state and the
+        # operator must resolve the IAM gap and re-run, not see a
+        # "deployed ✅" message.
+        failed_count = copy_result.get('failed_count', 0)
+        if failed_count and failed_count > 0:
+            failed_files = copy_result.get('failed_files') or []
+            sample = failed_files[0] if failed_files else {}
+            sample_err = sample.get('error', 'unknown')
+            sample_key = sample.get('key', 'unknown')
+            return _fail(
+                req,
+                f"File copy partially failed: {failed_count} of "
+                f"{copy_result.get('total_count', '?')} files did not upload. "
+                f"First failure on `{sample_key}`: {sample_err}",
+                reason='copy_files_partial_failure', task_id=task_id,
+                extra_details={'copy_result': copy_result},
+                log_fields={
+                    'copy_failed_count': failed_count,
+                    'copy_succeeded_count': copy_result.get('succeeded_count'),
+                    'copy_total_count': copy_result.get('total_count'),
+                    'copy_first_failed_key': sample_key,
+                    'copy_first_failed_error': sample_err[:500] if sample_err else None,
+                },
+            )
+
+        # ATOM returns 200 with "Successfully copied 0 files from ..." when the
+        # source path has no content. Treat that as failure — otherwise the bot
+        # reports "deployed" on a no-op (caught 2026-05-06 on safetyfirstauto.pro).
+        # Match either the legacy single-count format or the post-2026-05-11
+        # "Successfully copied N of M files" format.
+        msg = copy_result.get('message', '')
+        m = re.search(r'copied\s+(\d+)(?:\s+of\s+\d+)?\s+files', msg, re.IGNORECASE)
+        if m and int(m.group(1)) == 0:
+            return _fail(
+                req,
+                f'File copy returned 0 files — source has no content at '
+                f"folders={req.source_folders or '(none)'} files={req.source_files or '(none)'} "
+                f'in s3://{req.source_bucket}.',
+                reason='copy_files_zero', task_id=task_id,
+                extra_details={'copy_result': copy_result},
+            )
+
+        # Build the live URL with the folder path included. The lander typically
+        # lives under the first source folder (e.g. https://target.com/h-insure-c/),
+        # not the apex.
+        if req.source_folders:
+            folder = req.source_folders[0].strip('/')
+            live_url = f'https://{req.target_domain}/{folder}/' if folder else f'https://{req.target_domain}'
+        else:
+            live_url = f'https://{req.target_domain}'
+
+    # 5. Mark complete in inventory. Persist a real lander_url only when
+    # we actually deployed one; for setup-only runs leave lander_url
+    # NULL so /list-domains shows the domain as provisioned-but-empty
+    # rather than claiming a deploy that didn't happen.
+    store.mark_setup_complete(
+        req.target_domain,
+        lander_url=live_url if not setup_only else None,
+    )
 
     # 6. Move the row into its terminal STATUS_DEPLOYED state.
     # Best-effort — mark_setup_complete already stamped setup_at, so a
@@ -294,13 +489,25 @@ def run_existing_domain_workflow(
     log_event(
         'workflow_completed',
         domain=req.target_domain, atom_task_id=task_id,
-        live_url=live_url, duration_sec=duration_sec,
+        live_url=live_url if not setup_only else None,
+        setup_only=setup_only,
+        duration_sec=duration_sec,
     )
+    if setup_only:
+        message = (
+            f'AWS infrastructure provisioned for {req.target_domain} '
+            '(R53 zone, ACM cert, S3 bucket, CloudFront). No lander was '
+            'deployed — submit /new-domain again with a Lander URL, or '
+            'use the inventory tools to deploy one later.'
+        )
+    else:
+        message = f'Lander deployed. Live at {live_url}'
     return WorkflowResult(
         status='completed',
-        message=f'Lander deployed. Live at {live_url}',
+        message=message,
         details={
-            'live_url': live_url,
+            'live_url': live_url if not setup_only else None,
+            'setup_only': setup_only,
             'setup_result': setup_result,
             'copy_result': copy_result,
             'duration_sec': duration_sec,

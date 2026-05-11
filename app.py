@@ -103,8 +103,59 @@ def create_app() -> Flask:
 app = create_app()
 
 
+def _start_socket_mode_in_background() -> None:
+    """Boot Slack Socket Mode so the local process receives slash
+    commands + button clicks over a WebSocket — no public URL or tunnel
+    required. Runs in a daemon thread so Flask still serves /health.
+
+    Refuses to start if SLACK_APP_TOKEN is missing or the Bolt App
+    wasn't initialised (SLACK_BOT_TOKEN/SIGNING_SECRET unset).
+    """
+    import threading
+    from slack_bot.routes import _bolt_app
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+    if _bolt_app is None:
+        raise RuntimeError(
+            'SLACK_USE_SOCKET_MODE=true but the Bolt App did not '
+            'initialise — set SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET.'
+        )
+    if not Config.SLACK_APP_TOKEN:
+        raise RuntimeError(
+            'SLACK_USE_SOCKET_MODE=true but SLACK_APP_TOKEN is empty. '
+            'Get an `xapp-…` token from your Slack app\'s Socket Mode '
+            'settings and put it in .env.'
+        )
+
+    handler = SocketModeHandler(_bolt_app, Config.SLACK_APP_TOKEN)
+    t = threading.Thread(
+        target=handler.start, daemon=True, name='slack-socket-mode',
+    )
+    t.start()
+    log_event(
+        'slack_socket_mode_started',
+        note='Slack events arriving over WebSocket; '
+             'Render webhook deliveries are inactive while this runs.',
+    )
+
+
 if __name__ == '__main__':
     print(f"Starting atom-orchestrator on port {Config.PORT}")
     print(f"  → ATOM upstream: {Config.ATOM_BASE_URL}")
     print(f"  → Health check:  http://localhost:{Config.PORT}/health")
-    app.run(debug=True, host='0.0.0.0', port=Config.PORT)
+    if Config.SLACK_USE_SOCKET_MODE:
+        print(f"  → Slack:         Socket Mode (no tunnel needed)")
+        _start_socket_mode_in_background()
+    else:
+        print(f"  → Slack:         HTTP webhooks "
+              f"(POST /slack/events expected from public URL)")
+    # Flask's debug reloader forks a child process; if Socket Mode is on
+    # we'd open TWO WebSockets with the same xapp- token, and Slack
+    # routes events to whichever one it picked last — usually the dead
+    # one. Disable the reloader when Socket Mode is on; keep debug pages
+    # for stack traces. For HTTP-webhook mode the reloader is fine.
+    app.run(
+        debug=True,
+        use_reloader=not Config.SLACK_USE_SOCKET_MODE,
+        host='0.0.0.0', port=Config.PORT,
+    )

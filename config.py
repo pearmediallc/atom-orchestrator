@@ -24,6 +24,19 @@ class Config:
     SLACK_SIGNING_SECRET = os.getenv('SLACK_SIGNING_SECRET')
     SLACK_APP_TOKEN = os.getenv('SLACK_APP_TOKEN')
 
+    # Local-dev convenience: when true, app.py boots a Slack Socket Mode
+    # connection instead of (or alongside) HTTP webhooks. Slack pushes
+    # slash commands + interactions directly over a WebSocket using
+    # SLACK_APP_TOKEN — no ngrok / public URL required.
+    #
+    # IMPORTANT: a Slack app can only deliver events via ONE transport at
+    # a time. While this is enabled locally, your Render deployment will
+    # NOT receive Slack events. Pause Render (or run this against a
+    # separate dev Slack app) before testing.
+    SLACK_USE_SOCKET_MODE = os.getenv(
+        'SLACK_USE_SOCKET_MODE', ''
+    ).strip().lower() in ('1', 'true', 'yes', 'on')
+
     # Phase 3 — inventory
     # SQLite is the default for local dev / tests (zero setup, one file).
     INVENTORY_DB_PATH = os.getenv('INVENTORY_DB_PATH', './inventory.db')
@@ -170,6 +183,20 @@ class Config:
 
     # Single global fallback used when a vertical isn't in the JSON map above.
     PHASE7_DEFAULT_SOURCE_ACCOUNT = os.getenv('PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
+
+    # AWS accounts the /new-domain modal lets MDBs pick from for the TARGET
+    # account (where the new domain's R53 zone + ACM cert + S3 bucket +
+    # CloudFront distribution get provisioned). Comma-separated. ATOM
+    # decides how each account key maps to real AWS creds — the orchestrator
+    # only passes the string through. Examples:
+    #   AWS_ACCOUNT_OPTIONS=auto-insurance,home-insurance,medicare,medsupp
+    # Falls back to the single PHASE7_DEFAULT_SOURCE_ACCOUNT value so an
+    # operator who hasn't set this env var still sees a usable picker
+    # rather than an empty dropdown.
+    AWS_ACCOUNT_OPTIONS = [
+        a.strip() for a in os.getenv('AWS_ACCOUNT_OPTIONS', '').split(',')
+        if a.strip()
+    ] or [PHASE7_DEFAULT_SOURCE_ACCOUNT]
     PHASE7_DEFAULT_SOURCE_BUCKET = os.getenv('PHASE7_DEFAULT_SOURCE_BUCKET', '').strip()
     PHASE7_DEFAULT_SOURCE_FOLDERS = [
         f.strip() for f in os.getenv('PHASE7_DEFAULT_SOURCE_FOLDERS', '').split(',') if f.strip()

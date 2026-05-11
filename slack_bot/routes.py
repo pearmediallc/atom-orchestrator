@@ -178,7 +178,7 @@ def _build_confirmed_card(*, action_label: str, target: str,
 
 def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                                        extension, lander, requester,
-                                       examples=None):
+                                       examples=None, aws_account=''):
     """Render the /new-domain shortlist as Slack Block Kit blocks.
 
     Used by both the initial modal submission and the "Show 5 more"
@@ -189,6 +189,15 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
     `examples` is the user-supplied list of stylistic anchor domains
     from the modal. Carried through the Show-5-more button so the
     refresh worker can produce names in the same family.
+
+    `aws_account` is the AWS account the new domain will be provisioned
+    in (R53 zone, ACM cert, S3 bucket, CloudFront). Threaded into every
+    Pick-this button payload so the choice survives all hops down to
+    the inventory write at Mark Purchased.
+
+    `lander` may be empty — when so, the Pick payload carries empty
+    string and the downstream deploy worker will skip the file-copy
+    step and only run ATOM setup.
     """
     examples = examples or []
     if extension == 'any':
@@ -206,6 +215,8 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
         ext_display = extension
 
     audience_line = f'  ·  Audience: _{audience}_' if audience else ''
+    lander_line = f'  ·  Lander: {lander}' if lander else '  ·  Lander: _none (setup-only)_'
+    aws_line = f'  ·  AWS: `{aws_account}`' if aws_account else ''
 
     blocks = [
         {
@@ -220,7 +231,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
             'elements': [{
                 'type': 'mrkdwn',
                 'text': (f'Vertical: *{vertical}*  ·  Extension: `{ext_display}`'
-                         f'{audience_line}  ·  Lander: {lander}\n_{cap_label}_'),
+                         f'{aws_line}{audience_line}{lander_line}\n_{cap_label}_'),
             }],
         },
         {'type': 'divider'},
@@ -251,6 +262,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                     'lander': lander,
                     'extension': per_domain_extension,
                     'requester': requester,
+                    'aws_account': aws_account,
                 }),
             },
         })
@@ -269,6 +281,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                 'lander': lander,
                 'requester': requester,
                 'examples': examples,
+                'aws_account': aws_account,
             }),
         }],
     })
@@ -277,7 +290,8 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
 
 def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
                                 vertical, audience, extension,
-                                lander, requester, examples=None):
+                                lander, requester, examples=None,
+                                aws_account=''):
     """Worker that regenerates the /new-domain shortlist. Runs in a
     daemon thread so the original Slack action click can ack within 3s
     while the LLM + Namecheap calls take 15–30s.
@@ -319,6 +333,7 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         lander=lander,
         requester=requester,
         examples=examples,
+        aws_account=aws_account,
     )
     client.chat_update(
         channel=channel,
@@ -326,6 +341,90 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         blocks=new_blocks,
         text=f'{len(suggestions)} fresh domains for {vertical}',
     )
+
+
+# ─── ATOM setup live-progress reporter ────────────────────────────────────
+#
+# ATOM's setup_domain runs 9 sequential steps server-side. While they
+# execute we poll ATOM's /api/status/{task_id} every 5 seconds and edit
+# the original progress message in-place with a Slack checklist so the
+# requester can SEE the deploy progressing rather than staring at silence
+# for 5-20 minutes. Step keys + display labels mirror aws_automation's
+# canonical order in aws_automation.py (~line 982 onward).
+
+_ATOM_STEP_ORDER = [
+    ('initialization',          'Initializing setup'),
+    ('certificate',             'Requesting SSL certificate'),
+    ('namecheap_cname',         'Adding CNAME validation records to Namecheap'),
+    ('route53_zone',            'Creating Route 53 hosted zone'),
+    ('s3_buckets',              'Creating S3 buckets'),
+    ('certificate_validation',  'Waiting for SSL certificate validation'),
+    ('cloudfront',              'Creating CloudFront distribution'),
+    ('route53_records',         'Creating Route 53 alias records'),
+    ('nameserver_update',       'Updating Namecheap nameservers'),
+]
+
+
+def _render_progress_checklist(steps: dict) -> str:
+    """Render ATOM's per-step status map as a Slack-friendly checklist.
+
+    ``steps`` is the ``steps`` field from ATOM's status response — a dict
+    keyed by step_key with values like ``{'status': 'completed'}``. Empty
+    dict (pre-first-poll) renders all rows as pending so the requester
+    sees the full 9-row outline immediately.
+    """
+    glyphs = {
+        'completed':   ':white_check_mark:',
+        'in_progress': ':hourglass_flowing_sand:',
+        'failed':      ':x:',
+    }
+    lines = ['*Setup progress:*']
+    for key, label in _ATOM_STEP_ORDER:
+        step = steps.get(key) or {}
+        state = (step.get('status') or '').lower()
+        glyph = glyphs.get(state, ':white_large_square:')
+        lines.append(f'{glyph} {label}')
+    return '\n'.join(lines)
+
+
+def _make_atom_progress_callback(*, client, channel, message_ts,
+                                 header_text, target_domain):
+    """Build the callback ``wait_for_setup`` invokes on each poll.
+
+    Closure state: the last rendered checklist string. We only call
+    chat_update when the rendered output actually changes — Slack
+    rate-limits message edits, and unchanged updates would waste both
+    quota and the requester's "new activity" indicators.
+
+    Resilient by design: if message_ts is missing (the initial
+    chat_postMessage failed) or chat_update raises, we log + swallow.
+    Progress reporting is decorative; it must never derail the real
+    workflow.
+    """
+    state = {'last_rendered': _render_progress_checklist({})}
+
+    def on_progress(status: dict) -> None:
+        if not message_ts:
+            return
+        steps = status.get('steps') or {}
+        rendered = _render_progress_checklist(steps)
+        if rendered == state['last_rendered']:
+            return
+        state['last_rendered'] = rendered
+        try:
+            client.chat_update(
+                channel=channel,
+                ts=message_ts,
+                text=header_text + '\n\n' + rendered,
+            )
+        except Exception:
+            logger.exception(
+                'progress chat_update failed for %s (ts=%s); '
+                'continuing the wait',
+                target_domain, message_ts,
+            )
+
+    return on_progress
 
 
 # ─── Phase 7 worker (module-level so tests can import it) ──────────────────
@@ -403,15 +502,59 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     except Exception:
         logger.exception('record_event(phase7_started) failed')
 
-    client.chat_postMessage(
-        channel=channel, thread_ts=message_ts,
-        text=(f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
-              f'• source bucket: `{source_bucket}`\n'
-              f'• source folders: `{source_folders or "—"}`\n'
-              f'• source resolved from: _{source_origin}_\n'
-              '_This usually takes 5–20 minutes (cert validation + '
-              'CloudFront)._'),
-    )
+    # Decide what message to post BEFORE the workflow runs. The
+    # 9-step "Setup progress" checklist only makes sense on a fresh
+    # domain — when `setup_at` is already populated the workflow's
+    # skip-setup branch goes straight to copy_files and the checklist
+    # would stay all-pending forever, confusing the requester (audit
+    # 2026-05-11). Look up the row here so the header reflects what
+    # will actually happen.
+    try:
+        record_now = inventory_store.get_domain(target_domain) or {}
+    except Exception:
+        record_now = {}
+    already_setup = bool(record_now.get('setup_at'))
+
+    if already_setup:
+        header_text = (
+            f':package: *Deploying lander to* `{target_domain}`\n'
+            f'• source bucket: `{source_bucket}`\n'
+            f'• source folders: `{source_folders or "—"}`\n'
+            f'• source resolved from: _{source_origin}_\n'
+            f'• ATOM setup: _already complete '
+            f'(skipping cert / R53 / CloudFront — only copying files)_\n'
+            '_This usually takes 1–2 minutes — file copy only._'
+        )
+        progress_msg = client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=header_text,
+        )
+        # No live checklist on the skip-setup path. The workflow's
+        # wait_for_setup is never called, so the callback would never
+        # fire — leaving the checklist stuck at all-pending and
+        # making the requester think ATOM hung.
+        progress_callback = None
+    else:
+        header_text = (
+            f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
+            f'• source bucket: `{source_bucket}`\n'
+            f'• source folders: `{source_folders or "—"}`\n'
+            f'• source resolved from: _{source_origin}_\n'
+            '_This usually takes 5–20 minutes (cert validation + '
+            'CloudFront)._'
+        )
+        # Post the progress message as a thread reply and remember its
+        # ts — the progress callback edits THIS message in-place
+        # rather than spamming the channel with one update per step.
+        progress_msg = client.chat_postMessage(
+            channel=channel, thread_ts=message_ts,
+            text=header_text + '\n\n' + _render_progress_checklist({}),
+        )
+        progress_ts = progress_msg.get('ts')
+        progress_callback = _make_atom_progress_callback(
+            client=client, channel=channel, message_ts=progress_ts,
+            header_text=header_text, target_domain=target_domain,
+        )
 
     req = ExistingDomainRequest(
         target_domain=target_domain,
@@ -423,7 +566,9 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     )
 
     try:
-        result = run_existing_domain_workflow(req)
+        result = run_existing_domain_workflow(
+            req, progress_callback=progress_callback,
+        )
     except Exception as e:
         logger.exception('Phase 7 worker crashed for %s', target_domain)
         try:
@@ -679,7 +824,7 @@ if _bolt_app is not None:
         ack()
         client.views_open(
             trigger_id=body['trigger_id'],
-            view=_NEW_DOMAIN_MODAL,
+            view=_build_new_domain_modal(),
         )
 
     @_bolt_app.view('new_domain_modal')
@@ -702,8 +847,22 @@ if _bolt_app is not None:
         values = view['state']['values']
         vertical = (values['vertical_block']['vertical_input']['value'] or '').strip()
         audience = (values['audience_block']['audience_input']['value'] or '').strip()
-        lander = (values['lander_block']['lander_input']['value'] or '').strip()
+        # Lander is OPTIONAL — blank means "provision AWS infrastructure
+        # but skip the file copy step." Empty-string sentinel propagates
+        # all the way to the deploy worker.
+        lander = ((values.get('lander_block') or {})
+                  .get('lander_input', {}).get('value') or '').strip()
         extension = values['extension_block']['extension_select']['selected_option']['value']
+        # AWS account is REQUIRED (no more implicit auto-insurance default).
+        # The modal's static_select always returns a value, but be
+        # defensive in case Slack sends a weird payload.
+        aws_account = (
+            values.get('aws_account_block', {})
+                  .get('aws_account_select', {})
+                  .get('selected_option', {})
+                  .get('value')
+            or (Config.AWS_ACCOUNT_OPTIONS[0] if Config.AWS_ACCOUNT_OPTIONS else '')
+        )
 
         # Optional Example domains — multiline text input, one name per line.
         # Anchors the AI's stylistic feel when the prompt's generic defaults
@@ -733,16 +892,22 @@ if _bolt_app is not None:
         examples_summary = (
             f"• Style examples: `{', '.join(examples)}`\n" if examples else ''
         )
+        lander_line = (
+            f'• Lander URL: {lander}\n'
+            if lander
+            else '• Lander URL: _none — setup-only run, no file copy_\n'
+        )
         receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
             f'• Requested by: <@{requester}>'
             + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
             + f'\n'
             f'• Vertical: `{vertical}`\n'
+            f'• AWS account: `{aws_account}`\n'
             + (f"• Audience / angle: _{audience}_\n" if audience else '')
             + examples_summary
-            + f'• Lander URL: {lander}\n'
-            f'• Extension: `{extension}`\n'
+            + lander_line
+            + f'• Extension: `{extension}`\n'
             ':mag: Generating suggestions and checking Namecheap availability…'
         )
         client.chat_postMessage(channel=requester, text=receipt)
@@ -801,6 +966,7 @@ if _bolt_app is not None:
             lander=lander,
             requester=requester,
             examples=examples,
+            aws_account=aws_account,
         )
         client.chat_postMessage(
             channel=requester,
@@ -809,7 +975,8 @@ if _bolt_app is not None:
         )
 
     def _send_purchase_request_to_utkarsh(client, *, domain, vertical, lander,
-                                          extension, requester):
+                                          extension, requester,
+                                          aws_account=''):
         """DM Utkarsh (with dev-reroute applied) the purchase request card.
 
         Extracted from handle_pick_domain so TL approval can call it after
@@ -821,19 +988,34 @@ if _bolt_app is not None:
         users_select on the modal). Caller doesn't need to know about
         operator-vs-MDB — that distinction is preserved upstream and
         already shown in the TL approval card.
+
+        `aws_account` is threaded into the Mark Purchased button payload
+        so when Utkarsh clicks it the inventory row is created with the
+        explicit account choice from the modal (no silent default).
+
+        `lander` may be empty — when so, the Mark Purchased card explains
+        this is a "setup-only" run and the deploy worker will skip the
+        file-copy step.
         """
         real_purchaser = Config.UTKARSH_SLACK_USER_ID or requester
         purchaser = Config.route_recipient(real_purchaser)
+
+        lander_line = (
+            f'• Lander to deploy: {lander}\n' if lander
+            else '• Lander to deploy: _none — setup-only (no file copy)_\n'
+        )
+        aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
 
         utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
             f'• Requester: <@{requester}>\n'
             f'• Domain to buy: `{domain}`\n'
             f'• Vertical: `{vertical}`\n'
-            f'• Extension: `{extension}`\n'
-            f'• Lander to deploy: {lander}\n\n'
-            ':point_right: Please buy this on Namecheap, then click '
-            '*Mark Purchased* below.'
+            + aws_line
+            + f'• Extension: `{extension}`\n'
+            + lander_line
+            + '\n:point_right: Please buy this on Namecheap, then click '
+              '*Mark Purchased* below.'
         )
         client.chat_postMessage(
             channel=purchaser,
@@ -851,6 +1033,7 @@ if _bolt_app is not None:
                         'vertical': vertical,
                         'lander': lander,
                         'requester': requester,
+                        'aws_account': aws_account,
                     }),
                 }]},
             ],
@@ -880,6 +1063,7 @@ if _bolt_app is not None:
         lander = data.get('lander', '')
         requester = data['requester']
         examples = data.get('examples') or []
+        aws_account = data.get('aws_account', '')
         channel = body['channel']['id']
         old_ts = body['message']['ts']
 
@@ -911,6 +1095,7 @@ if _bolt_app is not None:
                 'vertical': vertical, 'audience': audience,
                 'extension': extension, 'lander': lander,
                 'requester': requester, 'examples': examples,
+                'aws_account': aws_account,
             },
             daemon=True,
             name=f'phase8-refresh-{vertical}',
@@ -941,6 +1126,7 @@ if _bolt_app is not None:
         lander = data['lander']
         extension = data['extension']
         requester = data['requester']
+        aws_account = data.get('aws_account', '')
 
         approver_ids = Config.APPROVER_SLACK_USER_IDS
         button_payload = sign_payload({
@@ -949,7 +1135,14 @@ if _bolt_app is not None:
             'lander': lander,
             'extension': extension,
             'requester': requester,
+            'aws_account': aws_account,
         })
+
+        lander_line = (
+            f'• Lander to deploy: {lander}\n' if lander
+            else '• Lander to deploy: _none — setup-only (no file copy)_\n'
+        )
+        aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
 
         if approver_ids:
             # Phase 7.5: send TL approval card to each configured approver
@@ -959,10 +1152,11 @@ if _bolt_app is not None:
                 f'• Requester: <@{requester}>\n'
                 f'• Domain: `{domain}`\n'
                 f'• Vertical: `{vertical}`\n'
-                f'• Extension: `{extension}`\n'
-                f'• Lander to deploy: {lander}\n\n'
-                ':point_right: Approve to forward this to Utkarsh for '
-                'purchase, or Reject to cancel.'
+                + aws_line
+                + f'• Extension: `{extension}`\n'
+                + lander_line
+                + '\n:point_right: Approve to forward this to Utkarsh for '
+                  'purchase, or Reject to cancel.'
             )
             approval_blocks = [
                 {'type': 'section',
@@ -1025,6 +1219,7 @@ if _bolt_app is not None:
             client,
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
+            aws_account=aws_account,
         )
         purchaser_is_requester = (purchaser == requester)
 
@@ -1076,6 +1271,7 @@ if _bolt_app is not None:
         lander = data['lander']
         extension = data.get('extension') or '.com'
         requester = data['requester']
+        aws_account = data.get('aws_account', '')
         approver = body['user']['id']
 
         # Forward to Utkarsh
@@ -1083,6 +1279,7 @@ if _bolt_app is not None:
             client,
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
+            aws_account=aws_account,
         )
 
         # Replace the approval card so it can't be re-approved
@@ -1502,13 +1699,28 @@ if _bolt_app is not None:
         vertical = data.get('vertical') or ''
         lander = data.get('lander') or ''
         requester = data['requester']
+        aws_account = data.get('aws_account', '').strip()
+        # Backwards compat: old in-flight buttons (signed before the modal
+        # added the picker) carry no aws_account key. Fall back to the
+        # first configured option, which preserves the previous implicit
+        # default (auto-insurance via init_db backfill). Logged as an info
+        # so operators can see when legacy buttons are being consumed.
+        if not aws_account:
+            aws_account = (
+                Config.AWS_ACCOUNT_OPTIONS[0]
+                if Config.AWS_ACCOUNT_OPTIONS else ''
+            )
+            logger.info(
+                'confirm_purchased: legacy button without aws_account — '
+                'defaulting to %r for domain=%s', aws_account, domain,
+            )
         confirmer = body['user']['id']
         channel = body['channel']['id']
         message_ts = body['message']['ts']
 
         log_event(
             'slack_button_clicked', button='confirm_purchased',
-            domain=domain, vertical=vertical,
+            domain=domain, vertical=vertical, aws_account=aws_account,
             requester=requester, confirmer=confirmer,
             lander_url=lander,
         )
@@ -1527,7 +1739,13 @@ if _bolt_app is not None:
             inventory_store.add_domain(
                 domain=domain,
                 vertical=vertical,
-                lander_url=lander,
+                # AWS account explicit choice from the /new-domain modal.
+                # Previously this column was NULL on insert and silently
+                # backfilled to 'auto-insurance' by init_db — making the
+                # provisioning account essentially un-configurable. Now
+                # the MDB picks it in the modal and the value flows here.
+                aws_account=aws_account or None,
+                lander_url=lander or None,
                 requested_by=f'Slack:{requester}',
                 notes='Purchased via /new-domain bot flow',
                 # State machine starts here — Phase 7 worker will move
@@ -1539,9 +1757,11 @@ if _bolt_app is not None:
                 # backfill in store.init_db().
                 assigned_to=requester,
                 # Audit trail for /domain-history. Captures who clicked
-                # Mark Purchased, plus the lander URL it'll be deployed to.
+                # Mark Purchased, plus the lander URL (if any) and the
+                # AWS account it'll be deployed to.
                 event_source='path_b_mark_purchased',
                 event_metadata={'lander_url': lander, 'vertical': vertical,
+                                'aws_account': aws_account,
                                 'confirmer': confirmer},
             )
         except inventory_store.DuplicateDomainError:
@@ -1612,120 +1832,169 @@ if _bolt_app is not None:
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
 
-_NEW_DOMAIN_MODAL = {
-    'type': 'modal',
-    'callback_id': 'new_domain_modal',
-    'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
-    'submit': {'type': 'plain_text', 'text': 'Continue'},
-    'close': {'type': 'plain_text', 'text': 'Cancel'},
-    'blocks': [
-        {
-            'type': 'input',
-            'block_id': 'mdb_block',
-            'optional': True,
-            'label': {'type': 'plain_text',
-                      'text': 'Requesting MDB (leave blank if this is for you)'},
-            'hint': {
-                'type': 'plain_text',
-                'text': ('Pick the marketer you\'re running this on behalf of. '
-                         'When set, all bot DMs (suggestions, approval status, '
-                         'final deploy notification) go to them instead of you.'),
-            },
-            'element': {
-                'type': 'users_select',
-                'action_id': 'mdb_select',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'Pick an MDB'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'vertical_block',
-            'label': {'type': 'plain_text', 'text': 'Vertical'},
-            'element': {
-                'type': 'plain_text_input',
-                'action_id': 'vertical_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'e.g. auto-insurance'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'audience_block',
-            'optional': True,
-            'label': {'type': 'plain_text',
-                      'text': 'Audience or angle (optional)'},
-            'hint': {
-                'type': 'plain_text',
-                'text': ('Who are you targeting and how. The bot will use '
-                         'this to match name style to the campaign. Leave '
-                         'blank if the vertical alone is enough.'),
-            },
-            'element': {
-                'type': 'plain_text_input',
-                'action_id': 'audience_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'examples_block',
-            'optional': True,
-            'label': {'type': 'plain_text',
-                      'text': 'Example domain names (optional)'},
-            'hint': {
-                'type': 'plain_text',
-                'text': ('One per line. The bot anchors the AI on the STYLE '
-                         'of these names (word count, tone, compounding) — '
-                         'it will NOT reuse them. Use this when the vertical '
-                         'is unusual or the AI\'s defaults don\'t match.'),
-            },
-            'element': {
-                'type': 'plain_text_input',
-                'action_id': 'examples_input',
-                'multiline': True,
-                'placeholder': {'type': 'plain_text',
-                                'text': 'mymedicareexperts.online\nseniorhealthhub.com\nmedicarequotefinder.pro'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'lander_block',
-            'label': {'type': 'plain_text',
-                      'text': 'Lander URL (which page to deploy)'},
-            'element': {
-                'type': 'url_text_input',
-                'action_id': 'lander_input',
-                'placeholder': {'type': 'plain_text',
-                                'text': 'https://example.com/landing-page'},
-            },
-        },
-        {
-            'type': 'input',
-            'block_id': 'extension_block',
-            'label': {'type': 'plain_text', 'text': 'Domain extension'},
-            'element': {
-                'type': 'static_select',
-                'action_id': 'extension_select',
-                'initial_option': {
-                    'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'},
-                    'value': 'any',
+def _build_new_domain_modal() -> dict:
+    """Build the /new-domain modal payload.
+
+    Built as a function (not a module-level constant) because the AWS
+    account picker reads `Config.AWS_ACCOUNT_OPTIONS` at modal-open time —
+    operators can adjust which accounts appear without restarting the bot.
+
+    Two design choices worth flagging:
+      • The AWS account picker is REQUIRED. The previous implicit default
+        of `auto-insurance` (via init_db NULL-backfill) silently routed
+        every new domain into one account; making the choice explicit
+        means MDBs can provision in medicare / medsupp / etc. without a
+        config change (audit 2026-05-11).
+      • The lander URL is OPTIONAL. Sometimes the team only wants to
+        provision the AWS infrastructure (R53 zone, ACM cert, S3 bucket,
+        CloudFront) and deploy the lander later. Blank → ATOM setup runs,
+        file-copy step is skipped.
+    """
+    account_options = [
+        {'text': {'type': 'plain_text', 'text': acct}, 'value': acct}
+        for acct in Config.AWS_ACCOUNT_OPTIONS
+    ]
+    return {
+        'type': 'modal',
+        'callback_id': 'new_domain_modal',
+        'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
+        'submit': {'type': 'plain_text', 'text': 'Continue'},
+        'close': {'type': 'plain_text', 'text': 'Cancel'},
+        'blocks': [
+            {
+                'type': 'input',
+                'block_id': 'mdb_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Requesting MDB (leave blank if this is for you)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Pick the marketer you\'re running this on behalf of. '
+                             'When set, all bot DMs (suggestions, approval status, '
+                             'final deploy notification) go to them instead of you.'),
                 },
-                'options': [
-                    {'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'}, 'value': 'any'},
-                    {'text': {'type': 'plain_text', 'text': '.com  (under $15)'},    'value': '.com'},
-                    {'text': {'type': 'plain_text', 'text': '.pro  (~$4)'},          'value': '.pro'},
-                    {'text': {'type': 'plain_text', 'text': '.info (~$4)'},          'value': '.info'},
-                    {'text': {'type': 'plain_text', 'text': '.site (~$1)'},          'value': '.site'},
-                    {'text': {'type': 'plain_text', 'text': '.live (~$3)'},          'value': '.live'},
-                    {'text': {'type': 'plain_text', 'text': '.top  (~$3)'},          'value': '.top'},
-                    {'text': {'type': 'plain_text', 'text': '.icu  (~$3)'},          'value': '.icu'},
-                ],
+                'element': {
+                    'type': 'users_select',
+                    'action_id': 'mdb_select',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'Pick an MDB'},
+                },
             },
-        },
-    ],
-}
+            {
+                'type': 'input',
+                'block_id': 'vertical_block',
+                'label': {'type': 'plain_text', 'text': 'Vertical'},
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'vertical_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. auto-insurance'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'aws_account_block',
+                'label': {'type': 'plain_text', 'text': 'AWS account (target)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Which AWS account this domain\'s R53 zone, ACM '
+                             'cert, S3 bucket, and CloudFront distribution '
+                             'should live in. Configure the list of options '
+                             'via the AWS_ACCOUNT_OPTIONS env var.'),
+                },
+                'element': {
+                    'type': 'static_select',
+                    'action_id': 'aws_account_select',
+                    'initial_option': account_options[0],
+                    'options': account_options,
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'audience_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Audience or angle (optional)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Who are you targeting and how. The bot will use '
+                             'this to match name style to the campaign. Leave '
+                             'blank if the vertical alone is enough.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'audience_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. seniors looking for medigap, low-credit drivers, first-time homebuyers'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'examples_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Example domain names (optional)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('One per line. The bot anchors the AI on the STYLE '
+                             'of these names (word count, tone, compounding) — '
+                             'it will NOT reuse them. Use this when the vertical '
+                             'is unusual or the AI\'s defaults don\'t match.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'examples_input',
+                    'multiline': True,
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'mymedicareexperts.online\nseniorhealthhub.com\nmedicarequotefinder.pro'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'lander_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Lander URL (optional — leave blank for setup-only)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('When set, the bot copies the lander\'s S3 contents '
+                             'to the new domain\'s bucket after ATOM setup. '
+                             'When blank, only AWS infrastructure is provisioned '
+                             '(R53 zone, ACM cert, S3 bucket, CloudFront) — you '
+                             'can deploy a lander later via /list-domains.'),
+                },
+                'element': {
+                    'type': 'url_text_input',
+                    'action_id': 'lander_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'https://example.com/landing-page (or leave blank)'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'extension_block',
+                'label': {'type': 'plain_text', 'text': 'Domain extension'},
+                'element': {
+                    'type': 'static_select',
+                    'action_id': 'extension_select',
+                    'initial_option': {
+                        'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'},
+                        'value': 'any',
+                    },
+                    'options': [
+                        {'text': {'type': 'plain_text', 'text': 'Any (cheapest first)'}, 'value': 'any'},
+                        {'text': {'type': 'plain_text', 'text': '.com  (under $15)'},    'value': '.com'},
+                        {'text': {'type': 'plain_text', 'text': '.pro  (~$4)'},          'value': '.pro'},
+                        {'text': {'type': 'plain_text', 'text': '.info (~$4)'},          'value': '.info'},
+                        {'text': {'type': 'plain_text', 'text': '.site (~$1)'},          'value': '.site'},
+                        {'text': {'type': 'plain_text', 'text': '.live (~$3)'},          'value': '.live'},
+                        {'text': {'type': 'plain_text', 'text': '.top  (~$3)'},          'value': '.top'},
+                        {'text': {'type': 'plain_text', 'text': '.icu  (~$3)'},          'value': '.icu'},
+                    ],
+                },
+            },
+        ],
+    }
 
 
 # ─── Flask routes (forward everything to bolt) ─────────────────────────────

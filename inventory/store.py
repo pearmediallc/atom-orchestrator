@@ -658,6 +658,26 @@ import json as _json
 from typing import Iterable as _Iterable
 
 
+def set_aws_account(domain: str, account: str) -> None:
+    """Self-healing setter for the aws_account column.
+
+    Used when the workflow discovers the inventory's recorded AWS account
+    has drifted from the bucket's actual owning account (typically because
+    a Path B confirm_purchased row was inserted without aws_account before
+    the 2026-05-11 modal-picker fix). Future deploys then use the corrected
+    value without operator intervention.
+    """
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET aws_account = ?, '
+            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
+            (account, domain),
+        )
+        if _is_postgres():
+            cur.close()
+
+
 def set_lifecycle_state(domain: str, state: Optional[str]) -> None:
     """Move a domain into a new lifecycle_state. None clears the column
     (used when a domain returns to ACTIVE/IDLE and we want the cron to

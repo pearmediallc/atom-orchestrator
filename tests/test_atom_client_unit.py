@@ -242,3 +242,55 @@ def test_wait_for_setup_raises_TimeoutError_when_status_never_terminal():
     with pytest.raises(TimeoutError):
         # timeout=0 means deadline already passed before first poll.
         client.wait_for_setup('t1', timeout=0, poll_interval=0)
+
+
+def test_wait_for_setup_invokes_progress_callback_on_every_poll():
+    """The Slack live-progress checklist relies on on_progress firing
+    once per poll — including the terminal poll — so the final state of
+    the displayed checklist matches reality (audit 2026-05-11).
+    """
+    sess = MagicMock()
+    sess.get.side_effect = [
+        _make_response(
+            200,
+            json.dumps({'status': 'running',
+                        'steps': {'certificate': {'status': 'in_progress'}}}),
+            content_type='application/json',
+        ),
+        _make_response(
+            200,
+            json.dumps({'status': 'completed',
+                        'steps': {'certificate': {'status': 'completed'}}}),
+            content_type='application/json',
+        ),
+    ]
+    client = _make_client(sess)
+    seen = []
+    out = client.wait_for_setup(
+        't1', timeout=10, poll_interval=0,
+        on_progress=lambda s: seen.append(s),
+    )
+    assert out['status'] == 'completed'
+    assert len(seen) == 2
+    assert seen[0]['steps']['certificate']['status'] == 'in_progress'
+    assert seen[1]['steps']['certificate']['status'] == 'completed'
+
+
+def test_wait_for_setup_progress_callback_failure_does_not_abort_wait():
+    """A buggy progress reporter must not derail the actual workflow.
+    The terminal status must still bubble up cleanly."""
+    sess = MagicMock()
+    sess.get.return_value = _make_response(
+        200, json.dumps({'status': 'completed'}),
+        content_type='application/json',
+    )
+    client = _make_client(sess)
+
+    def broken_callback(_status):
+        raise RuntimeError('Slack token expired or whatever')
+
+    out = client.wait_for_setup(
+        't1', timeout=10, poll_interval=0,
+        on_progress=broken_callback,
+    )
+    assert out['status'] == 'completed'

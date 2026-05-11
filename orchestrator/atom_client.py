@@ -240,6 +240,22 @@ class AtomClient:
     def check_existing(self, domain: str) -> dict:
         return self._get_json(f'/api/check-existing/{domain}', timeout=15)
 
+    def list_buckets(self, account_key: str) -> list:
+        """List bucket NAMES in the given AWS account, via ATOM.
+
+        Returns the bare list of strings (just the names — ATOM also
+        returns creation_date, which we don't need for ownership
+        resolution). Empty list on any response shape we don't
+        understand — the caller treats that as "this account doesn't
+        own the bucket I'm looking for" rather than crashing.
+        """
+        resp = self._get_json(f'/api/buckets/{account_key}', timeout=30)
+        return [
+            b.get('name')
+            for b in (resp.get('buckets') or [])
+            if b.get('name')
+        ]
+
     def setup_domain(self, domain: str, account_key: str = 'auto-insurance',
                      cname_name: str = 'track') -> dict:
         """Kicks off the 8-step domain setup. Returns task_id(s) immediately."""
@@ -272,7 +288,8 @@ class AtomClient:
         )
 
     def wait_for_setup(self, task_id: str, timeout: int = 1800,
-                       poll_interval: int = 5) -> dict:
+                       poll_interval: int = 5,
+                       on_progress=None) -> dict:
         """Block until setup completes or fails. Returns the final status dict.
 
         Transient AtomConnectionError / AtomServerError during polling
@@ -280,8 +297,16 @@ class AtomClient:
         hiccup) and resolve on the next poll. Persistent failures still
         bubble up via the deadline expiring.
 
-        Phase 4 TODO: instead of blocking, push progress updates back
-        to the Slack thread as they arrive.
+        ``on_progress`` (optional) is invoked with the full status dict on
+        every poll (running OR terminal). The callback runs in this
+        thread; failures are caught and logged so a buggy reporter never
+        prevents the worker from observing the terminal status.
+
+        ATOM's status dict during a running task carries:
+          • status:   'running' | 'completed' | 'failed'
+          • progress: human-readable string about the current step
+          • steps:    { step_key: { status: pending|in_progress|completed|failed } }
+        See aws_automation/app.py::setup_domain_async for the source.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -295,6 +320,16 @@ class AtomClient:
                 )
                 time.sleep(poll_interval)
                 continue
+            if on_progress is not None:
+                try:
+                    on_progress(s)
+                except Exception:
+                    # Progress reporting is decorative — never let a
+                    # callback bug abort the actual wait.
+                    logger.exception(
+                        'wait_for_setup progress callback raised for '
+                        'task %s; continuing wait', task_id,
+                    )
             if s.get('status') in ('completed', 'failed'):
                 return s
             time.sleep(poll_interval)

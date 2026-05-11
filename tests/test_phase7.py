@@ -14,7 +14,193 @@ import pytest
 
 from config import Config
 from orchestrator.workflow import WorkflowResult
-from slack_bot.routes import _phase7_run_atom_setup, _parse_lander_url
+from slack_bot.routes import (
+    _phase7_run_atom_setup,
+    _parse_lander_url,
+    _render_progress_checklist,
+    _make_atom_progress_callback,
+)
+
+
+# ─── ATOM live-progress checklist ─────────────────────────────────────────
+
+def test_progress_checklist_renders_all_9_steps_as_pending_when_empty():
+    """Pre-first-poll the requester should see the full outline, not a
+    blank message that says nothing. Reassures them the job is queued."""
+    out = _render_progress_checklist({})
+    # All 9 step labels must appear so the requester sees the roadmap.
+    for label_substr in (
+        'Initializing setup',
+        'Requesting SSL certificate',
+        'Adding CNAME validation records',
+        'Creating Route 53 hosted zone',
+        'Creating S3 buckets',
+        'Waiting for SSL certificate validation',
+        'Creating CloudFront distribution',
+        'Creating Route 53 alias records',
+        'Updating Namecheap nameservers',
+    ):
+        assert label_substr in out
+    # All rows start as ⬜ (white_large_square) before ATOM reports
+    # anything.
+    assert out.count(':white_large_square:') == 9
+
+
+def test_progress_checklist_uses_distinct_glyphs_per_state():
+    out = _render_progress_checklist({
+        'certificate':  {'status': 'completed'},
+        'route53_zone': {'status': 'in_progress'},
+        's3_buckets':   {'status': 'failed'},
+        # nameserver_update intentionally absent → pending
+    })
+    assert ':white_check_mark:' in out          # certificate
+    assert ':hourglass_flowing_sand:' in out    # route53_zone
+    assert ':x:' in out                          # s3_buckets
+    # 6 unmentioned steps + 0 mentioned-as-pending = 6 pending glyphs
+    assert out.count(':white_large_square:') == 6
+
+
+def test_progress_callback_skips_chat_update_when_nothing_changed():
+    """Slack rate-limits message edits and shows new-activity badges on
+    every update — calling chat_update with the same content is both
+    wasteful and noisy. The callback should de-dupe."""
+    client = MagicMock()
+    cb = _make_atom_progress_callback(
+        client=client, channel='C1', message_ts='123.456',
+        header_text='hdr', target_domain='x.com',
+    )
+    status = {'status': 'running',
+              'steps': {'certificate': {'status': 'in_progress'}}}
+
+    cb(status)
+    cb(status)  # identical → should NOT re-edit
+    cb(status)  # identical → should NOT re-edit
+
+    assert client.chat_update.call_count == 1
+
+
+def test_progress_callback_updates_when_step_status_changes():
+    client = MagicMock()
+    cb = _make_atom_progress_callback(
+        client=client, channel='C1', message_ts='123.456',
+        header_text='hdr', target_domain='x.com',
+    )
+    cb({'steps': {'certificate': {'status': 'in_progress'}}})
+    cb({'steps': {'certificate': {'status': 'completed'},
+                  'route53_zone': {'status': 'in_progress'}}})
+    cb({'steps': {'certificate': {'status': 'completed'},
+                  'route53_zone': {'status': 'completed'},
+                  's3_buckets':   {'status': 'in_progress'}}})
+
+    assert client.chat_update.call_count == 3
+    # Final edit body must show all the progress so far:
+    last_call_text = client.chat_update.call_args.kwargs.get('text', '')
+    assert ':white_check_mark: Requesting SSL certificate' in last_call_text
+    assert ':white_check_mark: Creating Route 53 hosted zone' in last_call_text
+    assert ':hourglass_flowing_sand: Creating S3 buckets' in last_call_text
+
+
+def test_progress_callback_no_ts_means_no_chat_update():
+    """If posting the initial message failed (no ts), we silently
+    accept that no live progress is possible. Don't crash the worker."""
+    client = MagicMock()
+    cb = _make_atom_progress_callback(
+        client=client, channel='C1', message_ts=None,
+        header_text='hdr', target_domain='x.com',
+    )
+    cb({'steps': {'certificate': {'status': 'in_progress'}}})
+    client.chat_update.assert_not_called()
+
+
+def test_progress_callback_chat_update_failure_is_swallowed():
+    """Slack hiccups during a 5-min deploy are common (rate limits,
+    workspace momentarily unreachable). The callback must NOT raise —
+    wait_for_setup would otherwise abort the whole deploy on a Slack
+    blip that has nothing to do with the actual ATOM run."""
+    client = MagicMock()
+    client.chat_update.side_effect = RuntimeError('slack 429')
+    cb = _make_atom_progress_callback(
+        client=client, channel='C1', message_ts='123.456',
+        header_text='hdr', target_domain='x.com',
+    )
+    # Must not raise.
+    cb({'steps': {'certificate': {'status': 'in_progress'}}})
+
+
+# ─── Worker header text: fresh vs already-setup ───────────────────────────
+
+def test_worker_posts_setup_checklist_for_fresh_domain(monkeypatch, tmp_inventory):
+    """Brand-new domain (setup_at IS NULL) → header must include the
+    9-step setup checklist AND a progress_callback must reach the
+    workflow, so the live in-progress edits work."""
+    tmp_inventory.add_domain(
+        domain='fresh.com', aws_account='auto-insurance',
+    )  # setup_at stays NULL
+    captured = _patch_workflow(
+        monkeypatch,
+        WorkflowResult(status='completed',
+                       message='Lander deployed.',
+                       details={'live_url': 'https://fresh.com/lander/'}),
+    )
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='100.0',
+        target_domain='fresh.com', vertical='auto-insurance',
+        requester='U_MDB', lander_url='https://src.com/lander/',
+    )
+
+    posted = _all_text(client)
+    assert 'Triggering ATOM setup' in posted
+    assert 'Setup progress' in posted
+    # All 9 steps must be in the first posted body so the user sees
+    # the full roadmap before any of them complete.
+    assert 'Initializing setup' in posted
+    assert 'Updating Namecheap nameservers' in posted
+    # progress_callback must have been threaded into the workflow so
+    # live updates can fire.
+    assert captured['progress_callback'] is not None
+
+
+def test_worker_posts_no_setup_checklist_when_setup_already_done(
+        monkeypatch, tmp_inventory):
+    """Already-setup domain (setup_at populated) → workflow's skip path
+    fires, so the 9-step checklist would stay all-pending forever and
+    just confuse the requester. Header must NOT include the checklist
+    and progress_callback must be None.
+
+    Regression guard for the 2026-05-11 visual confusion where the
+    requester saw "Setup progress: ⬜⬜⬜⬜⬜⬜⬜⬜⬜" alongside a
+    success message — making them think the deploy hung at step 1.
+    """
+    tmp_inventory.add_domain(
+        domain='already.com', aws_account='auto-insurance',
+    )
+    from inventory import store
+    store.mark_setup_complete('already.com')
+
+    captured = _patch_workflow(
+        monkeypatch,
+        WorkflowResult(status='completed',
+                       message='Lander deployed.',
+                       details={'live_url': 'https://already.com/lander/'}),
+    )
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='100.0',
+        target_domain='already.com', vertical='auto-insurance',
+        requester='U_MDB', lander_url='https://src.com/lander/',
+    )
+
+    posted = _all_text(client)
+    assert 'Deploying lander' in posted
+    assert 'already complete' in posted
+    # The literal checklist heading and the long-cert-validation
+    # latency promise must NOT be there — those mislead the requester.
+    assert 'Setup progress' not in posted
+    assert '5–20 minutes' not in posted
+    # And no progress_callback should be wired in — there's nothing
+    # for it to update.
+    assert captured['progress_callback'] is None
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -45,8 +231,9 @@ def _patch_workflow(monkeypatch, result: WorkflowResult):
     """Replace run_existing_domain_workflow with a stub that returns `result`."""
     captured = {}
 
-    def fake_workflow(req):
+    def fake_workflow(req, progress_callback=None, **_kwargs):
         captured['req'] = req
+        captured['progress_callback'] = progress_callback
         return result
 
     monkeypatch.setattr(
@@ -177,7 +364,7 @@ def test_worker_recovers_from_workflow_exception(monkeypatch):
     """
     _set_default_bucket(monkeypatch)
 
-    def raising_workflow(req):
+    def raising_workflow(req, progress_callback=None, **_kwargs):
         raise RuntimeError('atom went poof')
 
     monkeypatch.setattr(

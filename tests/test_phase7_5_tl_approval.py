@@ -105,9 +105,71 @@ def test_approval_card_payload_contains_all_fields_for_approve_handler():
     """The button value JSON must carry everything confirm_approved needs."""
     payload = json.dumps({
         'domain': 'foo.com', 'vertical': 'auto', 'lander': 'https://x/y',
-        'extension': '.com', 'requester': 'U_MDB',
+        'extension': '.com', 'requester': 'U_MDB', 'aws_account': 'auto-insurance',
     })
     parsed = json.loads(payload)
     # confirm_approved reads these keys directly:
-    for k in ('domain', 'vertical', 'lander', 'extension', 'requester'):
+    for k in ('domain', 'vertical', 'lander', 'extension', 'requester',
+             'aws_account'):
         assert k in parsed, f'{k!r} missing — confirm_approved would crash'
+
+
+# ─── /new-domain modal shape (audit 2026-05-11) ───────────────────────────
+
+def test_new_domain_modal_includes_aws_account_picker():
+    """The modal must expose an explicit AWS account choice. The previous
+    implicit default (auto-insurance via init_db NULL-backfill) silently
+    routed every new domain into one account; making it a required modal
+    choice is what closes that hole.
+    """
+    from slack_bot.routes import _build_new_domain_modal
+    modal = _build_new_domain_modal()
+    block_ids = [b['block_id'] for b in modal['blocks'] if 'block_id' in b]
+    assert 'aws_account_block' in block_ids, (
+        'aws_account_block missing — /new-domain would fall back to the '
+        'silent init_db default again'
+    )
+
+
+def test_new_domain_modal_makes_lander_optional():
+    """The lander_block must be marked optional. Setup-only runs
+    (provision AWS infra now, deploy a lander later) are a real workflow
+    and the modal should not block them by requiring a URL.
+    """
+    from slack_bot.routes import _build_new_domain_modal
+    modal = _build_new_domain_modal()
+    lander_block = next(
+        b for b in modal['blocks'] if b.get('block_id') == 'lander_block'
+    )
+    assert lander_block.get('optional') is True
+
+
+def test_pick_domain_button_payload_carries_aws_account(monkeypatch):
+    """The Pick-this button signed at shortlist time must include
+    aws_account in its payload so the choice survives every downstream
+    hop (TL approval, Mark Purchased, inventory insert).
+    """
+    from config import Config
+    from slack_bot.routes import _build_new_domain_shortlist_blocks
+    from slack_bot.payload_signing import verify_payload
+
+    # sign_payload refuses to sign with the dev-default secret. Patch a
+    # real-looking secret JUST for this test — monkeypatch reverts at
+    # test end so other tests' assumptions about Config don't break.
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+
+    blocks = _build_new_domain_shortlist_blocks(
+        suggestions=[{'domain': 'pick.com', 'price': 1.0, 'extension': '.com'}],
+        vertical='auto-insurance',
+        audience='',
+        extension='.com',
+        lander='https://x/y',
+        requester='U_MDB',
+        aws_account='medicare',
+    )
+    pick_button = next(
+        b['accessory'] for b in blocks
+        if b.get('accessory', {}).get('action_id') == 'pick_domain'
+    )
+    parsed = verify_payload(pick_button['value'])
+    assert parsed['aws_account'] == 'medicare'
