@@ -95,6 +95,14 @@ def main() -> int:
     skipped_unknown = 0
     failed = 0
 
+    # Track domains processed in this run. The store's "due for sync"
+    # query re-returns near-expiry rows on every batch (by design — for
+    # the daily cron, that's correct behaviour). For a one-shot backfill
+    # we want each row at most once, otherwise the loop never terminates.
+    # Caught 2026-05-10 on a real prod run that did 3x the inventory
+    # before hitting a connection timeout.
+    seen: set = set()
+
     while True:
         rows = store.get_domains_due_for_namecheap_sync(
             limit=_BATCH_SIZE,
@@ -104,7 +112,16 @@ def main() -> int:
         if not rows:
             break
 
-        for row in rows:
+        # Drop rows we've already processed this run. If after filtering
+        # the batch is empty, every remaining due row is a repeat — we're
+        # done. (Real daily cron uses a different code path and benefits
+        # from the re-fetch behaviour; this opt-out is backfill-specific.)
+        new_rows = [r for r in rows if r['domain'] not in seen]
+        if not new_rows:
+            break
+
+        for row in new_rows:
+            seen.add(row['domain'])
             domain = row['domain']
             total += 1
 
