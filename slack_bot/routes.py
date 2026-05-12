@@ -2655,6 +2655,12 @@ def slash_new_domain():
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 
+@slack_bp.route('/slash/buy-domain', methods=['POST'])
+def slash_buy_domain():
+    return _bolt_or_stub('Coming soon: /buy-domain. '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
 @slack_bp.route('/slash/list-domains', methods=['POST'])
 def slash_list_domains():
     return _bolt_or_stub('Coming soon: /list-domains (Phase 3). '
