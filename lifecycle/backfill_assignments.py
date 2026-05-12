@@ -104,6 +104,28 @@ def _build_fuzzy_pool(slack_users: List[dict]) -> List[Tuple[str, str]]:
     return pool
 
 
+def _build_alias_map(slack_users: List[dict]) -> dict:
+    """{lowercased_name_or_alias: slack_user_id} — in-memory equivalent of
+    store.lookup_slack_id_by_alias, used to avoid per-row DB round trips
+    when running the backfill from outside Render's network."""
+    import json as _json
+    m: dict = {}
+    for u in slack_users:
+        for key in (u.get('real_name'), u.get('display_name')):
+            if key and key.strip():
+                m.setdefault(key.strip().lower(), u['slack_user_id'])
+        aliases = u.get('name_aliases')
+        if isinstance(aliases, str):
+            try:
+                aliases = _json.loads(aliases)
+            except Exception:
+                aliases = []
+        for a in (aliases or []):
+            if a and str(a).strip():
+                m.setdefault(str(a).strip().lower(), u['slack_user_id'])
+    return m
+
+
 def _build_firstname_index(slack_users: List[dict]) -> dict:
     """{first_word_lower: [slack_user_id, ...]} — for unique-first-name
     match attempts."""
@@ -123,6 +145,7 @@ def _resolve_one(
     *,
     fuzzy_pool: List[Tuple[str, str]],
     firstname_idx: dict,
+    alias_map: Optional[dict] = None,
 ) -> Tuple[Optional[str], str, Optional[str]]:
     """Attempt to resolve a single non-multi MDB token to a Slack ID.
 
@@ -141,7 +164,10 @@ def _resolve_one(
     if _looks_like_slack_id(v):
         return (_strip_slack_prefix(v), 'already_id', None)
 
-    exact_uid = store.lookup_slack_id_by_alias(v)
+    if alias_map is not None:
+        exact_uid = alias_map.get(vl)
+    else:
+        exact_uid = store.lookup_slack_id_by_alias(v)
     if exact_uid:
         return (exact_uid, 'exact_or_alias', None)
 
@@ -173,6 +199,7 @@ def resolve_value(
     *,
     fuzzy_pool: List[Tuple[str, str]],
     firstname_idx: dict,
+    alias_map: Optional[dict] = None,
 ) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
     """Resolve a single raw assigned_to string to a list of Slack IDs.
 
@@ -191,6 +218,7 @@ def resolve_value(
     for tok in tokens:
         uid, kind, alias = _resolve_one(
             tok, fuzzy_pool=fuzzy_pool, firstname_idx=firstname_idx,
+            alias_map=alias_map,
         )
         if uid:
             if uid not in resolved:    # dedup within one value
@@ -229,9 +257,16 @@ def main() -> int:
 
     fuzzy_pool = _build_fuzzy_pool(slack_users)
     firstname_idx = _build_firstname_index(slack_users)
+    alias_map = _build_alias_map(slack_users)
 
     all_rows = store.list_domains()
     print(f'Inventory rows: {len(all_rows)}')
+
+    # Pre-load every active assignment in one query — otherwise we pay an
+    # extra round trip per row, which is ~1s each when running from outside
+    # Render's network.
+    bulk_assignments = store.bulk_current_assignments()
+    print(f'Existing active assignments: {len(bulk_assignments)} domains')
 
     counters = Counter()
     new_assignments = 0
@@ -245,13 +280,13 @@ def main() -> int:
 
         # Skip rows where domain_assignments already has entries —
         # makes the script safely re-runnable.
-        existing = store.current_assignments_for_domain(row['domain'])
-        if existing:
+        if bulk_assignments.get(row['domain']):
             counters['already_has_assignment'] += 1
             continue
 
         resolved, unresolved, alias_pairs = resolve_value(
             raw, fuzzy_pool=fuzzy_pool, firstname_idx=firstname_idx,
+            alias_map=alias_map,
         )
 
         if not resolved:

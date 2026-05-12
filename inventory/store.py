@@ -362,6 +362,18 @@ def _execute(c, query: str, params: tuple = ()):
     return c.execute(query, params)
 
 
+def _looks_like_slack_id_str(s: str) -> bool:
+    """True if s is a plausible Slack user ID (e.g. 'U09UDQNDNTV').
+
+    Slack IDs start with U (humans) or W (org-owners), are all uppercase
+    alphanumeric, and at least 9 chars. We accept >=2 to match test
+    fixtures like 'U_NEERAJ' (matches lifecycle/dm.py's detection).
+    """
+    if not s or len(s) < 2 or s[0] not in ('U', 'W'):
+        return False
+    return all(c.isupper() or c.isdigit() or c == '_' for c in s)
+
+
 # ─── Public API ────────────────────────────────────────────────────────────
 
 def _existing_columns(c) -> set:
@@ -600,6 +612,32 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                 f'Domain {domain!r} already exists in inventory'
             ) from e
         raise
+
+    # Mirror the Phase E ownership ledger. /new-domain passes assigned_to
+    # as a raw Slack ID (e.g. 'U09UDQNDNTV') or 'Slack:Uxxx' string; the
+    # cron and /reassign-domain read from domain_assignments, so without
+    # this write the new row is invisible to the new architecture and
+    # depends on the legacy-column fallback. Strip the 'Slack:' prefix.
+    # Skip if assigned_to is empty or doesn't look like a Slack ID — CSV
+    # legacy imports pass free-text names that resolve later via the
+    # backfill script.
+    if assigned_to:
+        uid = assigned_to[6:].strip() if assigned_to.startswith('Slack:') \
+            else assigned_to.strip()
+        if _looks_like_slack_id_str(uid):
+            try:
+                assign_domain(
+                    domain, uid,
+                    assigned_by=requested_by or 'add_domain',
+                    notes='via add_domain',
+                )
+            except Exception:  # noqa: BLE001
+                # Slack-ID mismatch with slack_users FK or transient — log
+                # but don't break the insert. The legacy-column fallback
+                # still carries this row until the next backfill pass.
+                logging.getLogger(__name__).exception(
+                    'add_domain: failed to mirror assignment for %s', domain,
+                )
 
     # Best-effort 'added' event for /domain-history. Failure here must
     # not break add_domain — the row already exists, the event is
