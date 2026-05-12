@@ -19,6 +19,7 @@ from slack_bot.routes import (
     _parse_lander_url,
     _render_progress_checklist,
     _make_atom_progress_callback,
+    _build_retry_setup_blocks,
 )
 
 
@@ -281,6 +282,112 @@ def test_worker_warns_when_lander_url_unparseable_and_no_fallback(monkeypatch):
     posted = _all_text(client)
     assert 'cannot deploy' in posted.lower()
     assert 'did not parse' in posted.lower()
+
+
+# ─── Retry-setup blocks ───────────────────────────────────────────────────
+
+def test_retry_setup_blocks_carry_payload_for_re_enqueue(monkeypatch):
+    """Failure messages need a Retry-setup button whose signed payload
+    carries everything handle_retry_atom_setup needs to enqueue a new
+    Phase 7 task — target_domain, vertical, requester, lander_url,
+    and the original channel + message_ts so the retry's progress
+    updates land in the same Slack thread.
+    """
+    from config import Config
+    from slack_bot.payload_signing import verify_payload
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+
+    blocks = _build_retry_setup_blocks(
+        heading=':x: *ATOM workflow failed* at step `cloudfront`.',
+        target_domain='retry.com', vertical='medicare',
+        requester='U_MDB', lander_url='https://src/lander/',
+        original_channel='C_THREAD', original_message_ts='1234.5678',
+    )
+    actions = next(b for b in blocks if b.get('type') == 'actions')
+    retry_btn = next(
+        e for e in actions['elements']
+        if e['action_id'] == 'retry_atom_setup'
+    )
+    parsed = verify_payload(retry_btn['value'])
+    assert parsed['target_domain'] == 'retry.com'
+    assert parsed['vertical'] == 'medicare'
+    assert parsed['requester'] == 'U_MDB'
+    assert parsed['lander_url'] == 'https://src/lander/'
+    assert parsed['original_channel'] == 'C_THREAD'
+    assert parsed['original_message_ts'] == '1234.5678'
+
+
+def test_retry_setup_blocks_handle_blank_lander(monkeypatch):
+    """Setup-only retries (blank lander) must carry empty-string
+    lander_url through the signed payload — NOT drop the field. The
+    worker reads `data.get('lander_url') or ''` and the empty value
+    routes back into the setup-only path on retry.
+    """
+    from config import Config
+    from slack_bot.payload_signing import verify_payload
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+
+    blocks = _build_retry_setup_blocks(
+        heading=':x: failure',
+        target_domain='retry.com', vertical='medicare',
+        requester='U_MDB', lander_url='',
+        original_channel='C_THREAD', original_message_ts='1234.5678',
+    )
+    actions = next(b for b in blocks if b.get('type') == 'actions')
+    retry_btn = next(
+        e for e in actions['elements']
+        if e['action_id'] == 'retry_atom_setup'
+    )
+    parsed = verify_payload(retry_btn['value'])
+    assert parsed['lander_url'] == ''
+
+
+def test_failure_message_includes_retry_button(monkeypatch, tmp_inventory):
+    """When the Phase 7 workflow returns a failed WorkflowResult, the
+    Slack thread reply must include a Retry-setup button — not just
+    the text "ATOM workflow failed." Anyone watching the thread
+    should be one click away from re-running.
+    """
+    from config import Config
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+    _set_default_bucket(monkeypatch)
+    tmp_inventory.add_domain(
+        domain='will-fail.com', aws_account='auto-insurance',
+    )
+
+    _patch_workflow(monkeypatch, WorkflowResult(
+        status='failed',
+        message="ATOM domain setup failed at step 'cloudfront'.",
+        details={
+            'reason': 'atom_setup_failed',
+            'setup_result': {'failed_at_step': 'cloudfront'},
+        },
+    ))
+
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='100.0',
+        target_domain='will-fail.com', vertical='auto-insurance',
+        requester='U_REQUESTER',
+        lander_url='https://safetyfirstauto.pro/h-insure-c/',
+    )
+
+    # Find the thread reply (chat_postMessage with thread_ts kwarg)
+    thread_replies = [
+        c for c in client.chat_postMessage.call_args_list
+        if c.kwargs.get('thread_ts')
+    ]
+    # At least one reply should carry a Retry button via blocks=
+    retry_replies = [
+        c for c in thread_replies
+        if any(
+            elt.get('action_id') == 'retry_atom_setup'
+            for blk in (c.kwargs.get('blocks') or [])
+            if blk.get('type') == 'actions'
+            for elt in blk.get('elements') or []
+        )
+    ]
+    assert retry_replies, 'failure thread reply must include a Retry button'
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────

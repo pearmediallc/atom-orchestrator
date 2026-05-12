@@ -435,6 +435,55 @@ def _make_atom_progress_callback(*, client, channel, message_ts,
     return on_progress
 
 
+def _build_retry_setup_blocks(*, heading, target_domain, vertical,
+                              requester, lander_url,
+                              original_channel, original_message_ts):
+    """Build Block Kit blocks for a Phase 7 failure message that
+    includes a Retry-setup button.
+
+    ATOM's setup_domain is idempotent for already-existing AWS
+    resources (cert, Route 53 zone, S3 bucket, S3 bucket policy) — so
+    re-running effectively *resumes* from the failed step rather than
+    re-creating what worked. CloudFront creation in particular has a
+    non-deterministic failure mode (cert not yet replicated to the
+    edge, transient AWS API blip) that often succeeds on retry.
+
+    The button preserves the original ``lander_url`` so a blank-on-
+    submission setup-only run retries as setup-only, and a real-lander
+    run retries with the same source. The original channel + message
+    timestamp are also preserved so the retry's progress updates land
+    in the same Slack thread.
+    """
+    retry_payload = sign_payload({
+        'target_domain': target_domain,
+        'vertical': vertical,
+        'requester': requester,
+        'lander_url': lander_url or '',
+        'original_channel': original_channel,
+        'original_message_ts': original_message_ts,
+    })
+    return [
+        {'type': 'section',
+         'text': {'type': 'mrkdwn', 'text': heading}},
+        {'type': 'actions', 'elements': [{
+            'type': 'button',
+            'action_id': 'retry_atom_setup',
+            'text': {'type': 'plain_text',
+                     'text': ':arrows_counterclockwise: Retry setup'},
+            'style': 'primary',
+            'value': retry_payload,
+        }]},
+        {'type': 'context', 'elements': [{
+            'type': 'mrkdwn',
+            'text': ('_Retry re-runs ATOM\'s 9-step setup. '
+                     'Already-created AWS resources (cert / R53 zone / '
+                     'S3 bucket) are reused; the failed step gets '
+                     'retried. CloudFront errors are most often '
+                     'transient — try once before digging into AWS._'),
+        }]},
+    ]
+
+
 # ─── Phase 7 worker (module-level so tests can import it) ──────────────────
 
 def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
@@ -633,9 +682,17 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
             )
         except Exception:
             pass
+        retry_blocks = _build_retry_setup_blocks(
+            heading=f':x: *ATOM workflow crashed:* '
+                    f'`{type(e).__name__}: {e}`',
+            target_domain=target_domain, vertical=vertical,
+            requester=requester, lander_url=lander_url,
+            original_channel=channel, original_message_ts=message_ts,
+        )
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=f':x: *ATOM workflow crashed:* `{type(e).__name__}: {e}`',
+            blocks=retry_blocks,
         )
         client.chat_postMessage(
             channel=requester,
@@ -677,10 +734,18 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
             )
         except Exception:
             logger.exception('record_event(phase7_failed) failed')
+        retry_blocks = _build_retry_setup_blocks(
+            heading=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
+                     f'Reason: {result.message}'),
+            target_domain=target_domain, vertical=vertical,
+            requester=requester, lander_url=lander_url,
+            original_channel=channel, original_message_ts=message_ts,
+        )
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
                   f'Reason: {result.message}'),
+            blocks=retry_blocks,
         )
         client.chat_postMessage(
             channel=requester,
@@ -2113,6 +2178,110 @@ if _bolt_app is not None:
             )
 
     # ─── Loop closers: Utkarsh clicks "Mark Done" ────────────────────────
+
+    @_bolt_app.action('retry_atom_setup')
+    def handle_retry_atom_setup(ack, body, client):
+        """Operator clicked Retry on a Phase 7 failure message.
+
+        Re-enqueues the same Phase 7 task — same target_domain,
+        vertical, requester, lander_url. The worker reads the
+        inventory row's aws_account so the retry uses the same AWS
+        account as the original attempt (no need to thread it through
+        the button payload — it's authoritative in the DB).
+
+        ATOM's setup_domain is idempotent for resources that already
+        exist, so this effectively resumes from the failed step. We
+        replace the failure card with a "retry sent" view so the
+        button can't be clicked again — the durability contract is
+        the new phase7_tasks row, not the in-flight Slack message.
+        """
+        ack()
+        data = _verify_button_click(body)
+        if data is None:
+            return
+
+        target_domain = data['target_domain']
+        vertical = data.get('vertical') or ''
+        requester = data['requester']
+        lander_url = data.get('lander_url') or ''
+        # Original channel + message_ts let the new run's progress
+        # updates land in the same Slack thread as the failure
+        # they're retrying — same flow continuity the requester sees
+        # on a normal Mark Deployed click.
+        original_channel = (
+            data.get('original_channel') or body['channel']['id']
+        )
+        original_message_ts = (
+            data.get('original_message_ts') or body['message']['ts']
+        )
+        retrier = body['user']['id']
+
+        log_event(
+            'atom_setup_retry_clicked',
+            domain=target_domain, vertical=vertical,
+            requester=requester, retrier=retrier,
+            lander_url=lander_url or None,
+        )
+        try:
+            inventory_store.record_event(
+                target_domain, 'phase7_retry_clicked', actor=retrier,
+                metadata={'lander_url': lander_url,
+                          'vertical': vertical,
+                          'requester': requester},
+            )
+        except Exception:
+            logger.exception(
+                'record_event(phase7_retry_clicked) failed for %s',
+                target_domain,
+            )
+
+        # Replace the failure card so the retry button can't be
+        # double-clicked. The "Retry sent" view shows who clicked it
+        # so anyone else looking at the thread knows a retry is in
+        # flight.
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Retry sent: {target_domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':arrows_counterclockwise: Retry sent: '
+                            f'{target_domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (f'Triggered by <@{retrier}>. Progress '
+                             'updates will appear in this thread.'),
+                }]},
+            ],
+        )
+
+        if Config.ENABLE_PHASE_7:
+            from orchestrator import tasks
+            from orchestrator.tasks_runner import enqueue_phase7
+            enqueue_phase7(
+                # Treat retries as Path A — the row exists in inventory
+                # already, so the worker's behaviour is identical to a
+                # /list-domains Deploy lander click. The Path B kind
+                # would have been semantically wrong post-purchase.
+                kind=tasks.TASK_KIND_PATH_A,
+                channel=original_channel,
+                message_ts=original_message_ts,
+                target_domain=target_domain,
+                vertical=vertical,
+                requester=requester,
+                lander_url=lander_url,
+            )
+        else:
+            client.chat_postMessage(
+                channel=body['channel']['id'],
+                thread_ts=body['message']['ts'],
+                text=(':warning: ENABLE_PHASE_7 is off — retry was '
+                      'recorded but the worker won\'t run. Flip the '
+                      'env var to true and click retry again, or '
+                      'tell ops to re-enqueue manually.'),
+            )
 
     @_bolt_app.action('confirm_deployed')
     def handle_confirm_deployed(ack, body, client):
