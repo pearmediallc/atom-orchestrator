@@ -401,6 +401,131 @@ def test_returns_failed_when_copy_files_reports_error(tmp_inventory):
     assert tmp_inventory.get_domain('copy-fail.com')['setup_at'] is None
 
 
+def test_atom_diagnosis_surfaced_in_failure_message_and_log(tmp_inventory, caplog):
+    """ATOM (post 2026-05-13) attaches a structured `diagnosis` to its
+    error response for known AWS error patterns
+    (CNAMEAlreadyExists, InvalidViewerCertificate, NoSuchHostedZone).
+    The workflow MUST surface the diagnosis fields so:
+      • workflow_failed log line carries root_cause + summary + action
+        as top-level keys (greppable in Render logs)
+      • result.message prefers the diagnosis.summary over the raw
+        AWS error text — operators see the actionable one-liner
+
+    Regression guard: previously workflow.py only read
+    error.{step_key, message, exception, aws_error_code} and dropped
+    everything else, including ATOM's structured diagnosis.
+    """
+    import logging as _logging
+    tmp_inventory.add_domain(
+        domain='diag.com', aws_account='auto-insurance')
+
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.return_value = {
+        'status': 'failed',
+        'failed_at_step': 'cloudfront',
+        'completed_steps': ['certificate', 'route53_zone', 's3_buckets'],
+        'error': {
+            'step_key': 'cloudfront',
+            'step_label': 'Creating CloudFront distribution',
+            'message': 'An error occurred (CNAMEAlreadyExists)...',
+            'exception': 'ClientError',
+            'aws_error_code': 'CNAMEAlreadyExists',
+            'diagnosis': {
+                'root_cause': 'CLOUDFRONT_DOMAIN_ALREADY_IN_USE',
+                'severity': 'fatal',
+                'summary': 'This domain is already used as an alias on '
+                           'another CloudFront distribution.',
+                'suggested_action': (
+                    'AWS error: CNAMEAlreadyExists\n'
+                    'How to fix:\n'
+                    '  1. Open CloudFront console: https://us-east-1...\n'
+                    '  2. Search for distribution claiming this CNAME\n'
+                    '  3. Disable + delete the orphan, or remove the alias\n'
+                    '  4. Retry domain setup'
+                ),
+            },
+        },
+    }
+
+    req = ExistingDomainRequest(
+        target_domain='diag.com',
+        source_account='auto-insurance',
+        source_bucket='lander-source.com',
+        source_folders=['lander-v3/'],
+    )
+    with caplog.at_level(_logging.ERROR, logger='orchestrator.workflow'):
+        result = run_existing_domain_workflow(req, client=client)
+
+    assert result.status == 'failed'
+    # Diagnosis summary wins over raw exception text in the human
+    # message — operators see "domain already in use" not "ClientError".
+    assert 'already used as an alias' in result.message
+    assert "step 'cloudfront'" in result.message
+
+    # Structured log fields surfaced for grep.
+    failed_records = [
+        r for r in caplog.records
+        if getattr(r, 'event', None) == 'workflow_failed'
+    ]
+    assert failed_records
+    rec = failed_records[-1]
+    assert rec.atom_diagnosis_root_cause == 'CLOUDFRONT_DOMAIN_ALREADY_IN_USE'
+    assert 'already used as an alias' in rec.atom_diagnosis_summary
+    assert 'CloudFront console' in rec.atom_diagnosis_action
+    assert '1. Open CloudFront console' in rec.atom_diagnosis_action
+
+
+def test_atom_diagnosis_missing_falls_back_gracefully(tmp_inventory, caplog):
+    """When ATOM didn't classify the error (older ATOM, novel failure
+    pattern), the diagnosis fields should be None and the workflow
+    should still surface the raw AWS error text + exception message.
+    Defensive contract — never KeyError on missing diagnosis."""
+    import logging as _logging
+    tmp_inventory.add_domain(
+        domain='no-diag.com', aws_account='auto-insurance')
+
+    client = MagicMock()
+    client.setup_domain.return_value = _ok_setup_response()
+    client.wait_for_setup.return_value = {
+        'status': 'failed',
+        'failed_at_step': 'cloudfront',
+        'completed_steps': [],
+        'error': {
+            'step_key': 'cloudfront',
+            'message': 'AccessDenied: cloudfront:CreateDistribution',
+            'exception': 'ClientError',
+            'aws_error_code': 'AccessDenied',
+            # No 'diagnosis' field — older ATOM or unclassified error.
+        },
+    }
+
+    req = ExistingDomainRequest(
+        target_domain='no-diag.com',
+        source_account='auto-insurance',
+        source_bucket='lander-source.com',
+        source_folders=['lander-v3/'],
+    )
+    with caplog.at_level(_logging.ERROR, logger='orchestrator.workflow'):
+        result = run_existing_domain_workflow(req, client=client)
+
+    assert result.status == 'failed'
+    # Falls back to raw error.message when no diagnosis.summary
+    assert 'AccessDenied: cloudfront:CreateDistribution' in result.message
+
+    failed_records = [
+        r for r in caplog.records
+        if getattr(r, 'event', None) == 'workflow_failed'
+    ]
+    assert failed_records
+    rec = failed_records[-1]
+    # Diagnosis fields should be absent (not present in extras), because
+    # _fail strips None-valued log_fields entries.
+    assert not hasattr(rec, 'atom_diagnosis_root_cause')
+    assert not hasattr(rec, 'atom_diagnosis_summary')
+    assert not hasattr(rec, 'atom_diagnosis_action')
+
+
 def test_returns_failed_when_copy_files_partial_failure(tmp_inventory, caplog):
     """Audit 2026-05-11: when ATOM's per-file PutObject calls fail (e.g.
     AccessDenied on the target bucket), it now returns 200 with

@@ -748,8 +748,26 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
                   f'Live at: {live}'),
         )
     else:
-        failed_step = (result.details.get('setup_result') or {}).get(
-            'failed_at_step', '?')
+        setup_result_dict = (result.details.get('setup_result') or {})
+        failed_step = setup_result_dict.get('failed_at_step', '?')
+        # When ATOM classified the error (CNAMEAlreadyExists,
+        # InvalidViewerCertificate, NoSuchHostedZone, etc.), pull the
+        # suggested_action so we can render it as a separate block on
+        # the Slack thread — operator sees the fix path inline instead
+        # of having to hunt for it.
+        err_obj = setup_result_dict.get('error') or {}
+        if not isinstance(err_obj, dict):
+            err_obj = {}
+        diagnosis = err_obj.get('diagnosis') or {}
+        if not isinstance(diagnosis, dict):
+            diagnosis = {}
+        diagnosis_action = diagnosis.get('suggested_action') if isinstance(
+            diagnosis.get('suggested_action'), str
+        ) else None
+        diagnosis_root_cause = diagnosis.get('root_cause') if isinstance(
+            diagnosis.get('root_cause'), str
+        ) else None
+
         try:
             inventory_store.record_event(
                 target_domain, 'phase7_failed', actor='cron',
@@ -757,10 +775,12 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
                     'failed_at_step': failed_step,
                     'reason': (result.details or {}).get('reason'),
                     'message': result.message[:500],
+                    'diagnosis_root_cause': diagnosis_root_cause,
                 },
             )
         except Exception:
             logger.exception('record_event(phase7_failed) failed')
+
         retry_blocks = _build_retry_setup_blocks(
             heading=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'
                      f'Reason: {result.message}'),
@@ -768,6 +788,37 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
             requester=requester, lander_url=lander_url,
             original_channel=channel, original_message_ts=message_ts,
         )
+        # Inject ATOM's diagnosis (if any) as a separate section block
+        # between the failure heading and the Retry button. Multi-line
+        # text rendered as mrkdwn — preserves the URLs + numbered steps
+        # ATOM emits in suggested_action. Slack section text caps at
+        # 3000 chars; we trim to be safe.
+        if diagnosis_action:
+            diagnosis_blocks = [
+                {'type': 'divider'},
+                {'type': 'section', 'text': {
+                    'type': 'mrkdwn',
+                    'text': (
+                        f':mag: *Root cause:* `{diagnosis_root_cause}`\n\n'
+                        + diagnosis_action[:2800]
+                    ),
+                }},
+                {'type': 'divider'},
+            ]
+            # Insert just before the actions block (the Retry button)
+            # so the suggested_action sits between the heading and the
+            # button — natural reading order.
+            insert_at = next(
+                (i for i, b in enumerate(retry_blocks)
+                 if b.get('type') == 'actions'),
+                len(retry_blocks),
+            )
+            retry_blocks = (
+                retry_blocks[:insert_at]
+                + diagnosis_blocks
+                + retry_blocks[insert_at:]
+            )
+
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':x: *ATOM workflow failed* at step `{failed_step}`.\n'

@@ -325,7 +325,9 @@ def run_existing_domain_workflow(
         # request id, etc. ATOM's failed-status shape (see
         # tests/test_atom_client.py::test_setup_domain_returns_structured_error):
         #   { status: 'failed', failed_at_step, completed_steps,
-        #     error: { step_key, message, exception, aws_error_code?, ... } }
+        #     error: { step_key, message, exception, aws_error_code?,
+        #              diagnosis?: {root_cause, severity, summary,
+        #                           suggested_action} } }
         # Older/edge failure modes may omit fields entirely OR return
         # `error` as a plain string instead of the structured dict — be
         # defensive both ways so we never lose ATOM's actual error text.
@@ -345,13 +347,38 @@ def run_existing_domain_workflow(
         err_exc = err.get('exception') if isinstance(err.get('exception'), str) else None
         aws_code = err.get('aws_error_code') if isinstance(err.get('aws_error_code'), str) else None
 
-        # Human message: lead with step, append AWS code + ATOM's exception
-        # message when available so the Slack reply and DB latest_error
-        # row both carry the real cause, not the literal 'unknown'.
+        # `diagnosis` (added to ATOM 2026-05-13) classifies known AWS error
+        # patterns into a root_cause + suggested_action. When present, it's
+        # MUCH more actionable than the raw AWS error code — e.g. for
+        # CNAMEAlreadyExists it spells out "find the orphaned CloudFront
+        # distribution claiming this CNAME and delete it." Surface it on
+        # the workflow_failed event so /domain-history + Slack thread can
+        # render the fix path without an operator hand-querying ATOM's
+        # status endpoint.
+        diagnosis = err.get('diagnosis') if isinstance(err.get('diagnosis'), dict) else {}
+        diagnosis_root_cause = (
+            diagnosis.get('root_cause')
+            if isinstance(diagnosis.get('root_cause'), str) else None
+        )
+        diagnosis_summary = (
+            diagnosis.get('summary')
+            if isinstance(diagnosis.get('summary'), str) else None
+        )
+        diagnosis_action = (
+            diagnosis.get('suggested_action')
+            if isinstance(diagnosis.get('suggested_action'), str) else None
+        )
+
+        # Human message: lead with step, append AWS code + the most
+        # human-friendly description we have. Diagnosis summary wins over
+        # the raw exception message when both are present — it's the
+        # one-liner the user actually wants to see.
         parts = [f"ATOM domain setup failed at step '{step}'."]
         if aws_code:
             parts.append(f'[{aws_code}]')
-        if err_msg:
+        if diagnosis_summary:
+            parts.append(diagnosis_summary)
+        elif err_msg:
             parts.append(err_msg)
         full_message = ' '.join(parts)
 
@@ -389,6 +416,14 @@ def run_existing_domain_workflow(
                 # Render log line readable (1KB is enough for the head
                 # of any traceback, which is what we actually need).
                 'atom_error_exception': (err_exc or '')[:1000] or None,
+                # ATOM's structured diagnosis (CLOUDFRONT_DOMAIN_ALREADY_IN_USE,
+                # CLOUDFRONT_CERT_INVALID, ROUTE53_ZONE_DISAPPEARED, etc.)
+                # surfaced as top-level keys so Render log greps for
+                # specific failure patterns work without parsing the
+                # nested error dict.
+                'atom_diagnosis_root_cause': diagnosis_root_cause,
+                'atom_diagnosis_summary': (diagnosis_summary or '')[:500] or None,
+                'atom_diagnosis_action': (diagnosis_action or '')[:2000] or None,
                 # Diagnostics for the case where ATOM returned an
                 # unexpected shape (step='unknown'). Empty in the
                 # normal case.
