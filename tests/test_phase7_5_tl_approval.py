@@ -173,3 +173,55 @@ def test_pick_domain_button_payload_carries_aws_account(monkeypatch):
     )
     parsed = verify_payload(pick_button['value'])
     assert parsed['aws_account'] == 'medicare'
+
+
+def test_shortlist_pick_payload_carries_price(monkeypatch):
+    """Price comes from Namecheap in workflow.suggest_new_domains; it
+    MUST be threaded into the Pick-this signed payload so the
+    downstream TL approval + Utkarsh purchase cards can display the
+    actual annual cost (audit 2026-05-12).
+    """
+    from config import Config
+    from slack_bot.routes import _build_new_domain_shortlist_blocks
+    from slack_bot.payload_signing import verify_payload
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+
+    blocks = _build_new_domain_shortlist_blocks(
+        suggestions=[{'domain': 'cheap.com', 'price': 9.18, 'extension': '.com'}],
+        vertical='auto-insurance',
+        audience='',
+        extension='.com',
+        lander='https://x/y',
+        requester='U_MDB',
+        aws_account='medicare',
+    )
+    pick_button = next(
+        b['accessory'] for b in blocks
+        if b.get('accessory', {}).get('action_id') == 'pick_domain'
+    )
+    parsed = verify_payload(pick_button['value'])
+    assert parsed['price'] == 9.18
+
+
+def test_buy_domain_confirm_payload_carries_price(monkeypatch):
+    """Same contract for the /buy-domain confirm card: price the bot
+    found on Namecheap must survive the signed payload all the way
+    to the TL + Utkarsh cards."""
+    from config import Config
+    from slack_bot.routes import _build_buy_domain_confirm_blocks
+    from slack_bot.payload_signing import verify_payload
+    monkeypatch.setattr(Config, 'FLASK_SECRET_KEY', 'x' * 64)
+
+    blocks = _build_buy_domain_confirm_blocks(
+        domain='foo.com', vertical='medicare', aws_account='auto-insurance',
+        lander='', requester='U_MDB',
+        availability_finding=':white_check_mark: Available.',
+        inventory_finding='', price_finding='$8.99',
+        price=8.99,
+    )
+    actions = next(b for b in blocks if b.get('type') == 'actions')
+    confirm_btn = next(
+        e for e in actions['elements'] if e['action_id'] == 'pick_domain'
+    )
+    parsed = verify_payload(confirm_btn['value'])
+    assert parsed['price'] == 8.99

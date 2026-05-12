@@ -265,6 +265,12 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                     'extension': per_domain_extension,
                     'requester': requester,
                     'aws_account': aws_account,
+                    # Price came from the Namecheap check in
+                    # workflow.suggest_new_domains; threading it
+                    # through the signed payload chain so the TL
+                    # approval card + Utkarsh purchase card both
+                    # display the actual annual cost.
+                    'price': s.get('price'),
                 }),
             },
         })
@@ -1177,6 +1183,10 @@ if _bolt_app is not None:
             availability_finding=availability_finding,
             inventory_finding=inventory_finding,
             price_finding=price_finding,
+            # Pass the actual Namecheap price (or None if API was
+            # unreachable) so it propagates through the signed payload
+            # chain to TL + Utkarsh cards.
+            price=(nc.get('price') if namecheap_ok else None),
         )
         if not namecheap_ok:
             # Replace the actions block with a Cancel-only one. There's
@@ -1392,7 +1402,7 @@ if _bolt_app is not None:
 
     def _send_purchase_request_to_utkarsh(client, *, domain, vertical, lander,
                                           extension, requester,
-                                          aws_account=''):
+                                          aws_account='', price=None):
         """DM Utkarsh (with dev-reroute applied) the purchase request card.
 
         Extracted from handle_pick_domain so TL approval can call it after
@@ -1421,6 +1431,14 @@ if _bolt_app is not None:
             else '• Lander to deploy: _none — setup-only (no file copy)_\n'
         )
         aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
+        # Utkarsh sees the expected price so he can sanity-check
+        # against what Namecheap actually charges at the checkout step
+        # — discrepancies (premium markup, currency, promo expired)
+        # surface here before the purchase, not after (audit 2026-05-12).
+        if isinstance(price, (int, float)) and price > 0:
+            price_line = f'• Expected price: *${price:.2f}/yr*\n'
+        else:
+            price_line = '• Expected price: _unknown — check Namecheap_\n'
 
         utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
@@ -1429,6 +1447,7 @@ if _bolt_app is not None:
             f'• Vertical: `{vertical}`\n'
             + aws_line
             + f'• Extension: `{extension}`\n'
+            + price_line
             + lander_line
             + '\n:point_right: Please buy this on Namecheap, then click '
               '*Mark Purchased* below.'
@@ -1450,6 +1469,10 @@ if _bolt_app is not None:
                         'lander': lander,
                         'requester': requester,
                         'aws_account': aws_account,
+                        # Price audit-trail: end-of-chain so
+                        # confirm_purchased can stamp it on the
+                        # domain_events row for /domain-history.
+                        'price': price,
                     }),
                 }]},
             ],
@@ -1543,6 +1566,11 @@ if _bolt_app is not None:
         extension = data['extension']
         requester = data['requester']
         aws_account = data.get('aws_account', '')
+        # Namecheap price flowed in via the Pick / Confirm payload —
+        # show it on the TL approval + Utkarsh purchase cards so both
+        # know the actual annual cost before approving / buying
+        # (audit 2026-05-12).
+        price = data.get('price')
 
         approver_ids = Config.APPROVER_SLACK_USER_IDS
         button_payload = sign_payload({
@@ -1552,6 +1580,7 @@ if _bolt_app is not None:
             'extension': extension,
             'requester': requester,
             'aws_account': aws_account,
+            'price': price,
         })
 
         lander_line = (
@@ -1559,6 +1588,22 @@ if _bolt_app is not None:
             else '• Lander to deploy: _none — setup-only (no file copy)_\n'
         )
         aws_line = f'• AWS account: `{aws_account}`\n' if aws_account else ''
+        # Display price with cap context when extension is known so TL
+        # can see at a glance whether this is within policy.
+        if isinstance(price, (int, float)) and price > 0:
+            try:
+                cap = Config.price_cap_for(extension or '.com')
+                over_cap = price > cap
+                price_line = (
+                    f'• Price: *${price:.2f}/yr* '
+                    f'(cap for `{extension}` is ${cap:.2f}'
+                    + ('  ⚠ over cap' if over_cap else '')
+                    + ')\n'
+                )
+            except Exception:
+                price_line = f'• Price: *${price:.2f}/yr*\n'
+        else:
+            price_line = '• Price: _unknown_\n'
 
         if approver_ids:
             # Phase 7.5: send TL approval card to each configured approver
@@ -1570,6 +1615,7 @@ if _bolt_app is not None:
                 f'• Vertical: `{vertical}`\n'
                 + aws_line
                 + f'• Extension: `{extension}`\n'
+                + price_line
                 + lander_line
                 + '\n:point_right: Approve to forward this to Utkarsh for '
                   'purchase, or Reject to cancel.'
@@ -1636,6 +1682,7 @@ if _bolt_app is not None:
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
             aws_account=aws_account,
+            price=price,
         )
         purchaser_is_requester = (purchaser == requester)
 
@@ -1688,6 +1735,7 @@ if _bolt_app is not None:
         extension = data.get('extension') or '.com'
         requester = data['requester']
         aws_account = data.get('aws_account', '')
+        price = data.get('price')
         approver = body['user']['id']
 
         # Forward to Utkarsh
@@ -1696,6 +1744,7 @@ if _bolt_app is not None:
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
             aws_account=aws_account,
+            price=price,
         )
 
         # Replace the approval card so it can't be re-approved
@@ -2116,6 +2165,7 @@ if _bolt_app is not None:
         lander = data.get('lander') or ''
         requester = data['requester']
         aws_account = data.get('aws_account', '').strip()
+        price = data.get('price')
         # Backwards compat: old in-flight buttons (signed before the modal
         # added the picker) carry no aws_account key. Fall back to the
         # first configured option, which preserves the previous implicit
@@ -2139,6 +2189,7 @@ if _bolt_app is not None:
             domain=domain, vertical=vertical, aws_account=aws_account,
             requester=requester, confirmer=confirmer,
             lander_url=lander,
+            price=price,
         )
 
         # Add to inventory so /list-domains starts showing it (and so the
@@ -2178,7 +2229,8 @@ if _bolt_app is not None:
                 event_source='path_b_mark_purchased',
                 event_metadata={'lander_url': lander, 'vertical': vertical,
                                 'aws_account': aws_account,
-                                'confirmer': confirmer},
+                                'confirmer': confirmer,
+                                'price_usd': price},
             )
         except inventory_store.DuplicateDomainError:
             logger.info(
@@ -2583,7 +2635,8 @@ def _build_buy_domain_modal(prefill_domain: str = '') -> dict:
 
 def _build_buy_domain_confirm_blocks(*, domain, vertical, aws_account,
                                      lander, requester, availability_finding,
-                                     inventory_finding, price_finding):
+                                     inventory_finding, price_finding,
+                                     price=None):
     """Render the confirm-or-cancel card the MDB sees after /buy-domain
     validation runs. Surfaces every finding factually; never auto-rejects.
 
@@ -2620,7 +2673,9 @@ def _build_buy_domain_confirm_blocks(*, domain, vertical, aws_account,
     )
 
     # Reuse pick_domain's payload contract so the existing handler picks
-    # up the click identically to an AI-shortlist selection.
+    # up the click identically to an AI-shortlist selection. Price is
+    # threaded through so TL approval + Utkarsh purchase cards display
+    # the actual annual cost (audit 2026-05-12).
     confirm_payload = sign_payload({
         'domain': domain,
         'vertical': vertical,
@@ -2628,6 +2683,7 @@ def _build_buy_domain_confirm_blocks(*, domain, vertical, aws_account,
         'extension': extension,
         'requester': requester,
         'aws_account': aws_account,
+        'price': price,
     })
     cancel_payload = sign_payload({'domain': domain, 'requester': requester})
 
