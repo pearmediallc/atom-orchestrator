@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request
 
 from config import Config
+from domain_assistant import namecheap_check
 from inventory import store as inventory_store
 from orchestrator.log_setup import log_event
 from orchestrator.workflow import (
