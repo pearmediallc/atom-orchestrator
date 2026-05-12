@@ -380,17 +380,44 @@ def _render_progress_checklist(steps: dict) -> str:
     keyed by step_key with values like ``{'status': 'completed'}``. Empty
     dict (pre-first-poll) renders all rows as pending so the requester
     sees the full 9-row outline immediately.
+
+    Implicit-completion: when a later step has any state but an earlier
+    step has none, the earlier step is rendered as ✅. ATOM's progress
+    callback only fires when a step does NEW work — on retries it
+    short-circuits steps whose resources already exist (cert reused,
+    R53 zone already exists, etc.) and just skips ahead. Without this
+    logic those skipped steps render as ⬜ "pending" alongside the
+    later ✅ steps, which looks broken even though the deploy succeeded
+    (audit 2026-05-13 retry on naturalfitnessguide.com — CNAME
+    validation step never re-emitted because the cert was already
+    valid from the first attempt).
     """
     glyphs = {
         'completed':   ':white_check_mark:',
         'in_progress': ':hourglass_flowing_sand:',
         'failed':      ':x:',
     }
+    # Find the highest-index step that has any state. Anything below it
+    # with no state is implicitly done — ATOM moved past it.
+    last_active_idx = -1
+    for i, (key, _label) in enumerate(_ATOM_STEP_ORDER):
+        step = steps.get(key) or {}
+        if step.get('status'):
+            last_active_idx = i
+
     lines = ['*Setup progress:*']
-    for key, label in _ATOM_STEP_ORDER:
+    for i, (key, label) in enumerate(_ATOM_STEP_ORDER):
         step = steps.get(key) or {}
         state = (step.get('status') or '').lower()
-        glyph = glyphs.get(state, ':white_large_square:')
+        if state in glyphs:
+            glyph = glyphs[state]
+        elif i < last_active_idx:
+            # No explicit state, but a later step IS active — this one
+            # was either skipped (resource reused) or finished silently.
+            # Either way, it's done from the requester's perspective.
+            glyph = ':white_check_mark:'
+        else:
+            glyph = ':white_large_square:'
         lines.append(f'{glyph} {label}')
     return '\n'.join(lines)
 

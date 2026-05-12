@@ -48,17 +48,74 @@ def test_progress_checklist_renders_all_9_steps_as_pending_when_empty():
 
 
 def test_progress_checklist_uses_distinct_glyphs_per_state():
+    """Each state maps to a unique glyph:
+       ✅ white_check_mark, ⏳ hourglass_flowing_sand, ❌ x, ⬜ white_large_square.
+    """
     out = _render_progress_checklist({
-        'certificate':  {'status': 'completed'},
-        'route53_zone': {'status': 'in_progress'},
-        's3_buckets':   {'status': 'failed'},
-        # nameserver_update intentionally absent → pending
+        'cloudfront':       {'status': 'in_progress'},
+        'route53_records':  {'status': 'failed'},
+        # Set the last-active step to route53_records (index 7) via the
+        # 'failed' state, so the only "after that" step is
+        # nameserver_update (index 8) — which has no state and renders
+        # ⬜. Everything before route53_records is implicitly completed.
     })
-    assert ':white_check_mark:' in out          # certificate
-    assert ':hourglass_flowing_sand:' in out    # route53_zone
-    assert ':x:' in out                          # s3_buckets
-    # 6 unmentioned steps + 0 mentioned-as-pending = 6 pending glyphs
-    assert out.count(':white_large_square:') == 6
+    assert ':hourglass_flowing_sand:' in out    # cloudfront in_progress
+    assert ':x:' in out                          # route53_records failed
+    # Steps 0-6 (init, cert, namecheap_cname, r53_zone, s3_buckets,
+    # cert_validation, cloudfront) are all ✅ — either explicit (cf)
+    # or implicit (everything before the last-active step). Step 8
+    # (nameserver_update) is ⬜ pending since nothing later is active.
+    assert out.count(':white_large_square:') == 1
+
+
+def test_progress_checklist_implicit_completion_on_retry(monkeypatch):
+    """ATOM's retry path short-circuits steps whose AWS resources already
+    exist (cert reused, R53 zone already there) — its progress callback
+    never re-emits those steps. Without implicit-completion logic those
+    steps render as ⬜ alongside the later ✅ steps, which looks broken
+    even though the deploy succeeded.
+
+    Regression guard for 2026-05-13 retry on naturalfitnessguide.com —
+    deploy completed end-to-end but the requester saw two unchecked
+    boxes ("Initializing setup" + "Adding CNAME validation records")
+    sitting between ✅ rows.
+    """
+    # Mimics the steps dict ATOM returns after a successful retry where
+    # the cert was already valid and the R53 zone already existed:
+    out = _render_progress_checklist({
+        'certificate':            {'status': 'completed'},
+        # 'namecheap_cname' intentionally absent — ATOM didn't add
+        # new records because cert was already valid.
+        'route53_zone':           {'status': 'completed'},
+        's3_buckets':              {'status': 'completed'},
+        'certificate_validation': {'status': 'completed'},
+        'cloudfront':              {'status': 'completed'},
+        'route53_records':         {'status': 'completed'},
+        'nameserver_update':       {'status': 'completed'},
+        # 'initialization' also intentionally absent — ATOM doesn't
+        # explicitly mark it.
+    })
+    # All 9 rows should be ✅ — both the explicit-completed ones AND
+    # the implicit ones (initialization, namecheap_cname) that
+    # precede the last-active step.
+    assert out.count(':white_check_mark:') == 9
+    assert ':white_large_square:' not in out
+
+
+def test_progress_checklist_does_not_imply_completion_for_steps_after_active():
+    """Implicit-completion looks BACK only, never forward. A step with
+    no state that comes AFTER the highest-active step is still ⬜
+    pending — we don't claim work that hasn't happened yet."""
+    out = _render_progress_checklist({
+        'certificate': {'status': 'in_progress'},
+        # Cert is the second step (index 1). Everything before
+        # (initialization, index 0) is implicitly ✅. Everything after
+        # is ⬜.
+    })
+    # 1 implicit ✅ (init) + 1 ⏳ (cert) + 7 ⬜ (everything after cert)
+    assert out.count(':white_check_mark:') == 1
+    assert out.count(':hourglass_flowing_sand:') == 1
+    assert out.count(':white_large_square:') == 7
 
 
 def test_progress_callback_skips_chat_update_when_nothing_changed():
