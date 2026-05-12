@@ -1816,9 +1816,16 @@ if _bolt_app is not None:
         """User clicked 'Deploy lander' on a domain in /list-domains.
 
         Open a confirmation modal that:
-          • shows the picked target domain
-          • warns about the destructive nature (overwrites existing lander)
-          • asks for the source lander URL to deploy
+          • shows the picked target domain + its current setup status
+          • when setup is already complete: warns this is destructive
+            (overwrites the live lander)
+          • when setup is incomplete (e.g. a Path B Mark-Purchased that
+            had ATOM crash mid-flight): the modal flips into "Retry /
+            finish setup" mode — the warning is replaced with a
+            "resuming infrastructure" message, and lander URL becomes
+            optional so the operator can run setup-only retries
+            without committing to a specific lander up front
+            (audit 2026-05-13).
         """
         ack()
         data = _verify_button_click(body)
@@ -1828,24 +1835,96 @@ if _bolt_app is not None:
         target_domain = data['domain']
         vertical = data.get('vertical') or '_no vertical_'
 
+        # Look up the row so the modal can adapt its copy + validation
+        # based on whether setup has actually completed on this domain.
+        try:
+            existing = inventory_store.get_domain(target_domain) or {}
+        except Exception:
+            logger.exception(
+                'inventory lookup failed for deploy_lander_click %s — '
+                'rendering modal in default "redeploy" mode',
+                target_domain,
+            )
+            existing = {}
+        setup_completed = bool(existing.get('setup_at'))
+
+        if setup_completed:
+            modal_title = 'Deploy lander'
+            warning_text = (
+                ':warning: *This will overwrite the existing '
+                f'lander on `{target_domain}`.*\n'
+                'If a campaign is currently live on this domain, '
+                'redeploying may interrupt it for up to 24h while '
+                'DNS / CloudFront caches refresh. Make sure this '
+                'domain is not running a live campaign.'
+            )
+            lander_label = 'Lander source URL — https://<bucket>/<folder>/'
+            lander_hint = (
+                'The bucket name and folder are pulled from this URL. '
+                'e.g. https://safetyfirstauto.pro/h-insure-c/ '
+                'will copy from bucket safetyfirstauto.pro, folder h-insure-c/.'
+            )
+            lander_required = True
+        else:
+            modal_title = 'Retry / finish setup'
+            warning_text = (
+                ':information_source: *ATOM setup is incomplete for '
+                f'`{target_domain}`* '
+                '(no `setup_at` recorded yet — usually means a previous '
+                'attempt crashed mid-flight).\n'
+                'Submitting this form re-runs ATOM\'s 9-step setup. '
+                'Cert / R53 zone / S3 bucket that already exist will be '
+                'reused; failed steps (typically CloudFront) get '
+                'retried.'
+            )
+            lander_label = 'Lander source URL (optional — leave blank for setup-only retry)'
+            lander_hint = (
+                'When set, the bot copies the lander\'s S3 contents to '
+                f'`{target_domain}` after setup completes. When blank, '
+                'only the AWS infrastructure is finished — you can '
+                'deploy a lander later via /list-domains.'
+            )
+            lander_required = False
+
+        lander_block = {
+            'type': 'input',
+            'block_id': 'lander_block',
+            'label': {'type': 'plain_text', 'text': lander_label},
+            'hint': {'type': 'plain_text', 'text': lander_hint},
+            'element': {
+                'type': 'url_text_input',
+                'action_id': 'lander_input',
+                'placeholder': {
+                    'type': 'plain_text',
+                    'text': (
+                        'https://safetyfirstauto.pro/h-insure-c/'
+                        if lander_required
+                        else 'https://example.com/lander/ (or leave blank)'
+                    ),
+                },
+            },
+        }
+        if not lander_required:
+            lander_block['optional'] = True
+
         modal = {
             'type': 'modal',
             'callback_id': 'deploy_lander_modal',
-            'title': {'type': 'plain_text', 'text': 'Deploy lander'},
+            'title': {'type': 'plain_text', 'text': modal_title},
             'submit': {'type': 'plain_text', 'text': 'Send to Utkarsh'},
             'close': {'type': 'plain_text', 'text': 'Cancel'},
-            # Stash the picked target domain so the submission handler
-            # knows what was clicked. private_metadata is the standard
-            # bolt mechanism for this.
+            # Stash the picked target domain + setup status so the
+            # submission handler knows which validation mode to apply.
             'private_metadata': json.dumps({
                 'target_domain': target_domain,
                 'vertical': vertical,
+                'setup_completed': setup_completed,
             }),
             'blocks': [
                 {
                     'type': 'header',
                     'text': {'type': 'plain_text',
-                             'text': f'Deploy to: {target_domain}'},
+                             'text': f'{modal_title}: {target_domain}'},
                 },
                 {
                     'type': 'context',
@@ -1854,17 +1933,7 @@ if _bolt_app is not None:
                 },
                 {
                     'type': 'section',
-                    'text': {
-                        'type': 'mrkdwn',
-                        'text': (
-                            ':warning: *This will overwrite the existing '
-                            f'lander on `{target_domain}`.*\n'
-                            'If a campaign is currently live on this domain, '
-                            'redeploying may interrupt it for up to 24h while '
-                            'DNS / CloudFront caches refresh. Make sure this '
-                            'domain is not running a live campaign.'
-                        ),
-                    },
+                    'text': {'type': 'mrkdwn', 'text': warning_text},
                 },
                 {'type': 'divider'},
                 {
@@ -1885,24 +1954,7 @@ if _bolt_app is not None:
                         'placeholder': {'type': 'plain_text', 'text': 'Pick an MDB'},
                     },
                 },
-                {
-                    'type': 'input',
-                    'block_id': 'lander_block',
-                    'label': {'type': 'plain_text',
-                              'text': 'Lander source URL — https://<bucket>/<folder>/'},
-                    'hint': {
-                        'type': 'plain_text',
-                        'text': ('The bucket name and folder are pulled from this URL. '
-                                 'e.g. https://safetyfirstauto.pro/h-insure-c/ '
-                                 'will copy from bucket safetyfirstauto.pro, folder h-insure-c/.'),
-                    },
-                    'element': {
-                        'type': 'url_text_input',
-                        'action_id': 'lander_input',
-                        'placeholder': {'type': 'plain_text',
-                                        'text': 'https://safetyfirstauto.pro/h-insure-c/'},
-                    },
-                },
+                lander_block,
                 {
                     'type': 'input',
                     'block_id': 'notes_block',
@@ -1937,18 +1989,28 @@ if _bolt_app is not None:
         meta = json.loads(view.get('private_metadata') or '{}')
         target_domain = meta.get('target_domain', '')
         vertical = meta.get('vertical', '')
+        setup_completed = bool(meta.get('setup_completed'))
 
         values = view['state']['values']
-        lander = (values['lander_block']['lander_input']['value'] or '').strip()
-        notes = (values['notes_block']['notes_input']['value'] or '').strip()
+        # lander_block.lander_input is None when the user left an
+        # optional field blank (retry-setup mode). Defensive `.get`
+        # chain so we never KeyError on missing pieces.
+        lander = ((values.get('lander_block') or {})
+                  .get('lander_input', {}).get('value') or '').strip()
+        notes = ((values.get('notes_block') or {})
+                 .get('notes_input', {}).get('value') or '').strip()
 
-        # Validate URL shape — must be parseable into bucket + folder so
-        # Phase 7 can use it as the source. Failing here keeps the modal
-        # open with the field highlighted in red.
-        _, _, url_err = _parse_lander_url(lander)
-        if url_err:
-            ack(response_action='errors', errors={'lander_block': url_err})
-            return
+        # Validate URL shape only when a URL was actually provided.
+        # Empty lander is a valid setup-only request (incomplete-setup
+        # path); empty lander on the deploy-redeploy path is also
+        # accepted now and treated as "you want to re-run setup but
+        # not touch the lander right now."
+        if lander:
+            _, _, url_err = _parse_lander_url(lander)
+            if url_err:
+                ack(response_action='errors',
+                    errors={'lander_block': url_err})
+                return
 
         ack()
 
@@ -1966,18 +2028,45 @@ if _bolt_app is not None:
 
         # 1. Send the deployment request to Utkarsh (or fallback to requester),
         # with a Mark Deployed button so he can close the loop in one click.
+        # When lander is blank, this is a setup-retry — Utkarsh doesn't
+        # need to deploy anything, just confirm the bot can re-run ATOM
+        # setup. Card copy adapts so he doesn't go looking for files
+        # to copy that don't exist.
+        if lander:
+            request_kind_emoji = ':rocket:'
+            request_kind_title = 'Lander deployment request'
+            lander_line = f'• Lander to deploy: {lander}\n'
+            action_instruction = (
+                '\n:point_right: Please confirm this domain is safe to '
+                'redeploy (no live campaign), deploy the lander files, '
+                'then click *Mark Deployed* below.'
+            )
+        else:
+            request_kind_emoji = ':wrench:'
+            request_kind_title = (
+                'Setup-retry request' if not setup_completed
+                else 'Setup-only redeploy request'
+            )
+            lander_line = (
+                '• Lander to deploy: _none — re-running ATOM setup only '
+                '(no file copy)_\n'
+            )
+            action_instruction = (
+                '\n:point_right: This re-runs ATOM\'s 9-step setup on '
+                'the domain. No file copy. Click *Mark Deployed* when '
+                'you\'re ready for the bot to start.'
+            )
+
         utkarsh_text = (
-            ':rocket: *Lander deployment request* :rocket:\n'
+            f'{request_kind_emoji} *{request_kind_title}* {request_kind_emoji}\n'
             f'• Requester: <@{requester}>'
             + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
             + f'\n'
             f'• Target domain: `{target_domain}`\n'
             f'• Vertical: `{vertical}`\n'
-            f'• Lander to deploy: {lander}\n'
+            + lander_line
             + (f'• Notes: _{notes}_\n' if notes else '')
-            + '\n:point_right: Please confirm this domain is safe to redeploy '
-            '(no live campaign), deploy the lander files, then click '
-            '*Mark Deployed* below.'
+            + action_instruction
         )
         client.chat_postMessage(
             channel=recipient,
