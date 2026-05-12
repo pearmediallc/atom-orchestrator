@@ -54,17 +54,24 @@ def main() -> int:
         from inventory import store
         from lifecycle.scan import run_scan, run_sla_escalation
         from lifecycle.inventory_digest import run_inventory_digest
+        from lifecycle.slack_sync import run_slack_users_sync
 
         store.init_db()
-        # 1. Classify every domain (ACTIVE / IDLE / EXPIRING_* / etc.)
+        # 1. Sync Slack workspace into slack_users cache FIRST — the
+        # classifier + digest downstream want fresh data on who exists,
+        # what their IDs are, and which previously-cached members have
+        # since left the workspace.
+        sync_counters = run_slack_users_sync()
+        # 2. Classify every domain (ACTIVE / IDLE / EXPIRING_* / etc.)
         scan_counters = run_scan()
-        # 2. Walk MDB-side AWAITING rows past SLA and DM TL with override
+        # 3. Walk MDB-side AWAITING rows past SLA and DM TL with override
         # buttons.
         sla_counters = run_sla_escalation()
-        # 3. Post the daily "available domains" digest to the developers
+        # 4. Post the daily "available domains" digest to the developers
         # channel. Opt-in via DEVELOPERS_CHANNEL_ID — empty disables.
         digest_counters = run_inventory_digest()
         print({
+            'slack_sync': sync_counters,
             'scan': scan_counters,
             'sla': sla_counters,
             'digest': digest_counters,

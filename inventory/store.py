@@ -150,6 +150,44 @@ CREATE TABLE IF NOT EXISTS domain_events (
 );
 CREATE INDEX IF NOT EXISTS idx_domain_events_domain      ON domain_events(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_events_occurred_at ON domain_events(occurred_at DESC);
+
+-- Phase E — slack_users: local cache of Slack workspace, kept in sync by
+-- a daily users.list pull. Slack workspace is the source of truth for
+-- "who exists, what's their ID". This table lets the bot resolve
+-- legacy free-text MDB names (from CSV imports) into stable Slack IDs.
+-- name_aliases stores every variant we've ever seen pointing at this
+-- person, so once a typo is resolved (via fuzzy match), it sticks.
+CREATE TABLE IF NOT EXISTS slack_users (
+    slack_user_id   TEXT PRIMARY KEY,
+    real_name       TEXT,
+    display_name    TEXT,
+    email           TEXT,
+    deleted         INTEGER NOT NULL DEFAULT 0,
+    first_seen_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    name_aliases    TEXT  -- JSON array of legacy name strings that map here
+);
+CREATE INDEX IF NOT EXISTS idx_slack_users_real_name ON slack_users(LOWER(real_name));
+CREATE INDEX IF NOT EXISTS idx_slack_users_email     ON slack_users(LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_slack_users_deleted   ON slack_users(deleted);
+
+-- Phase E — domain_assignments: append-only assignment ledger.
+-- A row records "this Slack user is/was assigned to this domain from
+-- assigned_at until ended_at". ended_at IS NULL = currently active.
+-- One domain can have multiple active assignments (multi-MDB support).
+-- The history of past assignments stays for audit.
+CREATE TABLE IF NOT EXISTS domain_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain          TEXT NOT NULL,
+    slack_user_id   TEXT NOT NULL,
+    assigned_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at        TIMESTAMP,
+    assigned_by     TEXT,
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_domain  ON domain_assignments(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_user    ON domain_assignments(slack_user_id);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_current ON domain_assignments(domain) WHERE ended_at IS NULL;
 """
 
 _POSTGRES_SCHEMA = """
@@ -202,6 +240,34 @@ CREATE TABLE IF NOT EXISTS domain_events (
 );
 CREATE INDEX IF NOT EXISTS idx_domain_events_domain      ON domain_events(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_events_occurred_at ON domain_events(occurred_at DESC);
+
+-- Phase E — see SQLite schema above for design rationale.
+CREATE TABLE IF NOT EXISTS slack_users (
+    slack_user_id   TEXT PRIMARY KEY,
+    real_name       TEXT,
+    display_name    TEXT,
+    email           TEXT,
+    deleted         BOOLEAN NOT NULL DEFAULT FALSE,
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_synced_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    name_aliases    JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_slack_users_real_name ON slack_users(LOWER(real_name));
+CREATE INDEX IF NOT EXISTS idx_slack_users_email     ON slack_users(LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_slack_users_deleted   ON slack_users(deleted);
+
+CREATE TABLE IF NOT EXISTS domain_assignments (
+    id              SERIAL PRIMARY KEY,
+    domain          TEXT NOT NULL,
+    slack_user_id   TEXT NOT NULL,
+    assigned_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at        TIMESTAMPTZ,
+    assigned_by     TEXT,
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_domain  ON domain_assignments(domain);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_user    ON domain_assignments(slack_user_id);
+CREATE INDEX IF NOT EXISTS idx_domain_assignments_current ON domain_assignments(domain) WHERE ended_at IS NULL;
 """
 
 # Columns added post-launch — these need to be ALTER-added on existing
@@ -916,6 +982,294 @@ def list_unassigned_domains(*, limit: int = 200) -> List[Dict]:
         if _is_postgres():
             cur.close()
     return [dict(r) for r in rows]
+
+
+# ─── Phase E — slack_users helpers ─────────────────────────────────────────
+# slack_users mirrors the Slack workspace. The daily sync UPSERTs every
+# active member into this table. Code that needs to DM "the MDB assigned
+# to this domain" should look up via JOIN to domain_assignments →
+# slack_users, NOT the legacy free-text domains.assigned_to column.
+
+def upsert_slack_user(
+    slack_user_id: str,
+    real_name: Optional[str],
+    display_name: Optional[str],
+    email: Optional[str],
+    *, deleted: bool = False,
+) -> None:
+    """Insert-or-update a Slack workspace member. Preserves
+    first_seen_at on update; refreshes last_synced_at every call.
+    Preserves name_aliases (adding aliases is a separate helper)."""
+    if _is_postgres():
+        sql = (
+            'INSERT INTO slack_users '
+            '(slack_user_id, real_name, display_name, email, deleted) '
+            'VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT (slack_user_id) DO UPDATE SET '
+            '  real_name = EXCLUDED.real_name, '
+            '  display_name = EXCLUDED.display_name, '
+            '  email = EXCLUDED.email, '
+            '  deleted = EXCLUDED.deleted, '
+            '  last_synced_at = NOW()'
+        )
+        params = (slack_user_id, real_name, display_name, email, deleted)
+    else:
+        sql = (
+            'INSERT INTO slack_users '
+            '(slack_user_id, real_name, display_name, email, deleted) '
+            'VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT(slack_user_id) DO UPDATE SET '
+            '  real_name = excluded.real_name, '
+            '  display_name = excluded.display_name, '
+            '  email = excluded.email, '
+            '  deleted = excluded.deleted, '
+            '  last_synced_at = CURRENT_TIMESTAMP'
+        )
+        params = (slack_user_id, real_name, display_name, email,
+                  1 if deleted else 0)
+    with _conn() as c:
+        cur = _execute(c, sql, params)
+        if _is_postgres():
+            cur.close()
+
+
+def mark_slack_user_deleted(slack_user_id: str) -> None:
+    """Soft-delete: row + ID stay (so old domain_assignments stay valid),
+    but `deleted` flag tells the bot to route this person's domains to
+    TL instead of attempting a DM."""
+    with _conn() as c:
+        if _is_postgres():
+            cur = _execute(
+                c,
+                'UPDATE slack_users SET deleted = TRUE, '
+                'last_synced_at = CURRENT_TIMESTAMP WHERE slack_user_id = ?',
+                (slack_user_id,),
+            )
+        else:
+            cur = _execute(
+                c,
+                'UPDATE slack_users SET deleted = 1, '
+                'last_synced_at = CURRENT_TIMESTAMP WHERE slack_user_id = ?',
+                (slack_user_id,),
+            )
+        if _is_postgres():
+            cur.close()
+
+
+def get_slack_user(slack_user_id: str) -> Optional[Dict]:
+    with _conn() as c:
+        cur = _execute(c, 'SELECT * FROM slack_users WHERE slack_user_id = ?',
+                       (slack_user_id,))
+        row = cur.fetchone()
+        if _is_postgres():
+            cur.close()
+    return dict(row) if row else None
+
+
+def lookup_slack_id_by_alias(alias: str) -> Optional[str]:
+    """Resolve a legacy free-text name to a Slack ID via name + aliases.
+    Returns None if no match. Case-insensitive."""
+    import json as _json
+    alias_lc = alias.strip().lower()
+    if not alias_lc:
+        return None
+    if _is_postgres():
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                'SELECT slack_user_id FROM slack_users '
+                'WHERE LOWER(real_name) = %s '
+                '   OR LOWER(display_name) = %s '
+                "   OR EXISTS (SELECT 1 FROM jsonb_array_elements_text("
+                "                 COALESCE(name_aliases, '[]'::jsonb)) v "
+                '              WHERE LOWER(v) = %s) '
+                'LIMIT 1',
+                (alias_lc, alias_lc, alias_lc),
+            )
+            row = cur.fetchone()
+            cur.close()
+        return row['slack_user_id'] if row else None
+    # SQLite path
+    with _conn() as c:
+        cur = c.execute(
+            'SELECT slack_user_id FROM slack_users '
+            'WHERE LOWER(real_name) = ? OR LOWER(display_name) = ? LIMIT 1',
+            (alias_lc, alias_lc),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return row['slack_user_id'] if hasattr(row, 'keys') else row[0]
+        cur = c.execute(
+            'SELECT slack_user_id, name_aliases FROM slack_users '
+            'WHERE name_aliases IS NOT NULL'
+        )
+        for r in cur.fetchall():
+            uid = r['slack_user_id'] if hasattr(r, 'keys') else r[0]
+            aj = r['name_aliases'] if hasattr(r, 'keys') else r[1]
+            try:
+                aliases = _json.loads(aj) if aj else []
+            except (ValueError, TypeError):
+                aliases = []
+            if any((a or '').strip().lower() == alias_lc for a in aliases):
+                return uid
+    return None
+
+
+def add_alias_to_slack_user(slack_user_id: str, alias: str) -> None:
+    """Append a name variant to a user's alias list. Idempotent
+    (case-insensitive duplicate check). Lets the backfill record that
+    a typo / variant resolved to this user so future imports skip the
+    fuzzy match step."""
+    import json as _json
+    alias_clean = (alias or '').strip()
+    if not alias_clean:
+        return
+    with _conn() as c:
+        cur = _execute(c, 'SELECT name_aliases FROM slack_users '
+                       'WHERE slack_user_id = ?', (slack_user_id,))
+        row = cur.fetchone()
+        if _is_postgres():
+            cur.close()
+        if not row:
+            return
+        current = row['name_aliases'] if hasattr(row, 'keys') else row[0]
+        if isinstance(current, list):
+            aliases = current
+        elif isinstance(current, str) and current.strip():
+            try:
+                aliases = _json.loads(current)
+            except (ValueError, TypeError):
+                aliases = []
+        else:
+            aliases = []
+        existing_lc = {(a or '').strip().lower() for a in aliases}
+        if alias_clean.lower() in existing_lc:
+            return
+        aliases.append(alias_clean)
+        new_json = _json.dumps(aliases)
+        cur = _execute(c, 'UPDATE slack_users SET name_aliases = ? '
+                       'WHERE slack_user_id = ?',
+                       (new_json, slack_user_id))
+        if _is_postgres():
+            cur.close()
+
+
+def list_slack_users(*, include_deleted: bool = False) -> List[Dict]:
+    """All workspace members. Used by the backfill + admin queries."""
+    if include_deleted:
+        sql = 'SELECT * FROM slack_users ORDER BY real_name'
+    else:
+        sql = (
+            'SELECT * FROM slack_users WHERE deleted = '
+            + ('FALSE' if _is_postgres() else '0')
+            + ' ORDER BY real_name'
+        )
+    with _conn() as c:
+        cur = _execute(c, sql)
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
+# ─── Phase E — domain_assignments helpers ──────────────────────────────────
+
+def current_assignments_for_domain(domain: str) -> List[Dict]:
+    """All active (ended_at IS NULL) assignments for a domain, plus the
+    underlying slack_user info. The bot DMs every active assignment."""
+    sql = (
+        'SELECT a.id, a.domain, a.slack_user_id, a.assigned_at, '
+        '       a.assigned_by, a.notes, '
+        '       u.real_name, u.display_name, u.email, u.deleted '
+        '  FROM domain_assignments a '
+        '  LEFT JOIN slack_users u ON u.slack_user_id = a.slack_user_id '
+        ' WHERE a.domain = ? AND a.ended_at IS NULL '
+        ' ORDER BY a.assigned_at ASC'
+    )
+    with _conn() as c:
+        cur = _execute(c, sql, (domain,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
+def list_assignments(domain: str) -> List[Dict]:
+    """Full assignment history for a domain — including ended ones."""
+    sql = (
+        'SELECT a.id, a.domain, a.slack_user_id, a.assigned_at, a.ended_at, '
+        '       a.assigned_by, a.notes, u.real_name, u.email '
+        '  FROM domain_assignments a '
+        '  LEFT JOIN slack_users u ON u.slack_user_id = a.slack_user_id '
+        ' WHERE a.domain = ? '
+        ' ORDER BY a.assigned_at DESC, a.id DESC'
+    )
+    with _conn() as c:
+        cur = _execute(c, sql, (domain,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
+def assign_domain(
+    domain: str,
+    slack_user_id: str,
+    *,
+    assigned_by: Optional[str] = None,
+    notes: Optional[str] = None,
+    end_others: bool = False,
+) -> int:
+    """Insert a new active assignment for the domain. Returns row id.
+
+    `end_others=True` ends every other active assignment first (use for
+    exclusive single-MDB assignment). Default False keeps existing
+    assignments active, supporting multi-MDB.
+    """
+    with _conn() as c:
+        if end_others:
+            cur = _execute(
+                c,
+                'UPDATE domain_assignments SET ended_at = CURRENT_TIMESTAMP '
+                'WHERE domain = ? AND ended_at IS NULL',
+                (domain,),
+            )
+            if _is_postgres():
+                cur.close()
+        sql = (
+            'INSERT INTO domain_assignments '
+            '(domain, slack_user_id, assigned_by, notes) '
+            'VALUES (?, ?, ?, ?)'
+        )
+        if _is_postgres():
+            cur = c.cursor()
+            cur.execute(_q(sql) + ' RETURNING id',
+                        (domain, slack_user_id, assigned_by, notes))
+            row = cur.fetchone()
+            cur.close()
+            return row['id']
+        cur = c.execute(sql, (domain, slack_user_id, assigned_by, notes))
+        return cur.lastrowid
+
+
+def end_assignment(
+    domain: str, slack_user_id: str, *, by: Optional[str] = None,
+) -> int:
+    """End all active assignments for (domain, slack_user_id). Returns
+    rowcount."""
+    note_suffix = f' [ended by {by}]' if by else ''
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domain_assignments SET ended_at = CURRENT_TIMESTAMP, '
+            "notes = COALESCE(notes, '') || ? "
+            'WHERE domain = ? AND slack_user_id = ? AND ended_at IS NULL',
+            (note_suffix, domain, slack_user_id),
+        )
+        rowcount = cur.rowcount if hasattr(cur, 'rowcount') else 0
+        if _is_postgres():
+            cur.close()
+    return rowcount
 
 
 def get_domains_due_for_namecheap_sync(
