@@ -136,6 +136,32 @@ def _recent_spend(domain: str) -> float:
         return 0.0
 
 
+def _check_still_actionable(client, body, domain: str, expected_state: str) -> bool:
+    """Phase E race-condition guard. With multi-MDB DMs, two assignees
+    might both receive the prompt and click at the same time. Only the
+    first click should mutate state — the second sees the state has
+    already advanced and gets an ephemeral notice.
+
+    Returns True if the row is still in the expected starting state
+    (the handler should proceed), False if not (ephemeral sent, handler
+    should return).
+    """
+    current = (store.get_domain(domain) or {}).get('lifecycle_state')
+    if current == expected_state:
+        return True
+    try:
+        client.chat_postEphemeral(
+            channel=body['channel']['id'],
+            user=body['user']['id'],
+            text=(f':information_source: `{domain}` was already actioned '
+                  f'by someone else (state is now `{current}`). Your click '
+                  'was ignored to avoid conflicting decisions.'),
+        )
+    except Exception:
+        logger.exception('chat_postEphemeral failed in race-guard')
+    return False
+
+
 # ─── Handler registration ─────────────────────────────────────────────────
 
 def register(app) -> None:
@@ -156,6 +182,11 @@ def register(app) -> None:
         if not _enforce(actor, assigned, ack, role='MDB usage'):
             _ephemeral_not_for_you(client, body['channel']['id'], actor,
                                    'MDB usage')
+            return
+
+        # Race guard: multi-MDB DM may have raced another assignee.
+        if not _check_still_actionable(client, body, domain,
+                                       S.AWAITING_MDB_USAGE_RESPONSE):
             return
 
         # Forward to Utkarsh + flip state.
@@ -209,6 +240,11 @@ def register(app) -> None:
         if not _enforce(actor, assigned, ack, role='MDB usage'):
             _ephemeral_not_for_you(client, body['channel']['id'], actor,
                                    'MDB usage')
+            return
+
+        # Race guard: multi-MDB DM may have raced another assignee.
+        if not _check_still_actionable(client, body, domain,
+                                       S.AWAITING_MDB_USAGE_RESPONSE):
             return
 
         # Contradiction guard: MDB says "not using" but recent spend
@@ -392,6 +428,12 @@ def register(app) -> None:
                                        'MDB inventory')
                 return
 
+            # Race guard: multi-MDB DM may have raced another assignee.
+            if not _check_still_actionable(
+                client, body, domain, S.AWAITING_MDB_INVENTORY_RESPONSE,
+            ):
+                return
+
             new_state = S.EXTENDED_30 if days == 30 else S.EXTENDED_15
             store.set_lifecycle_state(domain, new_state)
             store.record_event(
@@ -430,15 +472,31 @@ def register(app) -> None:
                                    'MDB inventory')
             return
 
+        # Race guard: multi-MDB DM may have raced another assignee.
+        if not _check_still_actionable(client, body, domain,
+                                       S.AWAITING_MDB_INVENTORY_RESPONSE):
+            return
+
         # Per design: leave AWS resources alive (cert / R53 / CF / S3)
-        # so rotation reuse is fast. We only nullify ownership.
+        # so rotation reuse is fast. We only release ownership.
+        # Phase E: end ALL active assignments (multi-MDB safe) AND clear
+        # the legacy assigned_to column for backwards-compat reads.
+        previous_assignments = [
+            a['slack_user_id']
+            for a in store.current_assignments_for_domain(domain)
+        ]
+        for uid in previous_assignments:
+            store.end_assignment(domain, uid, by=actor)
         store.assign_to(domain, None)
         store.set_lifecycle_state(domain, S.INVENTORY)
         store.record_event(
             domain, 'pushed_to_inventory', actor=actor,
             from_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
             to_state=S.INVENTORY,
-            metadata={'previous_assigned_to': assigned},
+            metadata={
+                'previous_assigned_to_legacy': assigned,
+                'previous_assignments': previous_assignments,
+            },
         )
         _replace_card(
             client, body,

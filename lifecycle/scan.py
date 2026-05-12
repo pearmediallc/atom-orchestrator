@@ -68,9 +68,20 @@ def run_scan(
     rows = store.list_domains_for_lifecycle(
         exclude_states=S.AWAITING_STATES,
     )
+    # Phase E: pre-load all current assignments so the classifier
+    # doesn't have to issue 744 lookups. One SELECT covers the lot.
+    try:
+        bulk_assignments = store.bulk_current_assignments()
+    except Exception:
+        logger.exception('bulk_current_assignments failed — falling back '
+                         'to legacy domains.assigned_to for this run')
+        bulk_assignments = {}
+
     logger.info(
-        'lifecycle scan starting — %d domains to classify, %d hosts in spend data, dry_run=%s',
-        len(rows), len(spend_by_host), Config.LIFECYCLE_DRY_RUN,
+        'lifecycle scan starting — %d domains to classify, %d hosts in spend data, '
+        '%d domains with active assignments, dry_run=%s',
+        len(rows), len(spend_by_host), len(bulk_assignments),
+        Config.LIFECYCLE_DRY_RUN,
     )
 
     counters = {
@@ -80,7 +91,10 @@ def run_scan(
 
     for row in rows:
         try:
-            outcome = _process_row(slack_client, row, spend_by_host, today)
+            outcome = _process_row(
+                slack_client, row, spend_by_host, today,
+                bulk_assignments=bulk_assignments,
+            )
             counters[outcome] = counters.get(outcome, 0) + 1
         except Exception:
             logger.exception(
@@ -101,16 +115,23 @@ def _make_slack_client():
     return WebClient(token=Config.SLACK_BOT_TOKEN)
 
 
-def _process_row(slack_client, row: dict, spend_by_host, today) -> str:
+def _process_row(slack_client, row: dict, spend_by_host, today,
+                 *, bulk_assignments=None) -> str:
     """Decide + dispatch for one domain. Returns one of:
         'classified' | 'prompted' | 'unchanged' | 'skipped' | 'errors'
     so the caller can tally counters.
+
+    `bulk_assignments` is the pre-loaded {domain: [slack_user_id, ...]}
+    map from store.bulk_current_assignments(). When provided, the
+    classifier uses it as the authoritative is-assigned signal.
     """
     domain = row['domain']
     current = row.get('lifecycle_state')
 
     spend = spend_by_host.get(domain.lower(), {})
-    new_state = classify_domain(row, spend, today=today)
+    assignees = (bulk_assignments or {}).get(domain, []) if bulk_assignments is not None else None
+    new_state = classify_domain(row, spend, today=today,
+                                current_assignees=assignees)
 
     if new_state is None:
         return 'skipped'
@@ -183,29 +204,45 @@ def _handle_expired(slack_client, row, from_state, spend) -> str:
 def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
     """TL Flow 2 — MDB hasn't run any spend in 30 days. Ask whether to
     keep the domain (30/15-day snooze) or push it to the inventory pool.
-    """
+
+    Multi-MDB: when a domain has multiple active assignments, DM each
+    MDB separately so any of them can answer. First click wins (handler
+    guards against double-action via state check)."""
     domain = row['domain']
-    assigned = row.get('assigned_to')
+    assignees = _dm.get_mdb_slack_ids_for_domain(domain, row=row)
+
+    if not assignees:
+        # No resolvable MDB at all → escalate straight to TL
+        _dm.dm(
+            slack_client, real_recipient=Config.TL_SLACK_USER_ID,
+            text=(f':warning: `{domain}` is idle but no resolvable MDB '
+                  '(assigned_to empty or unresolved). Reassign or push to inventory.'),
+            dry_run_label=f'idle_no_mdb:{domain}',
+        )
+        return 'skipped'
 
     if not _dedup_ok(row):
         return 'skipped'
 
-    blocks = _idle_card(domain, assigned, spend)
-    sent = _dm.dm(
-        slack_client, real_recipient=assigned,
-        text=(f'Heads up — `{domain}` had no spend in the last 30 days. '
-              'keep it, or push to inventory?'),
-        blocks=blocks,
-        dry_run_label=f'idle_prompt:{domain}',
-    )
-    if sent is None:
-        # No recipient → escalate straight to TL so the domain isn't
-        # stuck in limbo waiting for someone who can't be DM'd.
+    sent_any = False
+    for mdb_uid in assignees:
+        blocks = _idle_card(domain, mdb_uid, spend)
+        sent = _dm.dm(
+            slack_client, real_recipient=mdb_uid,
+            text=(f'Heads up — `{domain}` had no spend in the last 30 days. '
+                  'keep it, or push to inventory?'),
+            blocks=blocks,
+            dry_run_label=f'idle_prompt:{domain}:{mdb_uid}',
+        )
+        if sent is not None:
+            sent_any = True
+
+    if not sent_any:
         _dm.dm(
             slack_client, real_recipient=Config.TL_SLACK_USER_ID,
-            text=(f':warning: `{domain}` is idle but has no MDB to DM '
-                  '(assigned_to is empty). Reassign or push to inventory.'),
-            dry_run_label=f'idle_no_mdb:{domain}',
+            text=(f':warning: `{domain}` is idle but every DM attempt '
+                  f'failed (assignees: {assignees}). Reassign or push to inventory.'),
+            dry_run_label=f'idle_dm_failed:{domain}',
         )
         return 'skipped'
 
@@ -214,7 +251,7 @@ def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
     store.record_event(
         domain, 'prompted_mdb_idle', actor='cron',
         from_state=from_state, to_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
-        metadata={'spend': spend, 'assigned_to': assigned},
+        metadata={'spend': spend, 'assignees': assignees},
     )
     return 'prompted'
 
@@ -222,30 +259,47 @@ def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
 def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str:
     """TL Flow 1 — domain is actively spending AND expiring soon.
     Ask MDB if they're still using it. The 4-stage cascade
-    (EXPIRING_30/14/7/1) all enter through here; the urgency in the
-    DM copy escalates by stage."""
+    (EXPIRING_30/14/7/1) all enter through here; urgency escalates
+    via the days_left label in the DM copy.
+
+    Multi-MDB: same pattern as _prompt_mdb_idle — DM each assignee
+    independently, first click wins (handler guards via state check)."""
     domain = row['domain']
-    assigned = row.get('assigned_to')
+    assignees = _dm.get_mdb_slack_ids_for_domain(domain, row=row)
     days_left_label = new_state.removeprefix('EXPIRING_')
+
+    if not assignees:
+        _dm.dm(
+            slack_client, real_recipient=Config.TL_SLACK_USER_ID,
+            text=(f':warning: `{domain}` expires in ~{days_left_label} day(s) '
+                  'but no resolvable MDB. Decide on renew vs lapse manually.'),
+            dry_run_label=f'expiring_no_mdb:{domain}',
+        )
+        return 'skipped'
 
     if not _dedup_ok(row):
         return 'skipped'
 
-    blocks = _expiring_card(domain, assigned, days_left_label, new_state, spend)
-    sent = _dm.dm(
-        slack_client, real_recipient=assigned,
-        text=(f'`{domain}` expires in ~{days_left_label} day(s). '
-              'are you still using it?'),
-        blocks=blocks,
-        dry_run_label=f'expiring_{days_left_label}:{domain}',
-    )
-    if sent is None:
+    sent_any = False
+    for mdb_uid in assignees:
+        blocks = _expiring_card(domain, mdb_uid, days_left_label, new_state, spend)
+        sent = _dm.dm(
+            slack_client, real_recipient=mdb_uid,
+            text=(f'`{domain}` expires in ~{days_left_label} day(s). '
+                  'are you still using it?'),
+            blocks=blocks,
+            dry_run_label=f'expiring_{days_left_label}:{domain}:{mdb_uid}',
+        )
+        if sent is not None:
+            sent_any = True
+
+    if not sent_any:
         _dm.dm(
             slack_client, real_recipient=Config.TL_SLACK_USER_ID,
-            text=(f':warning: `{domain}` expires in ~{days_left_label} day(s) '
-                  'but has no MDB to DM (assigned_to is empty). Decide on '
-                  'renew vs lapse manually.'),
-            dry_run_label=f'expiring_no_mdb:{domain}',
+            text=(f':warning: `{domain}` expires in ~{days_left_label} day(s); '
+                  f'every DM attempt failed (assignees: {assignees}). '
+                  'Decide manually.'),
+            dry_run_label=f'expiring_dm_failed:{domain}',
         )
         return 'skipped'
 
@@ -255,7 +309,7 @@ def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str
         domain, 'prompted_mdb_usage', actor='cron',
         from_state=from_state, to_state=S.AWAITING_MDB_USAGE_RESPONSE,
         metadata={
-            'spend': spend, 'assigned_to': assigned,
+            'spend': spend, 'assignees': assignees,
             'days_until_expiry': days_left_label,
             'expiring_state': new_state,
         },

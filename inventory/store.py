@@ -1252,6 +1252,77 @@ def assign_domain(
         return cur.lastrowid
 
 
+def bulk_current_assignments() -> Dict[str, List[str]]:
+    """All active assignments, keyed by domain. {domain: [slack_user_id, ...]}.
+    One SELECT for the whole table — used by the cron classifier to avoid
+    N+1 lookups when processing 744 rows."""
+    sql = (
+        'SELECT a.domain, a.slack_user_id, u.deleted '
+        '  FROM domain_assignments a '
+        '  LEFT JOIN slack_users u ON u.slack_user_id = a.slack_user_id '
+        ' WHERE a.ended_at IS NULL '
+        ' ORDER BY a.domain, a.assigned_at ASC'
+    )
+    out: Dict[str, List[str]] = {}
+    with _conn() as c:
+        cur = _execute(c, sql)
+        for r in cur.fetchall():
+            d = r['domain'] if hasattr(r, 'keys') else r[0]
+            u = r['slack_user_id'] if hasattr(r, 'keys') else r[1]
+            deleted = r['deleted'] if hasattr(r, 'keys') else r[2]
+            # Skip Slack users we know have left the workspace.
+            if deleted in (1, True):
+                continue
+            out.setdefault(d, []).append(u)
+        if _is_postgres():
+            cur.close()
+    return out
+
+
+def list_domains_with_no_active_assignment(
+    *, limit: int = 200,
+) -> List[Dict]:
+    """Inventory pool: domains with no current `domain_assignments` row
+    AND no legacy `assigned_to` value.
+
+    Migration-safe: filters by BOTH new schema AND legacy column. Once
+    backfill has migrated every assigned row into domain_assignments and
+    the legacy column is dropped (future work), this query reduces to
+    just the NOT EXISTS clause.
+
+    Sort: closest expiry first (rotation candidates), NULLS LAST.
+    """
+    common_filter = (
+        ' WHERE NOT EXISTS ('
+        '   SELECT 1 FROM domain_assignments a '
+        '    WHERE a.domain = d.domain AND a.ended_at IS NULL '
+        ' ) '
+        "   AND (d.assigned_to IS NULL OR d.assigned_to = '') "
+    )
+    if _is_postgres():
+        sql = (
+            'SELECT d.* FROM domains d '
+            + common_filter +
+            'ORDER BY d.expire_at ASC NULLS LAST '
+            'LIMIT ?'
+        )
+    else:
+        sql = (
+            'SELECT d.* FROM domains d '
+            + common_filter +
+            'ORDER BY '
+            '   CASE WHEN d.expire_at IS NULL THEN 1 ELSE 0 END, '
+            '   d.expire_at ASC '
+            'LIMIT ?'
+        )
+    with _conn() as c:
+        cur = _execute(c, sql, (limit,))
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
 def end_assignment(
     domain: str, slack_user_id: str, *, by: Optional[str] = None,
 ) -> int:

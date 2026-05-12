@@ -40,6 +40,7 @@ def classify_domain(
     spend_data: Optional[Dict[str, float]] = None,
     *,
     today: Optional[_dt.date] = None,
+    current_assignees: Optional[list] = None,
 ) -> Optional[str]:
     """Decide what lifecycle_state `row` should be in.
 
@@ -48,13 +49,14 @@ def classify_domain(
     within the post-assignment grace window).
 
     Args:
-      row: a `domains` row as a dict (output of inventory.store.get_domain).
-           Must contain at least: lifecycle_state, assigned_to, expire_at,
-           last_active_at, purchased_at.
-      spend_data: `{cost, revenue, …}` for this domain from
-           redtrack_client.get_domain_spend_revenue_30d. Pass {} when the
-           classifier sees no data for this host.
+      row: a `domains` row as a dict.
+      spend_data: `{cost, revenue, …}` for this domain from RedTrack.
       today: override for tests. Defaults to date.today().
+      current_assignees: optional list of Slack user IDs from
+        domain_assignments (Phase E). When None, classifier falls back
+        to the legacy `row['assigned_to']` field. Pre-loading this in
+        bulk via store.bulk_current_assignments() and passing it in
+        avoids N+1 lookups when classifying 744 rows.
     """
     spend = spend_data or {}
     today = today or _dt.date.today()
@@ -64,11 +66,15 @@ def classify_domain(
         return None
 
     # 2. No assigned MDB → goes to inventory.
-    # We only force-flip to INVENTORY if the row isn't already in a
-    # post-action terminal state; otherwise we'd undo an EXTENDED_30/15
-    # the next pass. Domains in EXTENDED_* expire back to None when the
-    # snooze elapses (handler responsibility).
-    if not (row.get('assigned_to') or '').strip():
+    # UNION semantics during migration: assigned if EITHER the new
+    # domain_assignments table OR the legacy assigned_to column says so.
+    # This way pre-backfill rows (where current_assignees is [] but
+    # legacy column has a name) don't get incorrectly pushed to INVENTORY.
+    has_new = bool(current_assignees)
+    has_legacy = bool((row.get('assigned_to') or '').strip())
+    is_assigned = has_new or has_legacy
+
+    if not is_assigned:
         if row.get('lifecycle_state') in (
             S.EXTENDED_30, S.EXTENDED_15,
         ):

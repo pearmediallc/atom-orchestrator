@@ -290,11 +290,11 @@ def test_one_row_failure_does_not_abort_scan(tmp_inventory, monkeypatch):
     real_process = scan._process_row
     call_count = {'n': 0}
 
-    def faulty_process(client, row, spend, today):
+    def faulty_process(client, row, spend, today, **kwargs):
         call_count['n'] += 1
         if row['domain'] == 'bad.com':
             raise RuntimeError('synthetic test failure')
-        return real_process(client, row, spend, today)
+        return real_process(client, row, spend, today, **kwargs)
 
     monkeypatch.setattr(scan, '_process_row', faulty_process)
     client = _slack_client()

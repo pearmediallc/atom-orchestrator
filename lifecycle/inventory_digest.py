@@ -57,7 +57,17 @@ def run_inventory_digest(
         counters['skipped'] = 1
         return counters
 
-    rows = store.list_unassigned_domains(limit=_MAX_DOMAINS_PER_MESSAGE * 4)
+    # Phase E: prefer the new "no current assignment in domain_assignments"
+    # check. Falls back to the legacy assigned_to filter when the new
+    # table is empty (pre-backfill state) so the digest still works
+    # during the migration window.
+    rows = store.list_domains_with_no_active_assignment(
+        limit=_MAX_DOMAINS_PER_MESSAGE * 4,
+    )
+    if not rows:
+        rows = store.list_unassigned_domains(
+            limit=_MAX_DOMAINS_PER_MESSAGE * 4,
+        )
     counters['unassigned'] = len(rows)
     if not rows:
         logger.info('inventory digest skipped — 0 unassigned domains')

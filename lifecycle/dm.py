@@ -46,6 +46,49 @@ def normalise_slack_id(value: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def get_mdb_slack_ids_for_domain(
+    domain: str, *, row: Optional[dict] = None,
+) -> List[str]:
+    """Return all Slack user IDs to DM for this domain's MDB(s).
+
+    Authoritative source: domain_assignments (Phase E). The legacy
+    `domains.assigned_to` is read only as a fallback for rows the
+    backfill hasn't reached yet — once backfill_assignments has run on
+    prod, branch 1 handles every resolvable row.
+
+    Order of precedence:
+      1. Active rows in domain_assignments (excludes deleted users)
+      2. Legacy domains.assigned_to if it's already a Slack ID
+      3. Legacy domains.assigned_to resolved via slack_users name match
+      4. Empty list (domain is unassigned → goes to inventory pool)
+    """
+    from inventory import store as _store
+
+    current = _store.current_assignments_for_domain(domain)
+    if current:
+        return [a['slack_user_id'] for a in current
+                if not (a.get('deleted') in (1, True))]
+
+    if row is None:
+        row = _store.get_domain(domain)
+    if not row:
+        return []
+    legacy = (row.get('assigned_to') or '').strip()
+    if not legacy:
+        return []
+    if legacy.startswith('Slack:'):
+        legacy = legacy[6:].strip()
+    # Slack-ID heuristic: starts with U or W, only alphanumerics +
+    # underscores, no spaces. Real Slack IDs match; test fixtures like
+    # 'U_NEERAJ' also match. Free-text names ('Neeraj Nitin Tanish')
+    # don't (spaces) and fall through to alias resolution.
+    if (legacy and legacy[0] in ('U', 'W') and len(legacy) >= 2
+            and all(c.isalnum() or c == '_' for c in legacy)):
+        return [legacy]
+    uid = _store.lookup_slack_id_by_alias(legacy)
+    return [uid] if uid else []
+
+
 def dm(
     client,
     *,

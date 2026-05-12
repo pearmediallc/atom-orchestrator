@@ -818,6 +818,148 @@ if _bolt_app is not None:
             'text': f'Timeline for {domain}',
         })
 
+    @_bolt_app.command('/reassign-domain')
+    def handle_reassign_domain(ack, respond, command):
+        """Reassign a domain to one or more MDBs.
+
+            /reassign-domain mybusiness.com @anusree
+            /reassign-domain mybusiness.com @anusree @rajat   (multi-MDB)
+            /reassign-domain mybusiness.com clear             (release to inventory)
+
+        Ends every active assignment for the domain, then inserts new
+        rows in domain_assignments. Writes a `reassigned` event for
+        /domain-history. Updates legacy domains.assigned_to for
+        backwards-compat (first new MDB wins on that column).
+
+        Anyone in the workspace can run this — per Q2 design decision,
+        reassignment is operational, not policy.
+        """
+        ack()
+        actor = command.get('user_id', '')
+        text = (command.get('text') or '').strip()
+
+        if not text:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (
+                    'Usage: `/reassign-domain <domain> @user1 [@user2 ...]`\n'
+                    'or: `/reassign-domain <domain> clear` to release into '
+                    'the inventory pool.'
+                ),
+            })
+            return
+
+        parts = text.split()
+        domain_raw = parts[0]
+        # Normalise domain (strip protocol + path)
+        domain = domain_raw.lower()
+        for prefix in ('https://', 'http://', 'www.'):
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+        domain = domain.split('/')[0]
+
+        row = inventory_store.get_domain(domain)
+        if not row:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (f':no_entry: `{domain}` is not in inventory. Check '
+                         'the spelling or use `/list-domains` to find it.'),
+            })
+            return
+
+        # Parse mentions. Slack passes user mentions as `<@U_XXX|username>`
+        # in command text. The 'clear' keyword releases the domain.
+        targets = parts[1:]
+        if len(targets) == 1 and targets[0].lower() == 'clear':
+            new_assignees = []
+        else:
+            import re as _re
+            new_assignees = []
+            for t in targets:
+                m = _re.match(r'<@([A-Z0-9]+)(?:\|.*)?>', t)
+                if m:
+                    new_assignees.append(m.group(1))
+                else:
+                    respond({
+                        'response_type': 'ephemeral',
+                        'text': (f':no_entry: Couldn\'t parse {t!r} as a '
+                                 'Slack user mention. Use `@username` so '
+                                 'Slack expands it into a user reference.'),
+                    })
+                    return
+            if not new_assignees:
+                respond({
+                    'response_type': 'ephemeral',
+                    'text': (':no_entry: No users specified. Use '
+                             '`/reassign-domain <domain> @user` or '
+                             '`@user1 @user2 ...` or `clear`.'),
+                })
+                return
+
+        # Verify each target exists in slack_users (sanity check before write)
+        unknown = []
+        for uid in new_assignees:
+            if inventory_store.get_slack_user(uid) is None:
+                unknown.append(uid)
+        if unknown:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (f':warning: Don\'t recognise these Slack users in '
+                         f'our cache: {unknown}. The daily Slack sync may not '
+                         'have run yet, or they\'re not workspace members. '
+                         'Try again after the next 7 PM IST cron run, or '
+                         '`@`-mention real workspace members only.'),
+            })
+            return
+
+        # End every existing active assignment
+        previous = [a['slack_user_id']
+                    for a in inventory_store.current_assignments_for_domain(domain)]
+        for uid in previous:
+            inventory_store.end_assignment(domain, uid, by=actor)
+
+        # Insert each new assignment
+        for uid in new_assignees:
+            inventory_store.assign_domain(
+                domain, uid,
+                assigned_by=actor,
+                notes='via /reassign-domain',
+            )
+
+        # Keep legacy assigned_to in sync for any code still reading it
+        # (first new MDB wins; multi-MDB callers should use the new schema).
+        legacy_value = new_assignees[0] if new_assignees else None
+        inventory_store.assign_to(domain, legacy_value)
+
+        # Audit event for /domain-history
+        inventory_store.record_event(
+            domain, 'reassigned', actor=actor,
+            metadata={
+                'previous_assignees': previous,
+                'new_assignees': new_assignees,
+                'via': 'slash_command',
+            },
+        )
+
+        # Friendly confirmation
+        if new_assignees:
+            who = ', '.join(f'<@{u}>' for u in new_assignees)
+            respond({
+                'response_type': 'ephemeral',
+                'text': (f':white_check_mark: `{domain}` reassigned to {who}.'
+                         + (f' Previous: {", ".join(f"<@{u}>" for u in previous)}.'
+                            if previous else '')),
+            })
+        else:
+            respond({
+                'response_type': 'ephemeral',
+                'text': (f':package: `{domain}` released into the inventory '
+                         'pool. It will show up in tomorrow\'s '
+                         '#developers digest.'
+                         + (f' Previous: {", ".join(f"<@{u}>" for u in previous)}.'
+                            if previous else '')),
+            })
+
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
         """Open the new-domain modal."""
@@ -2056,6 +2198,12 @@ def slash_list_domains():
 @slack_bp.route('/slash/domain-history', methods=['POST'])
 def slash_domain_history():
     return _bolt_or_stub('Coming soon: /domain-history (Phase D). '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
+@slack_bp.route('/slash/reassign-domain', methods=['POST'])
+def slash_reassign_domain():
+    return _bolt_or_stub('Coming soon: /reassign-domain (Phase E). '
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 
