@@ -447,40 +447,75 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     Thread-safety: inventory_store opens a fresh sqlite connection per
     call, and the Slack WebClient is stateless wrt the auth token.
     """
-    url_bucket, url_folders, url_err = _parse_lander_url(lander_url)
-    if url_bucket:
-        source_bucket = url_bucket
-        source_folders = url_folders
-        source_files = []
-        # Account still comes from per-vertical config — the URL only
-        # tells us WHERE the files are, not which AWS creds can read them.
-        source_account = Config.phase7_defaults_for(vertical)['source_account']
-        source_origin = f'parsed from lander URL `{lander_url}`'
-    else:
-        defaults = Config.phase7_defaults_for(vertical)
-        source_bucket = defaults['source_bucket']
-        source_folders = defaults['source_folders']
-        source_files = defaults['source_files']
-        source_account = defaults['source_account']
-        source_origin = (
-            'config defaults '
-            f'(URL parse failed: {url_err})' if lander_url
-            else 'config defaults (no lander URL provided)'
-        )
+    # Three intentional cases:
+    #   1. Empty lander_url  → setup-only run. Pass empty source to the
+    #      workflow; run_existing_domain_workflow has a dedicated branch
+    #      that runs ATOM setup but skips copy_files (added 2026-05-11
+    #      when the modal made lander URL optional).
+    #   2. Parseable URL     → standard deploy. Source is URL-derived.
+    #   3. Unparseable URL   → fall back to per-vertical defaults, then
+    #      warn if even defaults don't have a source.
+    #
+    # Before this branching the worker treated case 1 as "no source
+    # configured" and short-circuited with the legacy "URL is empty"
+    # warning — which contradicted the modal's "lander is optional"
+    # contract and left freshly-purchased setup-only domains stuck at
+    # status=PENDING with setup_at=NULL forever (audit 2026-05-12 in
+    # prod).
+    lander_url = (lander_url or '').strip()
 
-    if not source_bucket:
+    if not lander_url:
+        source_bucket = ''
+        source_folders = []
+        source_files = []
+        # Source account is still meaningful even for setup-only —
+        # workflow may use it for cross-account permissions or future
+        # copy operations triggered by a later /list-domains redeploy.
+        source_account = Config.phase7_defaults_for(vertical)['source_account']
+        source_origin = (
+            'setup-only run (no lander URL provided — AWS infrastructure '
+            'will be provisioned, no file copy)'
+        )
+    else:
+        url_bucket, url_folders, url_err = _parse_lander_url(lander_url)
+        if url_bucket:
+            source_bucket = url_bucket
+            source_folders = url_folders
+            source_files = []
+            # Account still comes from per-vertical config — the URL only
+            # tells us WHERE the files are, not which AWS creds can read them.
+            source_account = Config.phase7_defaults_for(vertical)['source_account']
+            source_origin = f'parsed from lander URL `{lander_url}`'
+        else:
+            defaults = Config.phase7_defaults_for(vertical)
+            source_bucket = defaults['source_bucket']
+            source_folders = defaults['source_folders']
+            source_files = defaults['source_files']
+            source_account = defaults['source_account']
+            source_origin = (
+                f'config defaults (lander URL `{lander_url}` failed to '
+                f'parse: {url_err})'
+            )
+
+    # Genuine user-error short-circuit: a URL was provided but didn't
+    # parse AND no per-vertical fallback exists. Distinct from the
+    # setup-only path above (which intentionally has empty source).
+    if not source_bucket and lander_url:
         client.chat_postMessage(
             channel=channel, thread_ts=message_ts,
             text=(f':warning: *Phase 7 cannot deploy* — '
-                  f'{url_err or "no source bucket configured"}.\n'
-                  'Inventory was updated but the lander was NOT actually deployed.\n'
-                  '_Tip: use the form `https://<bucket>/<folder>/` in the lander '
-                  'URL field next time and the bot will figure out the rest._'),
+                  f'lander URL `{lander_url}` did not parse and no '
+                  'fallback source is configured for this vertical.\n'
+                  'Inventory was updated but the lander was NOT '
+                  'actually deployed.\n'
+                  '_Tip: use the form `https://<bucket>/<folder>/` in '
+                  'the lander URL field next time and the bot will '
+                  'figure out the rest._'),
         )
         try:
             inventory_store.record_event(
                 target_domain, 'phase7_skipped', actor='cron',
-                metadata={'reason': url_err or 'no_source_bucket',
+                metadata={'reason': 'unparseable_lander_url_no_fallback',
                           'lander_url': lander_url},
             )
         except Exception:
@@ -517,12 +552,24 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
         record_now = {}
     already_setup = bool(record_now.get('setup_at'))
 
+    # Header line for source — render `—` (em-dash) for the
+    # setup-only path so we don't show ugly empty backticks "``" in
+    # Slack.
+    source_bucket_line = (
+        f'• source bucket: `{source_bucket}`' if source_bucket
+        else '• source: _none (setup-only)_'
+    )
+    source_folders_line = (
+        f'• source folders: `{source_folders}`' if source_folders
+        else ''
+    )
+
     if already_setup:
         header_text = (
             f':package: *Deploying lander to* `{target_domain}`\n'
-            f'• source bucket: `{source_bucket}`\n'
-            f'• source folders: `{source_folders or "—"}`\n'
-            f'• source resolved from: _{source_origin}_\n'
+            f'{source_bucket_line}\n'
+            + (f'{source_folders_line}\n' if source_folders_line else '')
+            + f'• source resolved from: _{source_origin}_\n'
             f'• ATOM setup: _already complete '
             f'(skipping cert / R53 / CloudFront — only copying files)_\n'
             '_This usually takes 1–2 minutes — file copy only._'
@@ -539,9 +586,9 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
     else:
         header_text = (
             f':rocket: *Triggering ATOM setup* for `{target_domain}`\n'
-            f'• source bucket: `{source_bucket}`\n'
-            f'• source folders: `{source_folders or "—"}`\n'
-            f'• source resolved from: _{source_origin}_\n'
+            f'{source_bucket_line}\n'
+            + (f'{source_folders_line}\n' if source_folders_line else '')
+            + f'• source resolved from: _{source_origin}_\n'
             '_This usually takes 5–20 minutes (cert validation + '
             'CloudFront)._'
         )

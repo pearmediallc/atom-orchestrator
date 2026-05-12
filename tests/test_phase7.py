@@ -203,6 +203,86 @@ def test_worker_posts_no_setup_checklist_when_setup_already_done(
     assert captured['progress_callback'] is None
 
 
+def test_worker_runs_setup_only_when_lander_url_is_blank(
+        monkeypatch, tmp_inventory):
+    """Empty lander_url is a VALID Path B setup-only run, not an error.
+
+    Regression guard for 2026-05-12 prod incident: after the Path B
+    modal was made optional-lander, the worker still treated empty
+    lander_url as "no source configured" and short-circuited with the
+    legacy "URL is empty" warning. That left freshly-purchased
+    setup-only domains stuck at setup_at=NULL forever — Mark Purchased
+    succeeded but ATOM setup never ran.
+
+    The fix: empty lander_url -> pass empty source through to
+    run_existing_domain_workflow, which has the setup-only branch.
+    """
+    # No defaults configured — proves the fix doesn't rely on the
+    # legacy fallback path. Empty lander_url + empty defaults must
+    # mean "setup-only," not "abort."
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', '')
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', [])
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
+    monkeypatch.setattr(Config, 'PHASE7_LANDER_DEFAULTS', {})
+
+    tmp_inventory.add_domain(
+        domain='setup-only.com', aws_account='auto-insurance',
+    )
+    captured = _patch_workflow(
+        monkeypatch,
+        WorkflowResult(
+            status='completed',
+            message='AWS infrastructure provisioned for setup-only.com. '
+                    'No lander was deployed.',
+            details={'live_url': None, 'setup_only': True},
+        ),
+    )
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='100.0',
+        target_domain='setup-only.com', vertical='auto-insurance',
+        requester='U_MDB', lander_url='',
+    )
+
+    # Workflow MUST have been called — the old code short-circuited
+    # before reaching it, which is the bug we're guarding against.
+    assert 'req' in captured
+    req = captured['req']
+    assert req.source_bucket == ''
+    assert req.source_folders == []
+    assert req.source_files == []
+
+    # The header should explain this is setup-only, NOT show the
+    # legacy "URL is empty" warning.
+    posted = _all_text(client)
+    assert 'setup-only' in posted.lower()
+    assert 'cannot deploy' not in posted.lower()
+    assert 'URL is empty' not in posted
+
+
+def test_worker_warns_when_lander_url_unparseable_and_no_fallback(monkeypatch):
+    """If the MDB types something that isn't a parseable URL AND no
+    per-vertical fallback exists, that IS a genuine error — surface
+    the warning. This path stayed loud while the empty-URL path
+    became silent setup-only.
+    """
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', '')
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', [])
+    monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
+    monkeypatch.setattr(Config, 'PHASE7_LANDER_DEFAULTS', {})
+
+    client = _slack_client()
+    _phase7_run_atom_setup(
+        client=client, channel='C1', message_ts='100.0',
+        target_domain='garbled.com', vertical='auto-insurance',
+        requester='U_MDB', lander_url='not-a-real-url',  # unparseable
+    )
+
+    posted = _all_text(client)
+    assert 'cannot deploy' in posted.lower()
+    assert 'did not parse' in posted.lower()
+
+
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
 def _slack_client():
@@ -244,23 +324,33 @@ def _patch_workflow(monkeypatch, result: WorkflowResult):
 
 # ─── Tests ─────────────────────────────────────────────────────────────────
 
-def test_worker_warns_when_no_url_and_no_default_bucket(monkeypatch):
-    """No lander URL + no default bucket → clear warning, abort."""
+def test_worker_warns_when_unparseable_url_and_no_default_bucket(monkeypatch, tmp_inventory):
+    """Unparseable lander URL + no fallback defaults → clear warning, abort.
+
+    Note: empty lander_url is NO LONGER an error — it intentionally
+    means "setup-only run." See
+    test_worker_runs_setup_only_when_lander_url_is_blank for that
+    case. Only an unparseable-but-non-empty URL triggers the legacy
+    warning path now (audit 2026-05-12 prod fix).
+    """
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', '')
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', [])
     monkeypatch.setattr(Config, 'PHASE7_LANDER_DEFAULTS', {})
+    tmp_inventory.add_domain(
+        domain='example.com', aws_account='auto-insurance',
+    )
 
     client = _slack_client()
     _phase7_run_atom_setup(
         client=client, channel='C1', message_ts='123.45',
         target_domain='example.com', vertical='auto-insurance',
         requester='U_REQUESTER',
-        lander_url='',
+        lander_url='not-a-real-url',  # unparseable
     )
 
-    assert client.chat_postMessage.call_count == 1
     msg = _all_text(client)
     assert 'cannot deploy' in msg.lower()
+    assert 'did not parse' in msg.lower()
 
 
 def test_worker_uses_url_derived_bucket_and_folder(monkeypatch):
@@ -300,9 +390,18 @@ def test_worker_uses_url_derived_bucket_and_folder(monkeypatch):
     assert 'fully deployed' in (dm_calls[0].kwargs.get('text') or '')
 
 
-def test_worker_falls_back_to_config_defaults_when_no_url(monkeypatch):
-    """Empty URL but valid config default → workflow still runs using defaults."""
+def test_worker_falls_back_to_config_defaults_when_url_unparseable(
+        monkeypatch, tmp_inventory):
+    """Unparseable URL + per-vertical defaults → workflow still runs
+    using defaults. This preserves the original "URL parse failed,
+    fall back to vertical config" safety net for legacy /list-domains
+    Mark Deployed clicks whose URL field accepted free-text before
+    today's validation (audit 2026-05-12 prod fix).
+    """
     _set_default_bucket(monkeypatch)
+    tmp_inventory.add_domain(
+        domain='example.com', aws_account='auto-insurance',
+    )
     captured = _patch_workflow(monkeypatch, WorkflowResult(
         status='completed', message='ok',
         details={'live_url': 'https://example.com'},
@@ -312,10 +411,10 @@ def test_worker_falls_back_to_config_defaults_when_no_url(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='example.com', vertical='auto-insurance',
         requester='U_REQUESTER',
-        lander_url='',
+        lander_url='not-a-real-url',  # unparseable triggers default fallback
     )
     req = captured['req']
-    # Falls back to the config defaults
+    # Falls back to the config defaults when URL didn't parse
     assert req.source_bucket == 'lander-source-default'
     assert req.source_folders == ['lander/']
     text = _all_text(client)
@@ -385,8 +484,13 @@ def test_worker_recovers_from_workflow_exception(monkeypatch):
     assert 'atom went poof' in text
 
 
-def test_worker_uses_per_vertical_override_when_no_url(monkeypatch):
-    """No URL passed → per-vertical config wins over the global default."""
+def test_worker_uses_per_vertical_override_when_url_unparseable(
+        monkeypatch, tmp_inventory):
+    """Unparseable URL + per-vertical override → vertical config wins
+    over the global default. Audit 2026-05-12: empty URL is now
+    setup-only, not "use defaults" — this test pivoted to the
+    unparseable-URL fallback case.
+    """
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_BUCKET', 'global-default')
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_FOLDERS', ['default/'])
     monkeypatch.setattr(Config, 'PHASE7_DEFAULT_SOURCE_ACCOUNT', 'auto-insurance')
@@ -397,6 +501,9 @@ def test_worker_uses_per_vertical_override_when_no_url(monkeypatch):
             'source_folders': ['v2-lander/'],
         },
     })
+    tmp_inventory.add_domain(
+        domain='m.com', aws_account='other-vertical',
+    )
 
     captured = _patch_workflow(monkeypatch, WorkflowResult(
         status='completed', message='ok', details={'live_url': 'https://m.com'},
@@ -407,7 +514,7 @@ def test_worker_uses_per_vertical_override_when_no_url(monkeypatch):
         client=client, channel='C1', message_ts='123.45',
         target_domain='m.com', vertical='medicare',
         requester='U_REQUESTER',
-        lander_url='',  # no URL → fall back to config
+        lander_url='not-a-real-url',  # unparseable triggers fallback to defaults
     )
 
     req = captured['req']
