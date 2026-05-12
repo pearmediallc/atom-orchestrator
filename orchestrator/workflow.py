@@ -4,6 +4,7 @@ Two workflows mirror Utkarsh's two flows:
   • run_existing_domain_workflow — Path A (this phase)
   • run_new_domain_workflow      — Path B (Phase 5)
 """
+import json
 import logging
 import re
 import time
@@ -325,15 +326,22 @@ def run_existing_domain_workflow(
         # tests/test_atom_client.py::test_setup_domain_returns_structured_error):
         #   { status: 'failed', failed_at_step, completed_steps,
         #     error: { step_key, message, exception, aws_error_code?, ... } }
-        # Older/edge failure modes may omit fields entirely — be defensive.
-        err = setup_result.get('error')
-        err = err if isinstance(err, dict) else {}
+        # Older/edge failure modes may omit fields entirely OR return
+        # `error` as a plain string instead of the structured dict — be
+        # defensive both ways so we never lose ATOM's actual error text.
+        err_raw = setup_result.get('error')
+        err = err_raw if isinstance(err_raw, dict) else {}
+        err_string = err_raw if isinstance(err_raw, str) else None
+
         step = (
             setup_result.get('failed_at_step')
             or err.get('step_key')
             or 'unknown'
         )
-        err_msg = err.get('message') if isinstance(err.get('message'), str) else None
+        err_msg = (
+            (err.get('message') if isinstance(err.get('message'), str) else None)
+            or err_string
+        )
         err_exc = err.get('exception') if isinstance(err.get('exception'), str) else None
         aws_code = err.get('aws_error_code') if isinstance(err.get('aws_error_code'), str) else None
 
@@ -346,6 +354,26 @@ def run_existing_domain_workflow(
         if err_msg:
             parts.append(err_msg)
         full_message = ' '.join(parts)
+
+        # When the standard fields didn't tell us anything useful, snapshot
+        # the actual response shape into the log line so the next operator
+        # debugging this doesn't have to manually curl ATOM's /api/status
+        # endpoint to see what came back (audit 2026-05-13 — ATOM returned
+        # status='failed' with empty failed_at_step + completed_steps and
+        # no stdout trace; only the JSON response held the truth).
+        diagnostics_needed = step == 'unknown' or not err_msg
+        setup_result_keys = (
+            sorted(setup_result.keys())
+            if isinstance(setup_result, dict) else None
+        )
+        setup_result_preview = None
+        if diagnostics_needed and isinstance(setup_result, dict):
+            try:
+                setup_result_preview = json.dumps(
+                    setup_result, default=str
+                )[:2000]
+            except (TypeError, ValueError):
+                setup_result_preview = repr(setup_result)[:2000]
 
         return _fail(
             req,
@@ -361,6 +389,11 @@ def run_existing_domain_workflow(
                 # Render log line readable (1KB is enough for the head
                 # of any traceback, which is what we actually need).
                 'atom_error_exception': (err_exc or '')[:1000] or None,
+                # Diagnostics for the case where ATOM returned an
+                # unexpected shape (step='unknown'). Empty in the
+                # normal case.
+                'setup_result_keys': setup_result_keys,
+                'setup_result_preview': setup_result_preview,
             },
         )
 
