@@ -18,6 +18,7 @@ Slack, each Flask route below forwards to the SAME SlackRequestHandler — bolt
 internally dispatches based on the request body.
 """
 import json
+import re
 import logging
 import threading
 from urllib.parse import urlparse
@@ -959,6 +960,231 @@ if _bolt_app is not None:
                          + (f' Previous: {", ".join(f"<@{u}>" for u in previous)}.'
                             if previous else '')),
             })
+
+    @_bolt_app.command('/buy-domain')
+    def handle_buy_domain_command(ack, body, client):
+        """Open the buy-domain modal.
+
+        Inline arg `/buy-domain foo.com` pre-fills the domain input so
+        the MDB doesn't have to re-type. Bare `/buy-domain` opens the
+        modal with an empty domain field. Either way the domain is
+        editable so the MDB can fix typos before submitting.
+        """
+        ack()
+        prefill = _normalise_domain_input(body.get('text', ''))
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view=_build_buy_domain_modal(prefill_domain=prefill),
+        )
+
+    @_bolt_app.view('buy_domain_modal')
+    def handle_buy_domain_submission(ack, body, view, client):
+        """Modal submitted — run Namecheap availability + price + inventory
+        checks, then post a confirm/cancel card to the requester.
+
+        Design rule (feedback_bot_never_hard_rejects_user_choice): every
+        finding is surfaced as a labelled bullet on the card. Confirm
+        button is always present (except when Namecheap was literally
+        unreachable — there's no "fact" to confirm against). The MDB
+        decides whether to continue based on the facts they see.
+
+        Confirm reuses ``action_id='pick_domain'`` so the downstream
+        chain (TL approval -> Mark Purchased -> deploy) is shared with
+        the AI-shortlist flow. Zero duplicated handler code.
+        """
+        ack()
+        values = view['state']['values']
+        raw_domain = (values.get('domain_block', {})
+                            .get('domain_input', {}).get('value') or '')
+        domain = _normalise_domain_input(raw_domain)
+        vertical = (values['vertical_block']['vertical_input']['value']
+                    or '').strip()
+        aws_account = (
+            values.get('aws_account_block', {})
+                  .get('aws_account_select', {})
+                  .get('selected_option', {})
+                  .get('value')
+            or (Config.AWS_ACCOUNT_OPTIONS[0]
+                if Config.AWS_ACCOUNT_OPTIONS else '')
+        )
+        lander = ((values.get('lander_block') or {})
+                  .get('lander_input', {}).get('value') or '').strip()
+
+        operator = body['user']['id']
+        mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
+        picked_mdb = mdb_select.get('selected_user') or ''
+        requester = picked_mdb or operator
+
+        log_event(
+            'buy_domain_submitted', domain=domain, vertical=vertical,
+            aws_account=aws_account, lander_url=lander or None,
+            requester=requester, operator=operator,
+        )
+
+        # ── Finding 1: format ─────────────────────────────────────────
+        # The ONE technical impossibility: if the domain doesn't parse,
+        # we can't Namecheap-check it. Per the no-hard-reject rule, we
+        # still post a card, but it carries an instruction to re-run
+        # rather than a Confirm button — there's no fact to confirm.
+        format_ok = bool(_DOMAIN_RE.match(domain))
+        if not format_ok:
+            client.chat_postMessage(
+                channel=requester,
+                text=(
+                    f':warning: *Couldn\'t parse `{domain}` as a domain.*\n'
+                    'Apex domains only — no subdomains, no paths. Try '
+                    '`/buy-domain <name.tld>` again with a clean name.'
+                ),
+            )
+            return
+
+        extension = _extract_extension(domain)
+
+        # ── Finding 2: inventory collision ───────────────────────────
+        existing = None
+        try:
+            existing = inventory_store.get_domain(domain)
+        except Exception:
+            logger.exception(
+                'inventory lookup failed for /buy-domain %s — '
+                'proceeding with collision finding marked unknown',
+                domain,
+            )
+        if existing:
+            owner = existing.get('assigned_to') or 'unassigned'
+            setup_at = existing.get('setup_at') or 'never deployed'
+            inventory_finding = (
+                f':warning: *Already in our inventory* '
+                f'(assigned to <@{owner}>, setup_at: {setup_at}). '
+                f'Confirming will create a duplicate-purchase request — '
+                f'usually you want `/list-domains {domain}` + Mark Deployed '
+                f'instead.'
+            )
+        else:
+            inventory_finding = (
+                ':white_check_mark: Not in our inventory — safe to add.'
+            )
+
+        # ── Finding 3 + 4: Namecheap availability + price ────────────
+        # Cap lookup is cheap and never fails; do it first so the card
+        # has a fallback price line even when Namecheap is unreachable.
+        cap_price = Config.price_cap_for(extension)
+        availability_finding = ''
+        price_finding = ''
+        namecheap_ok = True
+        try:
+            results = namecheap_check.check_availability_and_price(
+                [domain], extension=extension,
+            )
+            nc = results[0] if results else {}
+        except Exception as e:
+            logger.exception(
+                'Namecheap check failed for /buy-domain %s', domain,
+            )
+            nc = {}
+            namecheap_ok = False
+            availability_finding = (
+                f':warning: *Couldn\'t reach Namecheap right now* '
+                f'(`{type(e).__name__}: {str(e)[:120]}`). Availability + '
+                f'price unknown.'
+            )
+
+        if namecheap_ok:
+            if nc.get('available'):
+                availability_finding = (
+                    f':white_check_mark: *Available on Namecheap.*'
+                )
+            else:
+                availability_finding = (
+                    ':no_entry: *NOT available on Namecheap right now.* '
+                    'Continuing means Utkarsh won\'t be able to buy it via '
+                    'the usual flow — confirm only if you have a different '
+                    'plan (secondary market, transfer, etc.).'
+                )
+
+            price = nc.get('price')
+            if price is None:
+                price_finding = (
+                    f':grey_question: Price unknown for `{extension}`. '
+                    f'Cap is ${cap_price:.2f}.'
+                )
+            else:
+                over_cap = price > cap_price
+                price_finding = (
+                    f':moneybag: *Price:* ${price:.2f}/yr '
+                    f'(cap for `{extension}` is ${cap_price:.2f}). '
+                    + (':warning: *Over cap* — TL should review carefully.'
+                       if over_cap else ':white_check_mark: Under cap.')
+                )
+
+        # ── Build the confirm card ────────────────────────────────────
+        # Per the no-hard-reject rule, even all-warning findings get a
+        # Confirm button. The exception is when Namecheap was literally
+        # unreachable: we still post the card (Cancel-only), so the MDB
+        # is informed without being asked to confirm a fact we couldn't
+        # verify.
+        blocks = _build_buy_domain_confirm_blocks(
+            domain=domain, vertical=vertical, aws_account=aws_account,
+            lander=lander, requester=requester,
+            availability_finding=availability_finding,
+            inventory_finding=inventory_finding,
+            price_finding=price_finding,
+        )
+        if not namecheap_ok:
+            # Replace the actions block with a Cancel-only one. There's
+            # no fact to confirm against, so no Confirm button.
+            blocks = [b for b in blocks if b.get('type') != 'actions']
+            blocks.append({'type': 'actions', 'elements': [
+                {
+                    'type': 'button',
+                    'action_id': 'cancel_buy_domain',
+                    'text': {'type': 'plain_text',
+                             'text': ':x: Dismiss — try again later'},
+                    'style': 'danger',
+                    'value': sign_payload({
+                        'domain': domain, 'requester': requester,
+                    }),
+                },
+            ]})
+
+        client.chat_postMessage(
+            channel=requester,
+            text=f'Pre-purchase check for {domain}',
+            blocks=blocks,
+        )
+
+    @_bolt_app.action('cancel_buy_domain')
+    def handle_cancel_buy_domain(ack, body, client):
+        """MDB clicked Cancel on the /buy-domain confirm card. Replace
+        the card so the buttons can't be re-clicked and emit a
+        structured log event for the audit trail."""
+        ack()
+        data = _verify_button_click(body)
+        if data is None:
+            return
+        domain = data.get('domain', '')
+        canceller = body['user']['id']
+        log_event(
+            'buy_domain_cancelled', domain=domain, canceller=canceller,
+        )
+        client.chat_update(
+            channel=body['channel']['id'],
+            ts=body['message']['ts'],
+            text=f'Cancelled: {domain}',
+            blocks=[
+                {'type': 'header', 'text': {
+                    'type': 'plain_text',
+                    'text': f':x: Cancelled: {domain}',
+                }},
+                {'type': 'context', 'elements': [{
+                    'type': 'mrkdwn',
+                    'text': (f'Cancelled by <@{canceller}>. Run '
+                             '`/buy-domain` again with a different name '
+                             'or extension, or use `/new-domain` for AI '
+                             'suggestions.'),
+                }]},
+            ],
+        )
 
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
@@ -2137,6 +2363,246 @@ def _build_new_domain_modal() -> dict:
             },
         ],
     }
+
+
+_DOMAIN_RE = re.compile(
+    # apex domain only — at least one label, then a single TLD label
+    # 2+ chars. Labels are lowercase alphanumeric with internal hyphens
+    # (no leading / trailing hyphen). Rejects subdomains and wildcards.
+    r'^(?!-)[a-z0-9-]{1,63}(?<!-)\.[a-z]{2,63}$'
+)
+
+
+_KNOWN_EXTENSIONS = ('.com', '.pro', '.info', '.site', '.live', '.top', '.icu')
+
+
+def _normalise_domain_input(raw: str) -> str:
+    """Strip the noise an MDB might paste — protocol, www, trailing slash,
+    whitespace, mixed case — and return a candidate apex domain string.
+
+    Doesn't reject anything; just normalises. The caller validates the
+    result against ``_DOMAIN_RE`` separately so we can surface a
+    targeted error rather than a generic ValueError.
+    """
+    s = (raw or '').strip().lower()
+    s = re.sub(r'^https?://', '', s)
+    s = re.sub(r'^www\.', '', s)
+    s = s.rstrip('/')
+    # Drop any path that snuck in (e.g. someone pasted a full URL).
+    if '/' in s:
+        s = s.split('/', 1)[0]
+    return s
+
+
+def _extract_extension(domain: str) -> str:
+    """Return the TLD portion including the leading dot, or empty string
+    if the domain doesn't parse cleanly. Last-dot-onward — keeps it simple
+    for the apex-only domains this flow accepts.
+    """
+    if '.' not in domain:
+        return ''
+    return '.' + domain.rsplit('.', 1)[1]
+
+
+def _build_buy_domain_modal(prefill_domain: str = '') -> dict:
+    """Build the /buy-domain modal payload.
+
+    Unlike /new-domain (which generates suggestions), this modal takes a
+    domain name the MDB already chose somewhere else — a tool, a vendor,
+    their own brainstorming. The bot still runs the same Namecheap
+    availability + price check, surfaces the findings, and lets the MDB
+    confirm before continuing into the existing Path B chain.
+
+    `prefill_domain` populates the domain input when the slash command
+    was invoked with an inline argument (`/buy-domain foo.com`). Empty
+    when the slash command was invoked bare.
+
+    Per feedback_bot_never_hard_rejects_user_choice: the modal does NO
+    validation itself. All checks happen on submit and are surfaced on
+    a confirm/cancel card. The bot reports; the human decides.
+    """
+    account_options = [
+        {'text': {'type': 'plain_text', 'text': acct}, 'value': acct}
+        for acct in Config.AWS_ACCOUNT_OPTIONS
+    ]
+    domain_input = {
+        'type': 'plain_text_input',
+        'action_id': 'domain_input',
+        'placeholder': {'type': 'plain_text',
+                        'text': 'e.g. mymedicareexperts.online'},
+    }
+    if prefill_domain:
+        domain_input['initial_value'] = prefill_domain
+
+    return {
+        'type': 'modal',
+        'callback_id': 'buy_domain_modal',
+        'title': {'type': 'plain_text', 'text': 'Buy a domain you picked'},
+        'submit': {'type': 'plain_text', 'text': 'Check & Continue'},
+        'close': {'type': 'plain_text', 'text': 'Cancel'},
+        'blocks': [
+            {
+                'type': 'context',
+                'elements': [{
+                    'type': 'mrkdwn',
+                    'text': ('_For domains you already have in mind. The '
+                             'bot will check Namecheap and show you the '
+                             'availability + price before anything else '
+                             'happens._'),
+                }],
+            },
+            {
+                'type': 'input',
+                'block_id': 'mdb_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Requesting MDB (leave blank if this is for you)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Pick the marketer you\'re running this on '
+                             'behalf of. When set, all bot DMs (approval '
+                             'status, deploy notification) go to them '
+                             'instead of you.'),
+                },
+                'element': {
+                    'type': 'users_select',
+                    'action_id': 'mdb_select',
+                    'placeholder': {'type': 'plain_text', 'text': 'Pick an MDB'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'domain_block',
+                'label': {'type': 'plain_text', 'text': 'Domain you picked'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Apex domain only. We\'ll strip http:// / www. / '
+                             'trailing slashes automatically.'),
+                },
+                'element': domain_input,
+            },
+            {
+                'type': 'input',
+                'block_id': 'vertical_block',
+                'label': {'type': 'plain_text', 'text': 'Vertical'},
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'vertical_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. medicare'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'aws_account_block',
+                'label': {'type': 'plain_text', 'text': 'AWS account (target)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Where this domain\'s R53 zone, ACM cert, S3 '
+                             'bucket, and CloudFront distribution will be '
+                             'provisioned.'),
+                },
+                'element': {
+                    'type': 'static_select',
+                    'action_id': 'aws_account_select',
+                    'initial_option': account_options[0],
+                    'options': account_options,
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'lander_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Lander URL (optional — leave blank for setup-only)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('When set, the bot copies the lander\'s S3 '
+                             'contents to the new domain\'s bucket after '
+                             'purchase. When blank, only AWS infrastructure '
+                             'is provisioned.'),
+                },
+                'element': {
+                    'type': 'url_text_input',
+                    'action_id': 'lander_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'https://example.com/landing-page (or leave blank)'},
+                },
+            },
+        ],
+    }
+
+
+def _build_buy_domain_confirm_blocks(*, domain, vertical, aws_account,
+                                     lander, requester, availability_finding,
+                                     inventory_finding, price_finding):
+    """Render the confirm-or-cancel card the MDB sees after /buy-domain
+    validation runs. Surfaces every finding factually; never auto-rejects.
+
+    The Confirm button reuses ``action_id='pick_domain'`` so it routes
+    into the same downstream chain an AI-shortlist Pick this would —
+    TL approval (if configured) -> Mark Purchased -> deploy. Zero
+    duplicated handler code, single test surface for "post-pick" logic.
+    """
+    extension = _extract_extension(domain)
+
+    # Build a compact findings block — emoji on the left so the MDB can
+    # scan vertically and see which items need their attention.
+    finding_lines = [
+        availability_finding,
+        price_finding,
+        inventory_finding,
+    ]
+    findings_text = '\n'.join(line for line in finding_lines if line)
+
+    lander_line = (
+        f'• Lander: {lander}' if lander
+        else '• Lander: _none — setup-only (no file copy)_'
+    )
+
+    header_text = (
+        f':receipt: *Pre-purchase check for* `{domain}`\n'
+        f'• Vertical: `{vertical}`\n'
+        f'• AWS account: `{aws_account}`\n'
+        f'{lander_line}\n'
+        f'• Requester: <@{requester}>\n\n'
+        f'{findings_text}\n\n'
+        f':point_right: Review the findings above and confirm to '
+        f'continue, or cancel.'
+    )
+
+    # Reuse pick_domain's payload contract so the existing handler picks
+    # up the click identically to an AI-shortlist selection.
+    confirm_payload = sign_payload({
+        'domain': domain,
+        'vertical': vertical,
+        'lander': lander,
+        'extension': extension,
+        'requester': requester,
+        'aws_account': aws_account,
+    })
+    cancel_payload = sign_payload({'domain': domain, 'requester': requester})
+
+    return [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': header_text}},
+        {'type': 'actions', 'elements': [
+            {
+                'type': 'button',
+                'action_id': 'pick_domain',
+                'text': {'type': 'plain_text',
+                         'text': ':white_check_mark: Confirm — continue'},
+                'style': 'primary',
+                'value': confirm_payload,
+            },
+            {
+                'type': 'button',
+                'action_id': 'cancel_buy_domain',
+                'text': {'type': 'plain_text', 'text': ':x: Cancel'},
+                'style': 'danger',
+                'value': cancel_payload,
+            },
+        ]},
+    ]
 
 
 # ─── Flask routes (forward everything to bolt) ─────────────────────────────
