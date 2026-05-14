@@ -180,7 +180,8 @@ def _build_confirmed_card(*, action_label: str, target: str,
 
 def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                                        extension, lander, requester,
-                                       examples=None, aws_account=''):
+                                       examples=None, aws_account='',
+                                       external_requester=''):
     """Render the /new-domain shortlist as Slack Block Kit blocks.
 
     Used by both the initial modal submission and the "Show 5 more"
@@ -265,6 +266,10 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                     'extension': per_domain_extension,
                     'requester': requester,
                     'aws_account': aws_account,
+                    # External requester name (empty for internal
+                    # requests) — threaded through every payload hop so
+                    # it survives down to the inventory write.
+                    'external_requester': external_requester,
                     # Price came from the Namecheap check in
                     # workflow.suggest_new_domains; threading it
                     # through the signed payload chain so the TL
@@ -290,6 +295,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
                 'requester': requester,
                 'examples': examples,
                 'aws_account': aws_account,
+                'external_requester': external_requester,
             }),
         }],
     })
@@ -299,7 +305,7 @@ def _build_new_domain_shortlist_blocks(*, suggestions, vertical, audience,
 def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
                                 vertical, audience, extension,
                                 lander, requester, examples=None,
-                                aws_account=''):
+                                aws_account='', external_requester=''):
     """Worker that regenerates the /new-domain shortlist. Runs in a
     daemon thread so the original Slack action click can ack within 3s
     while the LLM + Namecheap calls take 15–30s.
@@ -342,6 +348,7 @@ def _phase8_refresh_suggestions(client, channel, placeholder_ts, *,
         requester=requester,
         examples=examples,
         aws_account=aws_account,
+        external_requester=external_requester,
     )
     client.chat_update(
         channel=channel,
@@ -1454,6 +1461,15 @@ if _bolt_app is not None:
         operator = body['user']['id']
         mdb_select = (values.get('mdb_block') or {}).get('mdb_select') or {}
         picked_mdb = mdb_select.get('selected_user') or ''
+        # External requester: a name only (the person isn't in Slack).
+        # The operator stays the lifecycle owner — they get every DM and
+        # every expiry/idle alert; external_requester is recorded purely
+        # as the "who asked for this" reference. An internal MDB pick
+        # takes precedence if somehow both are filled.
+        external_requester = (
+            (values.get('external_requester_block') or {})
+            .get('external_requester_input', {}).get('value') or ''
+        ).strip()
         requester = picked_mdb or operator
         on_behalf = bool(picked_mdb and picked_mdb != operator)
 
@@ -1466,13 +1482,19 @@ if _bolt_app is not None:
             if lander
             else '• Lander URL: _none — setup-only run, no file copy_\n'
         )
+        external_line = (
+            f'• External requester: *{external_requester}* '
+            f'(you, <@{operator}>, are the owner)\n'
+            if external_requester else ''
+        )
         receipt = (
             ':sparkles: *New-domain request received* :sparkles:\n'
             f'• Requested by: <@{requester}>'
             + (f' (submitted by <@{operator}> on their behalf)' if on_behalf else '')
             + f'\n'
-            f'• Vertical: `{vertical}`\n'
-            f'• AWS account: `{aws_account}`\n'
+            + external_line
+            + f'• Vertical: `{vertical}`\n'
+            + f'• AWS account: `{aws_account}`\n'
             + (f"• Audience / angle: _{audience}_\n" if audience else '')
             + examples_summary
             + lander_line
@@ -1536,6 +1558,7 @@ if _bolt_app is not None:
             requester=requester,
             examples=examples,
             aws_account=aws_account,
+            external_requester=external_requester,
         )
         client.chat_postMessage(
             channel=requester,
@@ -1545,7 +1568,8 @@ if _bolt_app is not None:
 
     def _send_purchase_request_to_utkarsh(client, *, domain, vertical, lander,
                                           extension, requester,
-                                          aws_account='', price=None):
+                                          aws_account='', price=None,
+                                          external_requester=''):
         """DM Utkarsh (with dev-reroute applied) the purchase request card.
 
         Extracted from handle_pick_domain so TL approval can call it after
@@ -1583,10 +1607,16 @@ if _bolt_app is not None:
         else:
             price_line = '• Expected price: _unknown — check Namecheap_\n'
 
+        external_line = (
+            f'• External requester: *{external_requester}* '
+            f'(owner stays <@{requester}>)\n'
+            if external_requester else ''
+        )
         utkarsh_text = (
             ':moneybag: *Domain purchase request* :moneybag:\n'
             f'• Requester: <@{requester}>\n'
-            f'• Domain to buy: `{domain}`\n'
+            + external_line
+            + f'• Domain to buy: `{domain}`\n'
             f'• Vertical: `{vertical}`\n'
             + aws_line
             + f'• Extension: `{extension}`\n'
@@ -1612,6 +1642,7 @@ if _bolt_app is not None:
                         'lander': lander,
                         'requester': requester,
                         'aws_account': aws_account,
+                        'external_requester': external_requester,
                         # Price audit-trail: end-of-chain so
                         # confirm_purchased can stamp it on the
                         # domain_events row for /domain-history.
@@ -1646,6 +1677,7 @@ if _bolt_app is not None:
         requester = data['requester']
         examples = data.get('examples') or []
         aws_account = data.get('aws_account', '')
+        external_requester = data.get('external_requester', '')
         channel = body['channel']['id']
         old_ts = body['message']['ts']
 
@@ -1678,6 +1710,7 @@ if _bolt_app is not None:
                 'extension': extension, 'lander': lander,
                 'requester': requester, 'examples': examples,
                 'aws_account': aws_account,
+                'external_requester': external_requester,
             },
             daemon=True,
             name=f'phase8-refresh-{vertical}',
@@ -1709,6 +1742,7 @@ if _bolt_app is not None:
         extension = data['extension']
         requester = data['requester']
         aws_account = data.get('aws_account', '')
+        external_requester = data.get('external_requester', '')
         # Namecheap price flowed in via the Pick / Confirm payload —
         # show it on the TL approval + Utkarsh purchase cards so both
         # know the actual annual cost before approving / buying
@@ -1723,6 +1757,7 @@ if _bolt_app is not None:
             'extension': extension,
             'requester': requester,
             'aws_account': aws_account,
+            'external_requester': external_requester,
             'price': price,
         })
 
@@ -1825,6 +1860,7 @@ if _bolt_app is not None:
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
             aws_account=aws_account,
+            external_requester=external_requester,
             price=price,
         )
         purchaser_is_requester = (purchaser == requester)
@@ -1878,6 +1914,7 @@ if _bolt_app is not None:
         extension = data.get('extension') or '.com'
         requester = data['requester']
         aws_account = data.get('aws_account', '')
+        external_requester = data.get('external_requester', '')
         price = data.get('price')
         approver = body['user']['id']
 
@@ -1887,6 +1924,7 @@ if _bolt_app is not None:
             domain=domain, vertical=vertical, lander=lander,
             extension=extension, requester=requester,
             aws_account=aws_account,
+            external_requester=external_requester,
             price=price,
         )
 
@@ -2501,6 +2539,7 @@ if _bolt_app is not None:
         lander = data.get('lander') or ''
         requester = data['requester']
         aws_account = data.get('aws_account', '').strip()
+        external_requester = data.get('external_requester', '')
         price = data.get('price')
         # Backwards compat: old in-flight buttons (signed before the modal
         # added the picker) carry no aws_account key. Fall back to the
@@ -2538,6 +2577,18 @@ if _bolt_app is not None:
         # the inventory write didn't happen, so we MUST surface it
         # instead of silently telling Slack "purchased ✅" while the
         # backing row was lost (2026-05-08 audit fix).
+        # External requester: the person who asked isn't in our Slack, so
+        # there's no Slack ID to own the row. The operator (`requester`)
+        # stays the lifecycle owner — they get the expiry/idle DMs — and
+        # the external name is recorded in requested_by ('External:<name>'
+        # mirrors the 'Slack:Uxxx' convention) + notes + the audit event.
+        if external_requester:
+            requested_by_value = f'External:{external_requester}'
+            notes_value = (f'Purchased via /new-domain bot flow '
+                           f'(external requester: {external_requester})')
+        else:
+            requested_by_value = f'Slack:{requester}'
+            notes_value = 'Purchased via /new-domain bot flow'
         try:
             inventory_store.add_domain(
                 domain=domain,
@@ -2549,15 +2600,15 @@ if _bolt_app is not None:
                 # the MDB picks it in the modal and the value flows here.
                 aws_account=aws_account or None,
                 lander_url=lander or None,
-                requested_by=f'Slack:{requester}',
-                notes='Purchased via /new-domain bot flow',
+                requested_by=requested_by_value,
+                notes=notes_value,
                 # State machine starts here — Phase 7 worker will move
                 # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
                 status=inventory_store.STATUS_PENDING,
                 # Lifecycle ownership starts on day one — classifier needs
-                # an MDB to DM when this domain expires or goes idle.
-                # Legacy CSV-imported rows get this via the boot-time
-                # backfill in store.init_db().
+                # an MDB to DM when this domain expires or goes idle. For
+                # external requests this is the operator (the external
+                # requester has no Slack ID to own anything).
                 assigned_to=requester,
                 # Audit trail for /domain-history. Captures who clicked
                 # Mark Purchased, plus the lander URL (if any) and the
@@ -2566,7 +2617,8 @@ if _bolt_app is not None:
                 event_metadata={'lander_url': lander, 'vertical': vertical,
                                 'aws_account': aws_account,
                                 'confirmer': confirmer,
-                                'price_usd': price},
+                                'price_usd': price,
+                                'external_requester': external_requester or None},
             )
         except inventory_store.DuplicateDomainError:
             logger.info(
@@ -2682,6 +2734,28 @@ def _build_new_domain_modal() -> dict:
                     'action_id': 'mdb_select',
                     'placeholder': {'type': 'plain_text',
                                     'text': 'Pick an MDB'},
+                },
+            },
+            {
+                'type': 'input',
+                'block_id': 'external_requester_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'External requester (name only)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Only when this is for someone NOT in our Slack '
+                             'workspace — type their name. You (the operator) '
+                             'stay the owner: all bot DMs + expiry/idle alerts '
+                             'come to you, and the domain is recorded as '
+                             'requested by this external name. Leave the MDB '
+                             'picker above blank when you use this.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'external_requester_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. John from AcmeCorp'},
                 },
             },
             {

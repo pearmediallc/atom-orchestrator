@@ -185,3 +185,56 @@ def test_legacy_enqueue_path_b_shim_still_creates_path_b_task(tmp_inventory):
         )
         row = cur.fetchone()
     assert row['kind'] == tasks.TASK_KIND_PATH_B
+
+
+# ─── Phase: external /new-domain requester threading ──────────────────────
+
+from slack_bot.routes import _build_new_domain_shortlist_blocks
+from slack_bot.payload_signing import verify_payload
+
+
+def _pick_and_refresh_payloads(blocks):
+    """Pull the signed pick_domain + refresh payloads back out of a
+    shortlist block list."""
+    pick, refresh = None, None
+    for b in blocks:
+        acc = b.get('accessory')
+        if acc and acc.get('action_id') == 'pick_domain':
+            pick = verify_payload(acc['value'])
+        if b.get('type') == 'actions':
+            for el in b['elements']:
+                if el.get('action_id') == 'refresh_domain_suggestions':
+                    refresh = verify_payload(el['value'])
+    return pick, refresh
+
+
+def test_shortlist_threads_external_requester_into_payloads():
+    """external_requester must ride through both the pick_domain and the
+    'Show 5 more' refresh payloads so it survives every hop down to the
+    inventory write."""
+    blocks = _build_new_domain_shortlist_blocks(
+        suggestions=[{'domain': 'acmecorp-quote.com', 'price': 9.99,
+                      'extension': '.com'}],
+        vertical='auto-insurance', audience='', extension='.com',
+        lander='', requester='U_OPERATOR', aws_account='auto-insurance',
+        external_requester='John from AcmeCorp',
+    )
+    pick, refresh = _pick_and_refresh_payloads(blocks)
+    assert pick is not None and refresh is not None
+    assert pick['external_requester'] == 'John from AcmeCorp'
+    assert refresh['external_requester'] == 'John from AcmeCorp'
+    # The operator stays the requester/owner — external is just a name.
+    assert pick['requester'] == 'U_OPERATOR'
+
+
+def test_shortlist_external_requester_defaults_empty_for_internal():
+    """Internal requests (no external name) carry an empty string, not a
+    missing key — downstream readers use .get() but consistency helps."""
+    blocks = _build_new_domain_shortlist_blocks(
+        suggestions=[{'domain': 'x.com', 'price': 9.99, 'extension': '.com'}],
+        vertical='v', audience='', extension='.com', lander='',
+        requester='U_MDB', aws_account='acct',
+    )
+    pick, refresh = _pick_and_refresh_payloads(blocks)
+    assert pick['external_requester'] == ''
+    assert refresh['external_requester'] == ''
