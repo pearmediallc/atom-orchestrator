@@ -136,30 +136,105 @@ def _recent_spend(domain: str) -> float:
         return 0.0
 
 
-def _check_still_actionable(client, body, domain: str, expected_state: str) -> bool:
-    """Phase E race-condition guard. With multi-MDB DMs, two assignees
-    might both receive the prompt and click at the same time. Only the
-    first click should mutate state — the second sees the state has
-    already advanced and gets an ephemeral notice.
+# ─── Phase F — atomic first-click-wins + sibling-card sync ────────────────
 
-    Returns True if the row is still in the expected starting state
-    (the handler should proceed), False if not (ephemeral sent, handler
-    should return).
-    """
-    current = (store.get_domain(domain) or {}).get('lifecycle_state')
-    if current == expected_state:
-        return True
+# Events that mark a prompt as resolved. Used to name the winner when a
+# later click loses the race.
+_RESOLVING_EVENTS = frozenset({
+    'mdb_said_using_yes', 'mdb_said_using_no',
+    'mdb_extended_30', 'mdb_extended_15', 'pushed_to_inventory',
+})
+
+
+def _last_resolver(domain: str) -> Optional[str]:
+    """Slack ID of whoever resolved this domain's last prompt — read off
+    the most recent resolving domain_event. None if not found."""
+    try:
+        events = store.list_domain_events(domain, limit=15)  # newest first
+    except Exception:
+        logger.exception('list_domain_events failed in _last_resolver')
+        return None
+    for ev in events:
+        if ev.get('event_type') in _RESOLVING_EVENTS and ev.get('actor'):
+            return ev['actor']
+    return None
+
+
+def _already_handled(client, body, domain: str) -> None:
+    """The click lost the race — someone else already resolved this
+    prompt. Name the winner, replace the loser's own card so it stops
+    showing buttons, and send them an ephemeral."""
+    winner = _last_resolver(domain)
+    who = f'<@{winner}>' if winner else 'someone else'
+    _replace_card(
+        client, body,
+        header_text=f':information_source: {domain} — already handled',
+        context_text=(f'{who} already actioned this. Your click was ignored '
+                      'to avoid conflicting decisions.'),
+    )
     try:
         client.chat_postEphemeral(
-            channel=body['channel']['id'],
-            user=body['user']['id'],
-            text=(f':information_source: `{domain}` was already actioned '
-                  f'by someone else (state is now `{current}`). Your click '
-                  'was ignored to avoid conflicting decisions.'),
+            channel=body['channel']['id'], user=body['user']['id'],
+            text=(f':information_source: `{domain}` was already actioned by '
+                  f'{who}. Your click was ignored.'),
         )
     except Exception:
         logger.exception('chat_postEphemeral failed in race-guard')
+
+
+def _claim(client, body, domain: str, from_state: str, to_state: str) -> bool:
+    """Atomic first-click-wins. Moves the domain from_state -> to_state,
+    but ONLY if it's still in from_state — the DB decides the winner, so
+    two near-simultaneous clicks can't both proceed. Returns True if this
+    click won (caller does the work); False if it lost (loser's card +
+    ephemeral already handled, caller should return)."""
+    if store.transition_lifecycle_state(domain, from_state, to_state):
+        return True
+    _already_handled(client, body, domain)
     return False
+
+
+def _sync_siblings(client, body, domain: str,
+                   header_text: str, sibling_context: str) -> None:
+    """Phase F — after a resolution, update every OTHER recipient's card
+    (the fan-out siblings) so nobody else sees stale buttons. The
+    clicker's own card is handled separately by _replace_card.
+
+    Best-effort per card: a deleted message or API blip on one sibling
+    must not block the rest. Clears the fan-out ledger when done.
+    """
+    clicker_channel = (body.get('channel') or {}).get('id')
+    clicker_ts = (body.get('message') or {}).get('ts')
+    try:
+        recipients = store.get_prompt_recipients(domain)
+    except Exception:
+        logger.exception('get_prompt_recipients failed for %s', domain)
+        recipients = []
+    for r in recipients:
+        ch, ts = r.get('channel_id'), r.get('message_ts')
+        if not ch or not ts:
+            continue
+        if ch == clicker_channel and ts == clicker_ts:
+            continue  # the clicker's own card — _replace_card already did it
+        try:
+            client.chat_update(
+                channel=ch, ts=ts, text=header_text,
+                blocks=[
+                    {'type': 'header', 'text': {
+                        'type': 'plain_text', 'text': header_text}},
+                    {'type': 'context', 'elements': [{
+                        'type': 'mrkdwn', 'text': sibling_context}]},
+                ],
+            )
+        except Exception:
+            logger.exception(
+                'sibling chat_update failed (non-fatal) — channel=%s ts=%s',
+                ch, ts,
+            )
+    try:
+        store.clear_prompt_recipients(domain)
+    except Exception:
+        logger.exception('clear_prompt_recipients failed for %s', domain)
 
 
 # ─── Handler registration ─────────────────────────────────────────────────
@@ -184,13 +259,11 @@ def register(app) -> None:
                                    'MDB usage')
             return
 
-        # Race guard: multi-MDB DM may have raced another assignee.
-        if not _check_still_actionable(client, body, domain,
-                                       S.AWAITING_MDB_USAGE_RESPONSE):
+        # Atomic first-click-wins across every fan-out recipient (MDBs+TL).
+        if not _claim(client, body, domain,
+                      S.AWAITING_MDB_USAGE_RESPONSE, S.AWAITING_UTKARSH_RENEW):
             return
 
-        # Forward to Utkarsh + flip state.
-        store.set_lifecycle_state(domain, S.AWAITING_UTKARSH_RENEW)
         store.record_event(
             domain, 'mdb_said_using_yes', actor=actor,
             from_state=S.AWAITING_MDB_USAGE_RESPONSE,
@@ -202,6 +275,12 @@ def register(app) -> None:
             header_text=f':white_check_mark: Yes, using {domain}',
             context_text=(f'<@{actor}> confirmed in use. '
                           'Forwarding to Utkarsh for renewal.'),
+        )
+        _sync_siblings(
+            client, body, domain,
+            header_text=f':white_check_mark: Yes, using {domain}',
+            sibling_context=(f'<@{actor}> confirmed it\'s in use — resolved. '
+                             'Forwarded to Utkarsh for renewal.'),
         )
         _dm.dm(
             client, real_recipient=Config.UTKARSH_SLACK_USER_ID,
@@ -242,13 +321,17 @@ def register(app) -> None:
                                    'MDB usage')
             return
 
-        # Race guard: multi-MDB DM may have raced another assignee.
-        if not _check_still_actionable(client, body, domain,
-                                       S.AWAITING_MDB_USAGE_RESPONSE):
+        # Stale-click guard: if the row already left AWAITING, a sibling
+        # recipient already resolved it — name the winner and bail.
+        current = (store.get_domain(domain) or {}).get('lifecycle_state')
+        if current != S.AWAITING_MDB_USAGE_RESPONSE:
+            _already_handled(client, body, domain)
             return
 
         # Contradiction guard: MDB says "not using" but recent spend
         # disagrees → don't auto-disable; loop in TL with both signals.
+        # This does NOT resolve the prompt — state stays AWAITING and the
+        # other recipients' cards stay live (only the clicker's is replaced).
         cost = _recent_spend(domain)
         if cost >= Config.LIFECYCLE_ACTIVE_SPEND_USD:
             store.record_event(
@@ -273,9 +356,11 @@ def register(app) -> None:
             )
             return
 
-        store.set_lifecycle_state(
-            domain, S.AWAITING_UTKARSH_DISABLE_RENEW,
-        )
+        # No contradiction → resolve. Atomic first-click-wins.
+        if not _claim(client, body, domain, S.AWAITING_MDB_USAGE_RESPONSE,
+                      S.AWAITING_UTKARSH_DISABLE_RENEW):
+            return
+
         store.record_event(
             domain, 'mdb_said_using_no', actor=actor,
             from_state=S.AWAITING_MDB_USAGE_RESPONSE,
@@ -286,6 +371,12 @@ def register(app) -> None:
             header_text=f':x: Not using {domain}',
             context_text=(f'<@{actor}> confirmed not in use. '
                           'Asking Utkarsh to disable auto-renew so it lapses cleanly.'),
+        )
+        _sync_siblings(
+            client, body, domain,
+            header_text=f':x: Not using {domain}',
+            sibling_context=(f'<@{actor}> confirmed not in use — resolved. '
+                             'Utkarsh asked to disable auto-renew.'),
         )
         _dm.dm(
             client, real_recipient=Config.UTKARSH_SLACK_USER_ID,
@@ -428,14 +519,12 @@ def register(app) -> None:
                                        'MDB inventory')
                 return
 
-            # Race guard: multi-MDB DM may have raced another assignee.
-            if not _check_still_actionable(
-                client, body, domain, S.AWAITING_MDB_INVENTORY_RESPONSE,
-            ):
+            new_state = S.EXTENDED_30 if days == 30 else S.EXTENDED_15
+            # Atomic first-click-wins across every fan-out recipient.
+            if not _claim(client, body, domain,
+                          S.AWAITING_MDB_INVENTORY_RESPONSE, new_state):
                 return
 
-            new_state = S.EXTENDED_30 if days == 30 else S.EXTENDED_15
-            store.set_lifecycle_state(domain, new_state)
             store.record_event(
                 domain, f'mdb_extended_{days}', actor=actor,
                 from_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
@@ -446,6 +535,12 @@ def register(app) -> None:
                 client, body,
                 header_text=f':zzz: Snoozed {domain} for {days} days',
                 context_text=f'<@{actor}> kept it. Will re-check after {days} days.',
+            )
+            _sync_siblings(
+                client, body, domain,
+                header_text=f':zzz: Snoozed {domain} for {days} days',
+                sibling_context=(f'<@{actor}> kept it — resolved. '
+                                 f'Will re-check after {days} days.'),
             )
             _dm.dm(
                 client, real_recipient=Config.TL_SLACK_USER_ID,
@@ -472,15 +567,16 @@ def register(app) -> None:
                                    'MDB inventory')
             return
 
-        # Race guard: multi-MDB DM may have raced another assignee.
-        if not _check_still_actionable(client, body, domain,
-                                       S.AWAITING_MDB_INVENTORY_RESPONSE):
+        # Atomic first-click-wins across every fan-out recipient.
+        if not _claim(client, body, domain,
+                      S.AWAITING_MDB_INVENTORY_RESPONSE, S.INVENTORY):
             return
 
         # Per design: leave AWS resources alive (cert / R53 / CF / S3)
         # so rotation reuse is fast. We only release ownership.
         # Phase E: end ALL active assignments (multi-MDB safe) AND clear
         # the legacy assigned_to column for backwards-compat reads.
+        # (lifecycle_state is already INVENTORY — _claim did that.)
         previous_assignments = [
             a['slack_user_id']
             for a in store.current_assignments_for_domain(domain)
@@ -488,7 +584,6 @@ def register(app) -> None:
         for uid in previous_assignments:
             store.end_assignment(domain, uid, by=actor)
         store.assign_to(domain, None)
-        store.set_lifecycle_state(domain, S.INVENTORY)
         store.record_event(
             domain, 'pushed_to_inventory', actor=actor,
             from_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
@@ -503,6 +598,12 @@ def register(app) -> None:
             header_text=f':package: Pushed to inventory: {domain}',
             context_text=(f'<@{actor}> released it. AWS resources stay alive '
                           'for rotation reuse.'),
+        )
+        _sync_siblings(
+            client, body, domain,
+            header_text=f':package: Pushed to inventory: {domain}',
+            sibling_context=(f'<@{actor}> released it to inventory — resolved. '
+                             'AWS resources stay alive for rotation reuse.'),
         )
         _dm.dm(
             client, real_recipient=Config.TL_SLACK_USER_ID,

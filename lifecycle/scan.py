@@ -206,13 +206,60 @@ def _handle_expired(slack_client, row, from_state, spend) -> str:
     return 'classified'
 
 
+def _build_recipient_list(assignees):
+    """Phase F — fan-out targets for a prompt: every assigned MDB PLUS
+    the TL. Returns [(slack_user_id, is_tl), ...], deduped.
+
+    The TL is a full interactive recipient (same card, same buttons) so
+    he can resolve a prompt himself if the MDBs are slow — strict
+    first-click-wins, the existing 48h SLA escalator stays as the
+    separate "nobody answered" path. If the TL is also an assigned MDB
+    they appear once (as the MDB — the is_tl flag is display-only).
+    """
+    tl_norm = _dm.normalise_slack_id(Config.TL_SLACK_USER_ID)
+    out = []
+    seen = set()
+    for uid in assignees:
+        n = _dm.normalise_slack_id(uid)
+        if n and n not in seen:
+            seen.add(n)
+            out.append((uid, False))
+    if tl_norm and tl_norm not in seen:
+        out.append((Config.TL_SLACK_USER_ID, True))
+    return out
+
+
+def _extract_message_coords(resp, recipient_uid, is_tl):
+    """Pull {channel, ts} out of a successful chat_postMessage response
+    so we can record the recipient in the fan-out ledger.
+
+    Returns the ledger dict, or None for: dry-run sentinels (no real
+    message), unresolved recipients (_dm.dm returned None), or responses
+    missing channel/ts. A None recipient is simply omitted from the
+    ledger — there's no card to sync for them.
+    """
+    if not resp or not isinstance(resp, dict) or resp.get('dry_run'):
+        return None
+    channel = resp.get('channel')
+    ts = resp.get('ts')
+    if not channel or not ts:
+        return None
+    return {
+        'recipient_slack_id': recipient_uid,
+        'channel_id': channel,
+        'message_ts': ts,
+        'is_tl': is_tl,
+    }
+
+
 def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
     """TL Flow 2 — MDB hasn't run any spend in 30 days. Ask whether to
     keep the domain (30/15-day snooze) or push it to the inventory pool.
 
-    Multi-MDB: when a domain has multiple active assignments, DM each
-    MDB separately so any of them can answer. First click wins (handler
-    guards against double-action via state check)."""
+    Phase F: fans out to every assigned MDB AND the TL. Records each
+    recipient's Slack message coords in domain_prompt_recipients so the
+    button handlers can sync every sibling card on resolution. First
+    click wins (handler uses an atomic state transition)."""
     domain = row['domain']
     assignees = _dm.get_mdb_slack_ids_for_domain(domain, row=row)
 
@@ -229,24 +276,27 @@ def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
     if not _dedup_ok(row):
         return 'skipped'
 
-    sent_any = False
-    for mdb_uid in assignees:
-        blocks = _idle_card(domain, mdb_uid, spend)
-        sent = _dm.dm(
-            slack_client, real_recipient=mdb_uid,
+    recipients = _build_recipient_list(assignees)
+    sent_records = []
+    for uid, is_tl in recipients:
+        blocks = _idle_card(domain, uid, spend)
+        resp = _dm.dm(
+            slack_client, real_recipient=uid,
             text=(f'Heads up — `{domain}` had no spend in the last 30 days. '
                   'keep it, or push to inventory?'),
             blocks=blocks,
-            dry_run_label=f'idle_prompt:{domain}:{mdb_uid}',
+            dry_run_label=f'idle_prompt:{domain}:{uid}',
         )
-        if sent is not None:
-            sent_any = True
+        rec = _extract_message_coords(resp, uid, is_tl)
+        if rec:
+            sent_records.append(rec)
 
-    if not sent_any:
+    if not sent_records and not Config.LIFECYCLE_DRY_RUN:
         _dm.dm(
             slack_client, real_recipient=Config.TL_SLACK_USER_ID,
             text=(f':warning: `{domain}` is idle but every DM attempt '
-                  f'failed (assignees: {assignees}). Reassign or push to inventory.'),
+                  f'failed (recipients: {[u for u, _ in recipients]}). '
+                  'Reassign or push to inventory.'),
             dry_run_label=f'idle_dm_failed:{domain}',
         )
         return 'skipped'
@@ -261,10 +311,12 @@ def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
 
     store.set_lifecycle_state(domain, S.AWAITING_MDB_INVENTORY_RESPONSE)
     store.bump_last_prompted_at(domain)
+    store.record_prompt_recipients(domain, sent_records)
     store.record_event(
         domain, 'prompted_mdb_idle', actor='cron',
         from_state=from_state, to_state=S.AWAITING_MDB_INVENTORY_RESPONSE,
-        metadata={'spend': spend, 'assignees': assignees},
+        metadata={'spend': spend,
+                  'recipients': [r['recipient_slack_id'] for r in sent_records]},
     )
     return 'prompted'
 
@@ -275,8 +327,8 @@ def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str
     (EXPIRING_30/14/7/1) all enter through here; urgency escalates
     via the days_left label in the DM copy.
 
-    Multi-MDB: same pattern as _prompt_mdb_idle — DM each assignee
-    independently, first click wins (handler guards via state check)."""
+    Phase F: same fan-out pattern as _prompt_mdb_idle — DM every
+    assigned MDB AND the TL, record the ledger, first click wins."""
     domain = row['domain']
     assignees = _dm.get_mdb_slack_ids_for_domain(domain, row=row)
     days_left_label = new_state.removeprefix('EXPIRING_')
@@ -293,25 +345,27 @@ def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str
     if not _dedup_ok(row):
         return 'skipped'
 
-    sent_any = False
-    for mdb_uid in assignees:
-        blocks = _expiring_card(domain, mdb_uid, days_left_label, new_state, spend)
-        sent = _dm.dm(
-            slack_client, real_recipient=mdb_uid,
+    recipients = _build_recipient_list(assignees)
+    sent_records = []
+    for uid, is_tl in recipients:
+        blocks = _expiring_card(domain, uid, days_left_label, new_state, spend)
+        resp = _dm.dm(
+            slack_client, real_recipient=uid,
             text=(f'`{domain}` expires in ~{days_left_label} day(s). '
                   'are you still using it?'),
             blocks=blocks,
-            dry_run_label=f'expiring_{days_left_label}:{domain}:{mdb_uid}',
+            dry_run_label=f'expiring_{days_left_label}:{domain}:{uid}',
         )
-        if sent is not None:
-            sent_any = True
+        rec = _extract_message_coords(resp, uid, is_tl)
+        if rec:
+            sent_records.append(rec)
 
-    if not sent_any:
+    if not sent_records and not Config.LIFECYCLE_DRY_RUN:
         _dm.dm(
             slack_client, real_recipient=Config.TL_SLACK_USER_ID,
             text=(f':warning: `{domain}` expires in ~{days_left_label} day(s); '
-                  f'every DM attempt failed (assignees: {assignees}). '
-                  'Decide manually.'),
+                  f'every DM attempt failed (recipients: '
+                  f'{[u for u, _ in recipients]}). Decide manually.'),
             dry_run_label=f'expiring_dm_failed:{domain}',
         )
         return 'skipped'
@@ -323,11 +377,13 @@ def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str
 
     store.set_lifecycle_state(domain, S.AWAITING_MDB_USAGE_RESPONSE)
     store.bump_last_prompted_at(domain)
+    store.record_prompt_recipients(domain, sent_records)
     store.record_event(
         domain, 'prompted_mdb_usage', actor='cron',
         from_state=from_state, to_state=S.AWAITING_MDB_USAGE_RESPONSE,
         metadata={
-            'spend': spend, 'assignees': assignees,
+            'spend': spend,
+            'recipients': [r['recipient_slack_id'] for r in sent_records],
             'days_until_expiry': days_left_label,
             'expiring_state': new_state,
         },
@@ -339,20 +395,31 @@ def _dedup_ok(row) -> bool:
     """Defensive 23h dedup. The state-machine filter
     (exclude_states=AWAITING_*) already prevents most duplicate prompts;
     this is a belt-and-braces guard for cases where state was manually
-    cleared but the prompt was sent recently."""
+    cleared but the prompt was sent recently.
+
+    Must compare at DATETIME precision, not date — coercing to a date
+    measures the window from midnight, which makes the guard pass or
+    fail depending on the time of day (a domain prompted 5 minutes ago
+    could read as "23h ago" if it's late evening). Bug caught 2026-05-14.
+    """
+    import datetime as _dt
     last = row.get('last_prompted_at')
     if last is None:
         return True
-    # `last` may be a datetime (Postgres) or ISO string (SQLite). Defer
-    # to the classifier's coercion helper to keep one date-parsing seam.
-    from lifecycle.classifier import _coerce_date
-    last_date = _coerce_date(last)
-    if last_date is None:
+    # Postgres hands us a datetime (tz-aware); SQLite an ISO string.
+    if isinstance(last, _dt.datetime):
+        last_dt = last
+    elif isinstance(last, str):
+        try:
+            last_dt = _dt.datetime.fromisoformat(last.strip())
+        except ValueError:
+            return True  # unparseable → don't block the prompt
+    else:
         return True
-    import datetime as _dt
-    age_h = (_dt.datetime.now() - _dt.datetime(
-        last_date.year, last_date.month, last_date.day,
-    )).total_seconds() / 3600
+    # datetime.now() is naive; strip tzinfo so the subtraction is valid.
+    if last_dt.tzinfo is not None:
+        last_dt = last_dt.replace(tzinfo=None)
+    age_h = (_dt.datetime.now() - last_dt).total_seconds() / 3600
     return age_h >= Config.LIFECYCLE_PROMPT_DEDUP_HOURS
 
 

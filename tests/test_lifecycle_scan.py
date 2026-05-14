@@ -20,7 +20,18 @@ TODAY = dt.date(2026, 6, 1)
 
 
 def _slack_client():
-    return MagicMock(name='slack_client')
+    """Mock Slack client. chat_postMessage returns the real Slack API
+    response shape ({ok, channel, ts}) so Phase F's fan-out ledger can
+    capture channel + ts per recipient. Each call gets a distinct ts."""
+    client = MagicMock(name='slack_client')
+    _seq = iter(range(1, 100000))
+    def _post(*args, **kwargs):
+        n = next(_seq)
+        return {'ok': True,
+                'channel': kwargs.get('channel', 'D_TEST'),
+                'ts': f'1700000000.{n:06d}'}
+    client.chat_postMessage.side_effect = _post
+    return client
 
 
 def _all_dms(client) -> list:
@@ -115,21 +126,24 @@ def test_idle_prompt_dms_assigned_mdb_with_buttons(tmp_inventory, monkeypatch):
     row = tmp_inventory.get_domain('quiet.com')
     assert row['lifecycle_state'] == S.AWAITING_MDB_INVENTORY_RESPONSE
     assert row['last_prompted_at'] is not None
-    # MDB got the DM
+    # Phase F: fan-out goes to the assigned MDB AND the TL.
     dms = _all_dms(client)
-    assert len(dms) == 1
-    channel, text = dms[0]
-    assert channel == 'U_NEERAJ'
-    assert 'quiet.com' in text
-    # Button payload check
-    blocks = client.chat_postMessage.call_args.kwargs['blocks']
-    button_action_ids = {
-        b.get('action_id') for el in blocks if el.get('type') == 'actions'
-        for b in el['elements']
-    }
-    assert button_action_ids == {
-        'lifecycle_keep_30', 'lifecycle_keep_15', 'lifecycle_push_inventory',
-    }
+    assert len(dms) == 2
+    channels = {ch for ch, _ in dms}
+    assert channels == {'U_NEERAJ', 'U_TL'}
+    assert all('quiet.com' in text for _, text in dms)
+    # Every recipient card carries the same action buttons.
+    for call in client.chat_postMessage.call_args_list:
+        blocks = call.kwargs['blocks']
+        button_action_ids = {
+            b.get('action_id') for el in blocks if el.get('type') == 'actions'
+            for b in el['elements']
+        }
+        assert button_action_ids == {
+            'lifecycle_keep_30', 'lifecycle_keep_15', 'lifecycle_push_inventory',
+        }
+    # Fan-out ledger recorded both recipients.
+    assert len(store.get_prompt_recipients('quiet.com')) == 2
     assert counters['prompted'] == 1
 
 
@@ -186,14 +200,16 @@ def test_expiring_prompt_dms_mdb_with_yes_no_buttons(tmp_inventory, monkeypatch)
 
     row = tmp_inventory.get_domain('dying.com')
     assert row['lifecycle_state'] == S.AWAITING_MDB_USAGE_RESPONSE
+    # Phase F: fan-out goes to the assigned MDB AND the TL.
     dms = _all_dms(client)
-    assert len(dms) == 1
-    channel, _text = dms[0]
-    assert channel == 'U_NEERAJ'
-    blocks = client.chat_postMessage.call_args.kwargs['blocks']
-    action_ids = {b['action_id'] for el in blocks if el.get('type') == 'actions'
-                  for b in el['elements']}
-    assert action_ids == {'lifecycle_using_yes', 'lifecycle_using_no'}
+    assert len(dms) == 2
+    assert {ch for ch, _ in dms} == {'U_NEERAJ', 'U_TL'}
+    for call in client.chat_postMessage.call_args_list:
+        blocks = call.kwargs['blocks']
+        action_ids = {b['action_id'] for el in blocks
+                      if el.get('type') == 'actions' for b in el['elements']}
+        assert action_ids == {'lifecycle_using_yes', 'lifecycle_using_no'}
+    assert len(store.get_prompt_recipients('dying.com')) == 2
     assert counters['prompted'] == 1
 
 

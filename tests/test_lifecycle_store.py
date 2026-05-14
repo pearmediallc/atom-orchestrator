@@ -291,3 +291,54 @@ def test_namecheap_sync_respects_limit(tmp_inventory):
         store.add_domain(domain=f'ex{i}.com')
     due = store.get_domains_due_for_namecheap_sync(limit=3)
     assert len(due) == 3
+
+
+# ─── Phase F — atomic state guard + prompt fan-out ledger ─────────────────
+
+def test_transition_lifecycle_state_atomic(tmp_inventory):
+    """transition_lifecycle_state moves the row only if it's still in
+    the expected from_state — the DB-level first-click-wins guard."""
+    store.add_domain(domain='d.com')
+    store.set_lifecycle_state('d.com', S.AWAITING_MDB_INVENTORY_RESPONSE)
+
+    # Wins from the matching state.
+    assert store.transition_lifecycle_state(
+        'd.com', S.AWAITING_MDB_INVENTORY_RESPONSE, S.INVENTORY) is True
+    assert tmp_inventory.get_domain('d.com')['lifecycle_state'] == S.INVENTORY
+
+    # A second attempt from the now-stale original state loses, and the
+    # row is left exactly as the winner set it.
+    assert store.transition_lifecycle_state(
+        'd.com', S.AWAITING_MDB_INVENTORY_RESPONSE, S.EXTENDED_30) is False
+    assert tmp_inventory.get_domain('d.com')['lifecycle_state'] == S.INVENTORY
+
+
+def test_transition_lifecycle_state_from_null(tmp_inventory):
+    """from_state=None is NULL-safe — matches a freshly-classified row."""
+    store.add_domain(domain='d.com')  # lifecycle_state starts NULL
+    assert store.transition_lifecycle_state(
+        'd.com', None, S.ACTIVE) is True
+    assert tmp_inventory.get_domain('d.com')['lifecycle_state'] == S.ACTIVE
+    # Re-running from None now loses (row is no longer NULL).
+    assert store.transition_lifecycle_state('d.com', None, S.IDLE) is False
+
+
+def test_prompt_recipients_round_trip(tmp_inventory):
+    """record / get / clear the fan-out ledger; re-recording replaces."""
+    store.add_domain(domain='d.com')
+    recips = [
+        {'recipient_slack_id': 'U_A', 'channel_id': 'D_A',
+         'message_ts': '1.1', 'is_tl': False},
+        {'recipient_slack_id': 'U_TL', 'channel_id': 'D_TL',
+         'message_ts': '2.2', 'is_tl': True},
+    ]
+    store.record_prompt_recipients('d.com', recips)
+    got = store.get_prompt_recipients('d.com')
+    assert {r['recipient_slack_id'] for r in got} == {'U_A', 'U_TL'}
+
+    # Re-recording is DELETE + INSERT — it replaces, never appends.
+    store.record_prompt_recipients('d.com', recips[:1])
+    assert len(store.get_prompt_recipients('d.com')) == 1
+
+    store.clear_prompt_recipients('d.com')
+    assert store.get_prompt_recipients('d.com') == []

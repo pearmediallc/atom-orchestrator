@@ -188,6 +188,25 @@ CREATE TABLE IF NOT EXISTS domain_assignments (
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_domain  ON domain_assignments(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_user    ON domain_assignments(slack_user_id);
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_current ON domain_assignments(domain) WHERE ended_at IS NULL;
+
+-- Phase F — domain_prompt_recipients: the fan-out ledger.
+-- When the cron sends an idle/expiring prompt, it fans the DM out to
+-- every assigned MDB AND the TL. This table records each recipient's
+-- Slack message coordinates (channel + ts) so that when ANY recipient
+-- clicks a button, the handler can sync every sibling card to
+-- "resolved by <responder>". Rewritten (DELETE + INSERT) on each new
+-- prompt for a domain — a domain is in at most one AWAITING_* state at
+-- a time, so only the current prompt's fan-out is ever live.
+CREATE TABLE IF NOT EXISTS domain_prompt_recipients (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain              TEXT NOT NULL,
+    recipient_slack_id  TEXT NOT NULL,
+    channel_id          TEXT NOT NULL,
+    message_ts          TEXT NOT NULL,
+    is_tl               INTEGER NOT NULL DEFAULT 0,
+    created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_domain_prompt_recipients_domain ON domain_prompt_recipients(domain);
 """
 
 _POSTGRES_SCHEMA = """
@@ -268,6 +287,18 @@ CREATE TABLE IF NOT EXISTS domain_assignments (
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_domain  ON domain_assignments(domain);
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_user    ON domain_assignments(slack_user_id);
 CREATE INDEX IF NOT EXISTS idx_domain_assignments_current ON domain_assignments(domain) WHERE ended_at IS NULL;
+
+-- Phase F — see SQLite schema above for design rationale.
+CREATE TABLE IF NOT EXISTS domain_prompt_recipients (
+    id                  SERIAL PRIMARY KEY,
+    domain              TEXT NOT NULL,
+    recipient_slack_id  TEXT NOT NULL,
+    channel_id          TEXT NOT NULL,
+    message_ts          TEXT NOT NULL,
+    is_tl               BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_domain_prompt_recipients_domain ON domain_prompt_recipients(domain);
 """
 
 # Columns added post-launch — these need to be ALTER-added on existing
@@ -1378,6 +1409,99 @@ def end_assignment(
         if _is_postgres():
             cur.close()
     return rowcount
+
+
+# ─── Phase F — prompt fan-out ledger + atomic state guard ──────────────────
+
+def transition_lifecycle_state(
+    domain: str, from_state: Optional[str], to_state: Optional[str],
+) -> bool:
+    """Atomically move a domain's lifecycle_state, but ONLY if it's
+    currently `from_state`. Returns True if this call won the move,
+    False if the row was already in some other state (someone else got
+    there first).
+
+    This is the real first-click-wins guard for multi-recipient prompts.
+    `_check_still_actionable` reads-then-acts, which has a race window
+    between two near-simultaneous clicks; this UPDATE ... WHERE closes
+    it — the DB decides the winner.
+    """
+    # NULL-safe comparison: from_state can be NULL (freshly classified).
+    if from_state is None:
+        where = 'WHERE domain = ? AND lifecycle_state IS NULL'
+        params: tuple = (to_state, domain)
+    else:
+        where = 'WHERE domain = ? AND lifecycle_state = ?'
+        params = (to_state, domain, from_state)
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'UPDATE domains SET lifecycle_state = ?, '
+            'updated_at = CURRENT_TIMESTAMP ' + where,
+            params,
+        )
+        won = (cur.rowcount if hasattr(cur, 'rowcount') else 0) > 0
+        if _is_postgres():
+            cur.close()
+    return won
+
+
+def record_prompt_recipients(domain: str, recipients: List[Dict]) -> None:
+    """Persist the fan-out for a domain's current prompt. `recipients` is
+    a list of {recipient_slack_id, channel_id, message_ts, is_tl}.
+
+    DELETE + INSERT: the previous prompt cycle's rows (if any) are
+    cleared first, so get_prompt_recipients only ever returns the live
+    fan-out. Recipients whose DM failed to send (no channel/ts) should
+    simply be omitted by the caller — there's no card to sync for them.
+    """
+    with _conn() as c:
+        cur = _execute(
+            c, 'DELETE FROM domain_prompt_recipients WHERE domain = ?',
+            (domain,),
+        )
+        if _is_postgres():
+            cur.close()
+        for r in recipients:
+            cur = _execute(
+                c,
+                'INSERT INTO domain_prompt_recipients '
+                '(domain, recipient_slack_id, channel_id, message_ts, is_tl) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (domain, r['recipient_slack_id'], r['channel_id'],
+                 r['message_ts'], 1 if r.get('is_tl') else 0),
+            )
+            if _is_postgres():
+                cur.close()
+
+
+def get_prompt_recipients(domain: str) -> List[Dict]:
+    """Every recipient card for the domain's current prompt — used by the
+    button handlers to sync all sibling messages on resolution."""
+    with _conn() as c:
+        cur = _execute(
+            c,
+            'SELECT recipient_slack_id, channel_id, message_ts, is_tl '
+            'FROM domain_prompt_recipients WHERE domain = ? '
+            'ORDER BY id ASC',
+            (domain,),
+        )
+        rows = cur.fetchall()
+        if _is_postgres():
+            cur.close()
+    return [dict(r) for r in rows]
+
+
+def clear_prompt_recipients(domain: str) -> None:
+    """Drop the fan-out ledger for a domain — called after a resolution
+    has been synced to every sibling card."""
+    with _conn() as c:
+        cur = _execute(
+            c, 'DELETE FROM domain_prompt_recipients WHERE domain = ?',
+            (domain,),
+        )
+        if _is_postgres():
+            cur.close()
 
 
 def get_domains_due_for_namecheap_sync(

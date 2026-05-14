@@ -382,3 +382,81 @@ def test_dev_reroute_lets_dev_user_act_as_anyone(tmp_inventory, app, monkeypatch
     # Click went through
     assert tmp_inventory.get_domain('alive.com')['lifecycle_state'] == S.RENEWED
     assert client.chat_postEphemeral.call_count == 0
+
+
+# ─── Phase F — fan-out sibling sync + atomic first-click-wins ─────────────
+
+def _seed_idle_with_fanout(domain='quiet.com'):
+    """A domain in AWAITING_MDB_INVENTORY_RESPONSE with a 2-recipient
+    fan-out ledger: the MDB (C_DM/123.45) and the TL (C_TL/999.99)."""
+    store.add_domain(domain=domain, assigned_to='U_NEERAJ')
+    store.set_lifecycle_state(domain, S.AWAITING_MDB_INVENTORY_RESPONSE)
+    store.record_prompt_recipients(domain, [
+        {'recipient_slack_id': 'U_NEERAJ', 'channel_id': 'C_DM',
+         'message_ts': '123.45', 'is_tl': False},
+        {'recipient_slack_id': 'U_TL', 'channel_id': 'C_TL',
+         'message_ts': '999.99', 'is_tl': True},
+    ])
+
+
+def test_resolution_syncs_sibling_cards(tmp_inventory, app):
+    """When one recipient resolves, every OTHER recipient's card gets
+    chat_update'd and the fan-out ledger is cleared."""
+    _seed_idle_with_fanout()
+
+    body = _body('lifecycle_keep_30',
+                 {'domain': 'quiet.com', 'assigned_to': 'U_NEERAJ'},
+                 user='U_NEERAJ', channel='C_DM', message_ts='123.45')
+    ack, client = app.call('lifecycle_keep_30', body)
+
+    assert tmp_inventory.get_domain('quiet.com')['lifecycle_state'] == S.EXTENDED_30
+    # The TL's sibling card was chat_update'd.
+    updated = {(c.kwargs.get('channel'), c.kwargs.get('ts'))
+               for c in client.chat_update.call_args_list}
+    assert ('C_TL', '999.99') in updated
+    # Ledger cleared after the sync.
+    assert store.get_prompt_recipients('quiet.com') == []
+
+
+def test_second_clicker_loses_race_and_is_named(tmp_inventory, app):
+    """First click wins atomically; a sibling clicking afterwards loses,
+    the row is untouched, and the ephemeral names who already resolved."""
+    _seed_idle_with_fanout()
+
+    # First click — the MDB keeps it 30 days → wins.
+    app.call('lifecycle_keep_30',
+             _body('lifecycle_keep_30',
+                   {'domain': 'quiet.com', 'assigned_to': 'U_NEERAJ'},
+                   user='U_NEERAJ', channel='C_DM', message_ts='123.45'))
+    assert tmp_inventory.get_domain('quiet.com')['lifecycle_state'] == S.EXTENDED_30
+
+    # Second click — the TL clicks push_inventory on the now-stale card.
+    ack, client = app.call(
+        'lifecycle_push_inventory',
+        _body('lifecycle_push_inventory',
+              {'domain': 'quiet.com', 'assigned_to': 'U_TL'},
+              user='U_TL', channel='C_TL', message_ts='999.99'))
+
+    # State unchanged — the loser's click did nothing.
+    assert tmp_inventory.get_domain('quiet.com')['lifecycle_state'] == S.EXTENDED_30
+    # Ephemeral names the actual winner, not "someone else".
+    eph = client.chat_postEphemeral.call_args
+    assert 'U_NEERAJ' in eph.kwargs['text']
+
+
+def test_tl_can_resolve_the_prompt(tmp_inventory, app):
+    """The TL is a full interactive recipient — clicking their own card
+    resolves the prompt just like an MDB would."""
+    _seed_idle_with_fanout()
+
+    ack, client = app.call(
+        'lifecycle_push_inventory',
+        _body('lifecycle_push_inventory',
+              {'domain': 'quiet.com', 'assigned_to': 'U_TL'},
+              user='U_TL', channel='C_TL', message_ts='999.99'))
+
+    assert tmp_inventory.get_domain('quiet.com')['lifecycle_state'] == S.INVENTORY
+    # The MDB's sibling card got synced.
+    updated = {(c.kwargs.get('channel'), c.kwargs.get('ts'))
+               for c in client.chat_update.call_args_list}
+    assert ('C_DM', '123.45') in updated
