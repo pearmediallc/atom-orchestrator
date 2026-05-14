@@ -182,12 +182,6 @@ def _handle_expired(slack_client, row, from_state, spend) -> str:
     No MDB DM — at this point the domain is dead and the conversation
     is between TL and Utkarsh."""
     domain = row['domain']
-    store.set_lifecycle_state(domain, S.EXPIRED)
-    store.record_event(
-        domain, 'expired', actor='cron',
-        from_state=from_state, to_state=S.EXPIRED,
-        metadata={'spend': spend, 'expire_at': str(row.get('expire_at'))},
-    )
     _dm.dm(
         slack_client,
         real_recipient=Config.TL_SLACK_USER_ID,
@@ -197,6 +191,17 @@ def _handle_expired(slack_client, row, from_state, spend) -> str:
               f"${float(spend.get('revenue') or 0):.2f}. Coordinate with "
               f'Utkarsh on whether to re-buy or write it off.'),
         dry_run_label=f'expired:{domain}',
+    )
+    # Dry run is observe-only — see the note in _prompt_mdb_idle. Setting
+    # EXPIRED here means the next run sees it as 'unchanged' and the real
+    # TL alert never fires once we flip live.
+    if Config.LIFECYCLE_DRY_RUN:
+        return 'classified'
+    store.set_lifecycle_state(domain, S.EXPIRED)
+    store.record_event(
+        domain, 'expired', actor='cron',
+        from_state=from_state, to_state=S.EXPIRED,
+        metadata={'spend': spend, 'expire_at': str(row.get('expire_at'))},
     )
     return 'classified'
 
@@ -245,6 +250,14 @@ def _prompt_mdb_idle(slack_client, row, from_state, spend) -> str:
             dry_run_label=f'idle_dm_failed:{domain}',
         )
         return 'skipped'
+
+    # Dry run is observe-only. The "would DM" lines are already logged
+    # by _dm.dm above — do NOT advance the state machine. If we set
+    # AWAITING_* here, the classifier skips the row on every later run
+    # (rule 1), so once we flip live the REAL DM never goes out. The
+    # row would be stuck waiting on a click for a DM that was never sent.
+    if Config.LIFECYCLE_DRY_RUN:
+        return 'prompted'
 
     store.set_lifecycle_state(domain, S.AWAITING_MDB_INVENTORY_RESPONSE)
     store.bump_last_prompted_at(domain)
@@ -302,6 +315,11 @@ def _prompt_mdb_expiring(slack_client, row, from_state, new_state, spend) -> str
             dry_run_label=f'expiring_dm_failed:{domain}',
         )
         return 'skipped'
+
+    # Dry run is observe-only — see the note in _prompt_mdb_idle. Don't
+    # advance to AWAITING_* or the real expiry DM never fires once live.
+    if Config.LIFECYCLE_DRY_RUN:
+        return 'prompted'
 
     store.set_lifecycle_state(domain, S.AWAITING_MDB_USAGE_RESPONSE)
     store.bump_last_prompted_at(domain)

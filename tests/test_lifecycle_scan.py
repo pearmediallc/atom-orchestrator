@@ -227,9 +227,16 @@ def test_expired_dms_tl_no_mdb(tmp_inventory, monkeypatch):
 
 # ─── DRY_RUN gate ──────────────────────────────────────────────────────────
 
-def test_dry_run_does_not_send_dms_but_still_classifies(tmp_inventory, monkeypatch):
-    """LIFECYCLE_DRY_RUN=true → no real DMs go out, but state transitions
-    still happen so we can audit what the classifier WOULD have said."""
+def test_dry_run_does_not_send_dms_or_advance_state(tmp_inventory, monkeypatch):
+    """LIFECYCLE_DRY_RUN=true is observe-only: no real DMs, AND the state
+    machine is NOT advanced.
+
+    Regression guard (bug caught 2026-05-14): the prompt handlers used to
+    set AWAITING_* even under dry-run. Because the classifier skips
+    AWAITING_* rows, every domain a dry-run "prompted" got stuck — once
+    live the real DM would never fire. Dry-run must leave lifecycle_state
+    and last_prompted_at untouched; only the "would DM" log line happens.
+    """
     monkeypatch.setattr(Config, 'LIFECYCLE_DRY_RUN', True)
     monkeypatch.setattr(Config, 'TL_SLACK_USER_ID', 'U_TL')
     monkeypatch.setattr(Config, 'LIFECYCLE_ASSIGNMENT_GRACE_DAYS', 14)
@@ -243,13 +250,16 @@ def test_dry_run_does_not_send_dms_but_still_classifies(tmp_inventory, monkeypat
         )
 
     client = _slack_client()
-    scan.run_scan(slack_client=client, today=TODAY, spend_by_host={})
+    counters = scan.run_scan(slack_client=client, today=TODAY, spend_by_host={})
 
-    # No real DM sent
+    # No real DM sent.
     assert client.chat_postMessage.call_count == 0
-    # But state DID transition (we want the audit trail)
+    # The counter still reports what WOULD have happened (audit value).
+    assert counters['prompted'] == 1
+    # But the state machine is untouched — no AWAITING_*, no prompt stamp.
     row = tmp_inventory.get_domain('quiet.com')
-    assert row['lifecycle_state'] == S.AWAITING_MDB_INVENTORY_RESPONSE
+    assert row['lifecycle_state'] is None
+    assert row['last_prompted_at'] is None
 
 
 # ─── AWAITING_* protection ────────────────────────────────────────────────
