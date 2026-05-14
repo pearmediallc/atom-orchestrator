@@ -792,14 +792,28 @@ def update_namecheap_sync(
     stamps last_namecheap_sync_at so the classifier can avoid re-syncing
     a domain it just looked up.
 
+    Purely ADDITIVE: only columns we actually have a value for are
+    written. A None argument means "we didn't learn this — leave the
+    column alone", NOT "set it to NULL". This matters because the
+    backfill's "unknown" path (domain not in account OR a transient
+    fetch failure) calls this with everything None just to bump the
+    sync timestamp — and a transient proxy/rate-limit blip must NOT
+    destroy a previously-good expire_at. (Regression caught 2026-05-14:
+    a backfill run nulled expire_at on ~108 rows that hit transient
+    failures.) Stale data beats no data; the next good sync corrects it.
+
     `purchased_at` is Namecheap's CreatedDate — the real registration
     date. When provided it OVERWRITES domains.purchased_at (legacy CSV
-    rows carry the import date there, which is wrong). When None — e.g.
-    Namecheap omitted CreatedDate, or the domain isn't in our account —
-    purchased_at is left untouched rather than nulled.
+    rows carry the import date there, which is wrong).
     """
-    sets = ['expire_at = ?', 'auto_renew_enabled = ?']
-    params: list = [expire_at, auto_renew_enabled]
+    sets: list = []
+    params: list = []
+    if expire_at is not None:
+        sets.append('expire_at = ?')
+        params.append(expire_at)
+    if auto_renew_enabled is not None:
+        sets.append('auto_renew_enabled = ?')
+        params.append(auto_renew_enabled)
     if purchased_at is not None:
         sets.append('purchased_at = ?')
         params.append(purchased_at)

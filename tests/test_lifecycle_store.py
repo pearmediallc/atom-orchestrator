@@ -104,6 +104,26 @@ def test_update_namecheap_sync_leaves_purchased_at_when_none(tmp_inventory):
     assert after == before
 
 
+def test_update_namecheap_sync_failed_fetch_preserves_expire_at(tmp_inventory):
+    """Regression (2026-05-14): the backfill's 'unknown' path calls this
+    with everything None just to bump the sync timestamp. A transient
+    Namecheap failure must NOT null out a previously-good expire_at."""
+    store.add_domain(domain='ex.com')
+    store.update_namecheap_sync(
+        'ex.com', expire_at=dt.datetime(2027, 6, 1), auto_renew_enabled=None,
+    )
+    assert '2027' in str(tmp_inventory.get_domain('ex.com')['expire_at'])
+
+    # Simulate the 'unknown' path — fetch failed, everything None.
+    store.update_namecheap_sync(
+        'ex.com', expire_at=None, auto_renew_enabled=None,
+    )
+    row = tmp_inventory.get_domain('ex.com')
+    # expire_at survives; only the sync timestamp moved.
+    assert '2027' in str(row['expire_at'])
+    assert row['last_namecheap_sync_at'] is not None
+
+
 # ─── mark_active / assign_to ───────────────────────────────────────────────
 
 def test_mark_active_stamps_last_active_at(tmp_inventory):
