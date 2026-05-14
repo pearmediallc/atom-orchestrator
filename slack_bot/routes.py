@@ -1499,7 +1499,8 @@ if _bolt_app is not None:
         )
         external_line = (
             f'• External requester: *{external_requester}* '
-            f'(you, <@{operator}>, are the owner)\n'
+            f'— lifecycle owner will be Utkarsh (external domains are '
+            f'always Utkarsh-owned)\n'
             if external_requester else ''
         )
         receipt = (
@@ -1624,7 +1625,8 @@ if _bolt_app is not None:
 
         external_line = (
             f'• External requester: *{external_requester}* '
-            f'(owner stays <@{requester}>)\n'
+            f'— external domain, it will be assigned to you (Utkarsh) '
+            f'as the lifecycle owner\n'
             if external_requester else ''
         )
         utkarsh_text = (
@@ -2592,6 +2594,18 @@ if _bolt_app is not None:
         # the inventory write didn't happen, so we MUST surface it
         # instead of silently telling Slack "purchased ✅" while the
         # backing row was lost (2026-05-08 audit fix).
+        # Lifecycle owner. For INTERNAL domains it's the requester (the
+        # operator, or the MDB they picked). For EXTERNAL domains it is
+        # ALWAYS Utkarsh — he manages every external domain's renewal no
+        # matter which operator actually ran /new-domain-external. The
+        # operator who ran it stays recorded in requested_by below.
+        # Falls back to the requester only if UTKARSH_SLACK_USER_ID is
+        # unset (don't leave an external row ownerless).
+        if external_requester:
+            owner = Config.UTKARSH_SLACK_USER_ID or requester
+        else:
+            owner = requester
+
         try:
             inventory_store.add_domain(
                 domain=domain,
@@ -2609,10 +2623,9 @@ if _bolt_app is not None:
                 # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
                 status=inventory_store.STATUS_PENDING,
                 # Lifecycle ownership starts on day one — classifier needs
-                # an MDB to DM when this domain expires or goes idle. For
-                # external requests this is still the operator (the
-                # external requester has no Slack ID to own anything).
-                assigned_to=requester,
+                # an MDB to DM when this domain expires or goes idle.
+                # Internal: the requester. External: always Utkarsh.
+                assigned_to=owner,
                 # External-requester name lands in its own column (NULL
                 # for internal requests) — keeps requested_by clean and
                 # makes "how many external domains" a simple WHERE.
