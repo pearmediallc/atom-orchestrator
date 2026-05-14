@@ -427,32 +427,6 @@ def _ensure_indices(c) -> None:
         _execute(c, ddl)
 
 
-def _backfill_assigned_to_from_requested_by(c) -> None:
-    """Seed lifecycle's `assigned_to` column from `requested_by` on rows
-    where it's still NULL.
-
-    Why: the lifecycle classifier needs an MDB to DM. Pre-Phase-A rows
-    only have `requested_by` (set on Path B Mark Purchased + by the CSV
-    import). Copying that into `assigned_to` gives the bot something
-    to work with from day one.
-
-    `requested_by` values from confirm_purchased look like
-    'Slack:U_ABCDEF' (see slack_bot.routes._send_purchase…). Lifecycle's
-    DM helper strips that prefix at send time — we keep the value
-    verbatim here so requested_by stays the source of truth.
-
-    Idempotent: subsequent runs match 0 rows because assigned_to is
-    populated.
-    """
-    _execute(
-        c,
-        'UPDATE domains SET assigned_to = requested_by '
-        "WHERE assigned_to IS NULL "
-        "AND requested_by IS NOT NULL "
-        "AND requested_by <> ''"
-    )
-
-
 def _backfill_legacy_aws_account(c) -> None:
     """Set aws_account = 'auto-insurance' on rows where it is NULL or
     empty.
@@ -508,9 +482,6 @@ def init_db() -> None:
 
     with _conn() as c:
         _backfill_legacy_aws_account(c)
-
-    with _conn() as c:
-        _backfill_assigned_to_from_requested_by(c)
 
 
 def health_check() -> None:

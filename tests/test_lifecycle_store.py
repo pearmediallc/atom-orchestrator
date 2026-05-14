@@ -2,9 +2,8 @@
 
 These exercise the new schema columns (assigned_to, expire_at,
 auto_renew_enabled, last_active_at, last_prompted_at,
-last_namecheap_sync_at, lifecycle_state), the domain_events history
-table, and the boot-time backfill that copies requested_by → assigned_to
-on legacy rows.
+last_namecheap_sync_at, lifecycle_state) and the domain_events history
+table.
 """
 import datetime as dt
 
@@ -26,34 +25,6 @@ def test_init_db_creates_lifecycle_columns(tmp_inventory):
                 'last_active_at', 'last_prompted_at',
                 'last_namecheap_sync_at', 'lifecycle_state'):
         assert col in row, f'column {col!r} missing from domains schema'
-
-
-def test_assigned_to_backfilled_from_requested_by(tmp_inventory):
-    """Legacy rows (assigned_to NULL) get backfilled on next init_db."""
-    # Insert via raw SQL to mimic a legacy row that was added before
-    # add_domain accepted assigned_to.
-    with store._conn() as c:
-        c.execute(
-            'INSERT INTO domains (domain, requested_by, purchased_at, '
-            'updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
-            ('legacy.com', 'Slack:U_LEGACY_MDB'),
-        )
-    # Run init again — the backfill is part of init_db.
-    store.init_db()
-    row = tmp_inventory.get_domain('legacy.com')
-    assert row['assigned_to'] == 'Slack:U_LEGACY_MDB'
-
-
-def test_backfill_does_not_overwrite_existing_assigned_to(tmp_inventory):
-    """assigned_to that's already set must NOT be clobbered by the backfill."""
-    store.add_domain(
-        domain='already-owned.com',
-        requested_by='Slack:U_OLD_REQUESTER',
-        assigned_to='U_NEW_OWNER',
-    )
-    store.init_db()
-    row = tmp_inventory.get_domain('already-owned.com')
-    assert row['assigned_to'] == 'U_NEW_OWNER'
 
 
 def test_add_domain_accepts_assigned_to_kwarg(tmp_inventory):
