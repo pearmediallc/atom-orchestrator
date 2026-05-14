@@ -260,10 +260,17 @@ def get_domain_info(domain: str) -> Optional[Dict]:
     """Look up the registration details for one owned domain.
 
     Returns:
-      {'expire_at': datetime, 'auto_renew_enabled': None}     on success
-      None                                                    on any failure
-                                                              (transport, not-found,
-                                                              not-owned-by-this-user)
+      {'expire_at': datetime,           on success
+       'created_at': datetime | None,
+       'auto_renew_enabled': None}
+      None                              on any failure (transport,
+                                        not-found, not-owned-by-this-user)
+
+    `created_at` is Namecheap's CreatedDate — the real registration date
+    in this account. The lifecycle backfill writes it into
+    domains.purchased_at so that column reflects when the domain was
+    actually bought, not when our CSV import happened. May be None if
+    Namecheap omits it (rare); callers leave purchased_at untouched then.
 
     `auto_renew_enabled` is intentionally None for now — `domains.getInfo`
     doesn't return that field; it lives in `domains.getList` and is
@@ -286,13 +293,17 @@ def get_domain_info(domain: str) -> Optional[Dict]:
     # The DomainGetInfoResult element wraps the per-domain block. When
     # the domain isn't in this Namecheap account, Namecheap returns the
     # element with Status="Failed" or simply no DomainDetails child.
+    # CreatedDate + ExpiredDate live as siblings inside DomainDetails.
     expire_at: Optional[_dt.datetime] = None
+    created_at: Optional[_dt.datetime] = None
     for el in root.iter():
         if _local_name(el.tag) == 'DomainDetails':
             for child in el:
-                if _local_name(child.tag) == 'ExpiredDate':
+                tag = _local_name(child.tag)
+                if tag == 'ExpiredDate':
                     expire_at = _parse_namecheap_date(child.text)
-                    break
+                elif tag == 'CreatedDate':
+                    created_at = _parse_namecheap_date(child.text)
             break
 
     if expire_at is None:
@@ -306,6 +317,7 @@ def get_domain_info(domain: str) -> Optional[Dict]:
 
     return {
         'expire_at': expire_at,
+        'created_at': created_at,
         'auto_renew_enabled': None,
     }
 

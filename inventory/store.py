@@ -786,17 +786,31 @@ def update_namecheap_sync(
     domain: str,
     expire_at: Optional[_dt.datetime],
     auto_renew_enabled: Optional[bool],
+    purchased_at: Optional[_dt.datetime] = None,
 ) -> None:
     """Persist the result of a Namecheap domains.getInfo call. Always
     stamps last_namecheap_sync_at so the classifier can avoid re-syncing
-    a domain it just looked up."""
+    a domain it just looked up.
+
+    `purchased_at` is Namecheap's CreatedDate — the real registration
+    date. When provided it OVERWRITES domains.purchased_at (legacy CSV
+    rows carry the import date there, which is wrong). When None — e.g.
+    Namecheap omitted CreatedDate, or the domain isn't in our account —
+    purchased_at is left untouched rather than nulled.
+    """
+    sets = ['expire_at = ?', 'auto_renew_enabled = ?']
+    params: list = [expire_at, auto_renew_enabled]
+    if purchased_at is not None:
+        sets.append('purchased_at = ?')
+        params.append(purchased_at)
+    sets.append('last_namecheap_sync_at = CURRENT_TIMESTAMP')
+    sets.append('updated_at = CURRENT_TIMESTAMP')
+    params.append(domain)
     with _conn() as c:
         cur = _execute(
             c,
-            'UPDATE domains SET expire_at = ?, auto_renew_enabled = ?, '
-            'last_namecheap_sync_at = CURRENT_TIMESTAMP, '
-            'updated_at = CURRENT_TIMESTAMP WHERE domain = ?',
-            (expire_at, auto_renew_enabled, domain),
+            'UPDATE domains SET ' + ', '.join(sets) + ' WHERE domain = ?',
+            tuple(params),
         )
         if _is_postgres():
             cur.close()

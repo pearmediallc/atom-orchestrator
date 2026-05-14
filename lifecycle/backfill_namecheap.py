@@ -1,8 +1,10 @@
 """One-shot Namecheap expiry backfill for the lifecycle bot.
 
 Walks every domain in our table, calls namecheap.domains.getInfo to
-populate `expire_at`, and stamps `last_namecheap_sync_at` so the
-classifier's expiry cascade has data to act on.
+populate `expire_at` AND `purchased_at` (from Namecheap's CreatedDate —
+the real registration date, vs the CSV-import date legacy rows carry),
+and stamps `last_namecheap_sync_at` so the classifier's expiry cascade
+has data to act on.
 
 Usage:
     # 1. Make sure REDTRACK_API_KEY + NAMECHEAP_* are set in env.
@@ -146,12 +148,14 @@ def main() -> int:
                     )
             else:
                 expire = info['expire_at'].date() if info.get('expire_at') else 'unknown'
-                print(f'[{total:4d}] {domain:50s} expires={expire}')
+                created = info['created_at'].date() if info.get('created_at') else 'unknown'
+                print(f'[{total:4d}] {domain:50s} expires={expire}  registered={created}')
                 if args.apply:
                     store.update_namecheap_sync(
                         domain,
                         expire_at=info.get('expire_at'),
                         auto_renew_enabled=info.get('auto_renew_enabled'),
+                        purchased_at=info.get('created_at'),
                     )
                     saved += 1
 

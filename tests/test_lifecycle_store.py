@@ -78,6 +78,32 @@ def test_update_namecheap_sync_persists_expiry_and_autorenew(tmp_inventory):
     assert row['last_namecheap_sync_at'] is not None
 
 
+def test_update_namecheap_sync_overwrites_purchased_at_when_given(tmp_inventory):
+    """When Namecheap returns a CreatedDate, purchased_at is overwritten
+    with the real registration date (legacy rows carry the import date)."""
+    store.add_domain(domain='ex.com')  # stamps purchased_at = NOW()
+    real_reg = dt.datetime(2021, 3, 9, 0, 0, 0)
+    store.update_namecheap_sync(
+        'ex.com', expire_at=dt.datetime(2027, 1, 1),
+        auto_renew_enabled=None, purchased_at=real_reg,
+    )
+    row = tmp_inventory.get_domain('ex.com')
+    assert '2021-03-09' in str(row['purchased_at'])
+
+
+def test_update_namecheap_sync_leaves_purchased_at_when_none(tmp_inventory):
+    """When CreatedDate is absent (purchased_at=None), the existing
+    purchased_at is left untouched — NOT nulled."""
+    store.add_domain(domain='ex.com')
+    before = tmp_inventory.get_domain('ex.com')['purchased_at']
+    store.update_namecheap_sync(
+        'ex.com', expire_at=dt.datetime(2027, 1, 1),
+        auto_renew_enabled=None,  # purchased_at defaults to None
+    )
+    after = tmp_inventory.get_domain('ex.com')['purchased_at']
+    assert after == before
+
+
 # ─── mark_active / assign_to ───────────────────────────────────────────────
 
 def test_mark_active_stamps_last_active_at(tmp_inventory):

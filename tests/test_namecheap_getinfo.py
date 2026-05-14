@@ -76,6 +76,38 @@ def test_parses_expired_date_from_ok_response(monkeypatch):
     assert result['auto_renew_enabled'] is None
 
 
+def test_parses_created_date_from_ok_response(monkeypatch):
+    """CreatedDate is parsed into created_at — the real registration date
+    the lifecycle backfill writes into domains.purchased_at."""
+    _set_creds(monkeypatch)
+    monkeypatch.setattr(nc, '_request_namecheap',
+                        _fake_request_returning(_OK_XML))
+
+    result = nc.get_domain_info('example.com')
+
+    assert result is not None
+    assert result['created_at'] is not None
+    assert (result['created_at'].year,
+            result['created_at'].month,
+            result['created_at'].day) == (2009, 6, 16)
+
+
+def test_created_date_none_when_absent(monkeypatch):
+    """When DomainDetails has no CreatedDate, created_at is None and the
+    caller leaves purchased_at untouched — expire_at still parses."""
+    xml_no_created = _OK_XML.replace(
+        '<CreatedDate>06/16/2009</CreatedDate>', '')
+    _set_creds(monkeypatch)
+    monkeypatch.setattr(nc, '_request_namecheap',
+                        _fake_request_returning(xml_no_created))
+
+    result = nc.get_domain_info('example.com')
+
+    assert result is not None
+    assert result['created_at'] is None
+    assert result['expire_at'].year == 2027
+
+
 # ─── Error-shape handling ─────────────────────────────────────────────────
 
 def test_returns_none_on_namecheap_error_response(monkeypatch):
