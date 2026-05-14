@@ -35,6 +35,19 @@ from inventory import store
 
 logger = logging.getLogger(__name__)
 
+# Bucket C — legacy names that MIGHT still be current employees (the
+# fuzzy matcher couldn't place them, and we haven't gotten a yes/no from
+# Utkarsh yet). HOLD these — do NOT release until verified, otherwise we
+# orphan a domain that actually has a live owner. Compared case-folded.
+# Once Utkarsh confirms each one (alias it, or "ex-employee"), drop it
+# from this set.
+_HOLD_NAMES = {
+    'anup', 'swayam', 'parmeet', 'swayam saini', 'rajat', 'chetan sir',
+    'mohit', 'parmeet singh', 'vansh sourav', 'swayan', 'shubam', 'rishi',
+    'tanishq', 'mohit bhandari', 'shubham chandrabansi', 'vansh', 'anurag',
+    'rajat sir', 'aniket',
+}
+
 _ZOMBIE_SQL = (
     'SELECT d.domain, d.assigned_to '
     'FROM domains d '
@@ -54,11 +67,15 @@ def _find_zombies():
         if store._is_postgres():
             cur.close()
     out = []
+    held = []
     for r in rows:
         domain = r['domain'] if hasattr(r, 'keys') else r[0]
         legacy = r['assigned_to'] if hasattr(r, 'keys') else r[1]
-        out.append((domain, legacy))
-    return out
+        if (legacy or '').strip().lower() in _HOLD_NAMES:
+            held.append((domain, legacy))
+        else:
+            out.append((domain, legacy))
+    return out, held
 
 
 def _release(domain: str, legacy: str) -> None:
@@ -95,23 +112,25 @@ def main() -> int:
                         format='%(asctime)s %(levelname)-7s %(message)s')
 
     store.init_db()
-    zombies = _find_zombies()
-    print(f'found {len(zombies)} zombie rows (legacy text, no assignment)')
+    zombies, held = _find_zombies()
+    print(f'found {len(zombies) + len(held)} zombie rows total')
+    print(f'  releasing:  {len(zombies)}  (confirmed ex-employee / non-MDB label)')
+    print(f'  HOLDING:    {len(held)}  (bucket C — unverified, awaiting Utkarsh)')
 
     if not zombies:
-        print('nothing to release.')
+        print('\nnothing to release.')
         return 0
 
     # Show a sample so the operator can sanity-check before --apply.
-    print('\nsample (first 15):')
+    print('\nsample of what WOULD be released (first 15):')
     for domain, legacy in zombies[:15]:
         print(f'  {domain:45s}  assigned_to={legacy!r}')
     if len(zombies) > 15:
         print(f'  ... and {len(zombies) - 15} more')
 
     if not args.apply:
-        print(f'\nDRY RUN — would clear assigned_to on {len(zombies)} rows. '
-              'Re-run with --apply to commit.')
+        print(f'\nDRY RUN — would clear assigned_to on {len(zombies)} rows '
+              f'({len(held)} held back). Re-run with --apply to commit.')
         return 0
 
     released = 0
