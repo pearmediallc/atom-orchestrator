@@ -319,6 +319,12 @@ _POST_LAUNCH_COLUMNS = {
     'last_prompted_at':       ('TIMESTAMP', 'TIMESTAMPTZ'),
     'last_namecheap_sync_at': ('TIMESTAMP', 'TIMESTAMPTZ'),
     'lifecycle_state':        ('TEXT',      'TEXT'),
+    # Set only when the domain was requested by someone NOT in our Slack
+    # workspace (via /new-domain-external). NULL = internal request.
+    # Holds the external person's name; the operator who ran the command
+    # stays the lifecycle owner (assigned_to). Queryable: count external
+    # domains with `WHERE external_requester_name IS NOT NULL`.
+    'external_requester_name': ('TEXT',     'TEXT'),
 }
 
 # Indices added post-launch (separate from column adds because Postgres
@@ -543,6 +549,7 @@ def add_domain(domain: str, vertical: Optional[str] = None,
                notes: Optional[str] = None,
                status: Optional[str] = None,
                assigned_to: Optional[str] = None,
+               external_requester_name: Optional[str] = None,
                event_source: Optional[str] = None,
                event_metadata: Optional[Dict] = None) -> int:
     """Insert a new domain; returns its row id.
@@ -562,6 +569,12 @@ def add_domain(domain: str, vertical: Optional[str] = None,
     back to NULL for legacy CSV imports — the boot-time backfill copies
     requested_by → assigned_to for those.
 
+    `external_requester_name` is set ONLY for domains requested via
+    /new-domain-external — the name of the non-workspace person it's
+    for. NULL = internal request. The operator who ran the command is
+    still the lifecycle owner (assigned_to); this column is purely the
+    "who asked" record, and makes external domains queryable.
+
     `event_source`, when provided, writes an 'added' row to
     domain_events so /domain-history shows when + how the domain
     entered inventory. Bulk CSV imports leave it None to avoid 743
@@ -580,24 +593,23 @@ def add_domain(domain: str, vertical: Optional[str] = None,
         )
     insert_sql = (
         'INSERT INTO domains (domain, vertical, aws_account, lander_url, '
-        'requested_by, notes, status, assigned_to, '
+        'requested_by, notes, status, assigned_to, external_requester_name, '
         'purchased_at, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)'
     )
+    _insert_params = (domain, vertical, aws_account, lander_url,
+                      requested_by, notes, status, assigned_to,
+                      external_requester_name)
     try:
         with _conn() as c:
             if _is_postgres():
                 cur = c.cursor()
-                cur.execute(_q(insert_sql) + ' RETURNING id',
-                            (domain, vertical, aws_account, lander_url,
-                             requested_by, notes, status, assigned_to))
+                cur.execute(_q(insert_sql) + ' RETURNING id', _insert_params)
                 row = cur.fetchone()
                 cur.close()
                 new_id = row['id']
             else:
-                cur = c.execute(insert_sql,
-                                (domain, vertical, aws_account, lander_url,
-                                 requested_by, notes, status, assigned_to))
+                cur = c.execute(insert_sql, _insert_params)
                 new_id = cur.lastrowid
     except sqlite3.IntegrityError as e:
         # SQLite raises IntegrityError on UNIQUE violations.

@@ -342,3 +342,22 @@ def test_prompt_recipients_round_trip(tmp_inventory):
 
     store.clear_prompt_recipients('d.com')
     assert store.get_prompt_recipients('d.com') == []
+
+
+# ─── external_requester_name column ───────────────────────────────────────
+
+def test_add_domain_stores_external_requester_name(tmp_inventory):
+    """Domains from /new-domain-external carry the external person's name
+    in their own column — queryable, no string-prefix hack."""
+    store.add_domain(domain='ext.com',
+                     external_requester_name='John from AcmeCorp')
+    assert (tmp_inventory.get_domain('ext.com')['external_requester_name']
+            == 'John from AcmeCorp')
+
+
+def test_add_domain_external_requester_name_defaults_null(tmp_inventory):
+    """Internal requests leave external_requester_name NULL — that NULL
+    vs not-NULL is exactly how external domains are counted."""
+    store.add_domain(domain='internal.com')
+    assert (tmp_inventory.get_domain('internal.com')
+            ['external_requester_name'] is None)

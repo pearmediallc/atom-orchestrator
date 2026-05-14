@@ -238,3 +238,34 @@ def test_shortlist_external_requester_defaults_empty_for_internal():
     pick, refresh = _pick_and_refresh_payloads(blocks)
     assert pick['external_requester'] == ''
     assert refresh['external_requester'] == ''
+
+
+# ─── /new-domain-external modal ──────────────────────────────────────────
+
+def test_external_modal_has_required_name_field_and_no_mdb_picker():
+    """The external modal swaps the optional MDB picker for a REQUIRED
+    external-requester name field, and shares the rest with the internal
+    modal via the same callback_id + common blocks."""
+    from slack_bot.routes import (
+        _build_new_domain_external_modal, _build_new_domain_modal,
+    )
+    ext = _build_new_domain_external_modal()
+    internal = _build_new_domain_modal()
+    ext_ids = {b.get('block_id') for b in ext['blocks']}
+    int_ids = {b.get('block_id') for b in internal['blocks']}
+
+    # External: required name field, no MDB picker.
+    assert 'external_requester_block' in ext_ids
+    assert 'mdb_block' not in ext_ids
+    ext_block = next(b for b in ext['blocks']
+                     if b.get('block_id') == 'external_requester_block')
+    assert ext_block['optional'] is False
+
+    # Internal: MDB picker, no external field.
+    assert 'mdb_block' in int_ids
+    assert 'external_requester_block' not in int_ids
+
+    # Both carry the same downstream blocks + share the submit handler.
+    for shared in ('vertical_block', 'aws_account_block', 'extension_block'):
+        assert shared in ext_ids and shared in int_ids
+    assert ext['callback_id'] == internal['callback_id'] == 'new_domain_modal'

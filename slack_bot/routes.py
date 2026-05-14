@@ -1396,11 +1396,26 @@ if _bolt_app is not None:
 
     @_bolt_app.command('/new-domain')
     def handle_new_domain_command(ack, body, client):
-        """Open the new-domain modal."""
+        """Open the new-domain modal (internal requests)."""
         ack()
         client.views_open(
             trigger_id=body['trigger_id'],
             view=_build_new_domain_modal(),
+        )
+
+    @_bolt_app.command('/new-domain-external')
+    def handle_new_domain_external_command(ack, body, client):
+        """Open the external-requester variant of the new-domain modal.
+
+        Same downstream pipeline as /new-domain — the only difference is
+        the entry modal: a required external-requester NAME instead of
+        the internal MDB picker. The operator who runs this stays the
+        lifecycle owner.
+        """
+        ack()
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view=_build_new_domain_external_modal(),
         )
 
     @_bolt_app.view('new_domain_modal')
@@ -2577,18 +2592,6 @@ if _bolt_app is not None:
         # the inventory write didn't happen, so we MUST surface it
         # instead of silently telling Slack "purchased ✅" while the
         # backing row was lost (2026-05-08 audit fix).
-        # External requester: the person who asked isn't in our Slack, so
-        # there's no Slack ID to own the row. The operator (`requester`)
-        # stays the lifecycle owner — they get the expiry/idle DMs — and
-        # the external name is recorded in requested_by ('External:<name>'
-        # mirrors the 'Slack:Uxxx' convention) + notes + the audit event.
-        if external_requester:
-            requested_by_value = f'External:{external_requester}'
-            notes_value = (f'Purchased via /new-domain bot flow '
-                           f'(external requester: {external_requester})')
-        else:
-            requested_by_value = f'Slack:{requester}'
-            notes_value = 'Purchased via /new-domain bot flow'
         try:
             inventory_store.add_domain(
                 domain=domain,
@@ -2600,16 +2603,20 @@ if _bolt_app is not None:
                 # the MDB picks it in the modal and the value flows here.
                 aws_account=aws_account or None,
                 lander_url=lander or None,
-                requested_by=requested_by_value,
-                notes=notes_value,
+                requested_by=f'Slack:{requester}',
+                notes='Purchased via /new-domain bot flow',
                 # State machine starts here — Phase 7 worker will move
                 # the row to STATUS_DEPLOYING then DEPLOYED|FAILED.
                 status=inventory_store.STATUS_PENDING,
                 # Lifecycle ownership starts on day one — classifier needs
                 # an MDB to DM when this domain expires or goes idle. For
-                # external requests this is the operator (the external
-                # requester has no Slack ID to own anything).
+                # external requests this is still the operator (the
+                # external requester has no Slack ID to own anything).
                 assigned_to=requester,
+                # External-requester name lands in its own column (NULL
+                # for internal requests) — keeps requested_by clean and
+                # makes "how many external domains" a simple WHERE.
+                external_requester_name=external_requester or None,
                 # Audit trail for /domain-history. Captures who clicked
                 # Mark Purchased, plus the lander URL (if any) and the
                 # AWS account it'll be deployed to.
@@ -2688,76 +2695,23 @@ if _bolt_app is not None:
 
 # ─── Modal definition (Block Kit) ──────────────────────────────────────────
 
-def _build_new_domain_modal() -> dict:
-    """Build the /new-domain modal payload.
+def _new_domain_common_blocks() -> list:
+    """The modal blocks shared by BOTH /new-domain and
+    /new-domain-external — everything except the first "who is this for"
+    block. Built fresh each call because the AWS account picker reads
+    Config.AWS_ACCOUNT_OPTIONS at modal-open time.
 
-    Built as a function (not a module-level constant) because the AWS
-    account picker reads `Config.AWS_ACCOUNT_OPTIONS` at modal-open time —
-    operators can adjust which accounts appear without restarting the bot.
-
-    Two design choices worth flagging:
-      • The AWS account picker is REQUIRED. The previous implicit default
-        of `auto-insurance` (via init_db NULL-backfill) silently routed
-        every new domain into one account; making the choice explicit
-        means MDBs can provision in medicare / medsupp / etc. without a
-        config change (audit 2026-05-11).
-      • The lander URL is OPTIONAL. Sometimes the team only wants to
-        provision the AWS infrastructure (R53 zone, ACM cert, S3 bucket,
-        CloudFront) and deploy the lander later. Blank → ATOM setup runs,
-        file-copy step is skipped.
+    Design notes:
+      • AWS account picker is REQUIRED — the old implicit auto-insurance
+        default silently routed every domain into one account.
+      • Lander URL is OPTIONAL — blank means provision AWS infra only,
+        deploy the lander later.
     """
     account_options = [
         {'text': {'type': 'plain_text', 'text': acct}, 'value': acct}
         for acct in Config.AWS_ACCOUNT_OPTIONS
     ]
-    return {
-        'type': 'modal',
-        'callback_id': 'new_domain_modal',
-        'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
-        'submit': {'type': 'plain_text', 'text': 'Continue'},
-        'close': {'type': 'plain_text', 'text': 'Cancel'},
-        'blocks': [
-            {
-                'type': 'input',
-                'block_id': 'mdb_block',
-                'optional': True,
-                'label': {'type': 'plain_text',
-                          'text': 'Requesting MDB (leave blank if this is for you)'},
-                'hint': {
-                    'type': 'plain_text',
-                    'text': ('Pick the marketer you\'re running this on behalf of. '
-                             'When set, all bot DMs (suggestions, approval status, '
-                             'final deploy notification) go to them instead of you.'),
-                },
-                'element': {
-                    'type': 'users_select',
-                    'action_id': 'mdb_select',
-                    'placeholder': {'type': 'plain_text',
-                                    'text': 'Pick an MDB'},
-                },
-            },
-            {
-                'type': 'input',
-                'block_id': 'external_requester_block',
-                'optional': True,
-                'label': {'type': 'plain_text',
-                          'text': 'External requester (name only)'},
-                'hint': {
-                    'type': 'plain_text',
-                    'text': ('Only when this is for someone NOT in our Slack '
-                             'workspace — type their name. You (the operator) '
-                             'stay the owner: all bot DMs + expiry/idle alerts '
-                             'come to you, and the domain is recorded as '
-                             'requested by this external name. Leave the MDB '
-                             'picker above blank when you use this.'),
-                },
-                'element': {
-                    'type': 'plain_text_input',
-                    'action_id': 'external_requester_input',
-                    'placeholder': {'type': 'plain_text',
-                                    'text': 'e.g. John from AcmeCorp'},
-                },
-            },
+    return [
             {
                 'type': 'input',
                 'block_id': 'vertical_block',
@@ -2871,7 +2825,87 @@ def _build_new_domain_modal() -> dict:
                     ],
                 },
             },
-        ],
+    ]
+
+
+def _build_new_domain_modal() -> dict:
+    """The /new-domain modal — for internal requests. The first block is
+    an optional MDB picker (operator-on-behalf-of). Shares everything
+    below it with the external modal via _new_domain_common_blocks().
+    """
+    return {
+        'type': 'modal',
+        'callback_id': 'new_domain_modal',
+        'title': {'type': 'plain_text', 'text': 'Setup New Domain'},
+        'submit': {'type': 'plain_text', 'text': 'Continue'},
+        'close': {'type': 'plain_text', 'text': 'Cancel'},
+        'blocks': [
+            {
+                'type': 'input',
+                'block_id': 'mdb_block',
+                'optional': True,
+                'label': {'type': 'plain_text',
+                          'text': 'Requesting MDB (leave blank if this is for you)'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('Pick the marketer you\'re running this on behalf of. '
+                             'When set, all bot DMs (suggestions, approval status, '
+                             'final deploy notification) go to them instead of you. '
+                             'For someone NOT in our Slack workspace, use '
+                             '`/new-domain-external` instead.'),
+                },
+                'element': {
+                    'type': 'users_select',
+                    'action_id': 'mdb_select',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'Pick an MDB'},
+                },
+            },
+        ] + _new_domain_common_blocks(),
+    }
+
+
+def _build_new_domain_external_modal() -> dict:
+    """The /new-domain-external modal — for requests from people NOT in
+    our Slack workspace. The first block is a REQUIRED free-text name
+    (the external person has no Slack ID). The internal operator who
+    runs this stays the lifecycle owner — all bot DMs + expiry/idle
+    alerts go to them; the external name is recorded for reference and
+    is queryable via the domains.external_requester_name column.
+
+    Same callback_id as the internal modal — handle_new_domain_submission
+    handles both (it reads mdb_block / external_requester_block with
+    .get(), so a modal missing one just yields an empty value there).
+    """
+    return {
+        'type': 'modal',
+        'callback_id': 'new_domain_modal',
+        'title': {'type': 'plain_text', 'text': 'New Domain (External)'},
+        'submit': {'type': 'plain_text', 'text': 'Continue'},
+        'close': {'type': 'plain_text', 'text': 'Cancel'},
+        'blocks': [
+            {
+                'type': 'input',
+                'block_id': 'external_requester_block',
+                'optional': False,
+                'label': {'type': 'plain_text',
+                          'text': 'External requester name'},
+                'hint': {
+                    'type': 'plain_text',
+                    'text': ('The person this domain is for, who is NOT in our '
+                             'Slack workspace — name only. You, the operator '
+                             'running this, stay the owner: every bot DM and '
+                             'expiry/idle alert comes to you. The domain is '
+                             'tagged external and recorded under this name.'),
+                },
+                'element': {
+                    'type': 'plain_text_input',
+                    'action_id': 'external_requester_input',
+                    'placeholder': {'type': 'plain_text',
+                                    'text': 'e.g. John from AcmeCorp'},
+                },
+            },
+        ] + _new_domain_common_blocks(),
     }
 
 
