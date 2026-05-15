@@ -1481,7 +1481,7 @@ def record_prompt_recipients(domain: str, recipients: List[Dict]) -> None:
                 '(domain, recipient_slack_id, channel_id, message_ts, is_tl) '
                 'VALUES (?, ?, ?, ?, ?)',
                 (domain, r['recipient_slack_id'], r['channel_id'],
-                 r['message_ts'], 1 if r.get('is_tl') else 0),
+                 r['message_ts'], bool(r.get('is_tl'))),
             )
             if _is_postgres():
                 cur.close()

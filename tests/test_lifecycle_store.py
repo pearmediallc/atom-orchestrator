@@ -344,6 +344,39 @@ def test_prompt_recipients_round_trip(tmp_inventory):
     assert store.get_prompt_recipients('d.com') == []
 
 
+def test_record_prompt_recipients_binds_is_tl_as_bool(tmp_inventory, monkeypatch):
+    """Postgres regression — is_tl is a BOOLEAN column on Postgres. SQLite
+    is permissive (it'd accept 0/1) so a backend-agnostic check has to
+    look at the bound param type. We intercept _execute and assert the
+    last param is a bool, not an int. See 2026-05-15 incident:
+    `column "is_tl" is of type boolean but expression is of type integer`."""
+    store.add_domain(domain='d.com')
+
+    captured = []
+    real_execute = store._execute
+
+    def spy(c, query, params=()):
+        if 'INSERT INTO domain_prompt_recipients' in query:
+            captured.append(params)
+        return real_execute(c, query, params)
+
+    monkeypatch.setattr(store, '_execute', spy)
+    store.record_prompt_recipients('d.com', [
+        {'recipient_slack_id': 'U_A', 'channel_id': 'D_A',
+         'message_ts': '1.1', 'is_tl': False},
+        {'recipient_slack_id': 'U_TL', 'channel_id': 'D_TL',
+         'message_ts': '2.2', 'is_tl': True},
+    ])
+
+    assert len(captured) == 2
+    for params in captured:
+        is_tl_bind = params[-1]
+        assert isinstance(is_tl_bind, bool), (
+            f'is_tl must bind as bool for Postgres BOOLEAN column, '
+            f'got {type(is_tl_bind).__name__}={is_tl_bind!r}'
+        )
+
+
 # ─── external_requester_name column ───────────────────────────────────────
 
 def test_add_domain_stores_external_requester_name(tmp_inventory):
