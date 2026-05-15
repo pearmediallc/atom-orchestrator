@@ -260,6 +260,21 @@ class Config:
         'LIFECYCLE_DRY_RUN', 'true'
     ).lower() in ('1', 'true', 'yes', 'on')
 
+    # Seconds to sleep after each successful chat_postMessage. Slack
+    # caps bot DMs at ~1/sec per channel; a catch-up burst (e.g., the
+    # lifecycle wave that fanned 700 sends through the TL's channel)
+    # otherwise hits 'ratelimited' on the first dozen and the rest
+    # cascade-fail. 1.2s gives ~50 sends/min which Slack tolerates.
+    # Tune via env if Slack tightens or our volume changes.
+    LIFECYCLE_DM_PACE_SECONDS = float(
+        os.getenv('LIFECYCLE_DM_PACE_SECONDS', '1.2')
+    )
+    # On a 'ratelimited' response from Slack we sleep this many seconds
+    # (used as the default when Slack's Retry-After header is absent).
+    LIFECYCLE_DM_RETRY_SLEEP_SECONDS = float(
+        os.getenv('LIFECYCLE_DM_RETRY_SLEEP_SECONDS', '30')
+    )
+
     # Optional public channel where the daily cron posts an "available
     # in inventory" digest — domains with no assigned MDB, listed so
     # the team can self-serve from the rotation pool without DMing

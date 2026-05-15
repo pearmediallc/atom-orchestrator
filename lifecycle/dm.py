@@ -21,11 +21,18 @@ that's how we guarantee DRY_RUN is honoured everywhere.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# How many times to retry a 'ratelimited' response before giving up. Two
+# retries plus the initial attempt = up to three sends per DM. Beyond
+# that the burst is too sustained to handle from here — let the row's
+# per-row exception handler log it and the next cron run pick it up.
+_RATELIMIT_MAX_RETRIES = 2
 
 
 def normalise_slack_id(value: Optional[str]) -> Optional[str]:
@@ -122,8 +129,50 @@ def dm(
                 'real_recipient': recipient,
                 'label': dry_run_label}
 
-    return client.chat_postMessage(
-        channel=routed,
-        text=text,
-        blocks=blocks,
-    )
+    # Retry on Slack's 'ratelimited' response, respecting the Retry-After
+    # header. Without this the lifecycle catch-up wave (~700 sends to
+    # the TL's channel after the first live flip) burns through the
+    # ~1/sec per-channel limit and every send after the first dozen
+    # cascade-fails. With retry + the post-send pacing below, the burst
+    # paces itself naturally.
+    for attempt in range(_RATELIMIT_MAX_RETRIES + 1):
+        try:
+            response = client.chat_postMessage(
+                channel=routed,
+                text=text,
+                blocks=blocks,
+            )
+            # Pace under Slack's ~1/sec per-channel cap so a sequence of
+            # sends (e.g. the cron's idle/expiring loop) doesn't trip the
+            # limit on the next iteration. Skipped on dry-run above.
+            if Config.LIFECYCLE_DM_PACE_SECONDS > 0:
+                time.sleep(Config.LIFECYCLE_DM_PACE_SECONDS)
+            return response
+        except Exception as e:  # noqa: BLE001 — slack_sdk's SlackApiError
+            err = None
+            resp = getattr(e, 'response', None)
+            if resp is not None:
+                try:
+                    err = resp.get('error')
+                except Exception:
+                    err = None
+            if err == 'ratelimited' and attempt < _RATELIMIT_MAX_RETRIES:
+                retry_after = Config.LIFECYCLE_DM_RETRY_SLEEP_SECONDS
+                try:
+                    headers = getattr(resp, 'headers', {}) or {}
+                    retry_after = float(headers.get('Retry-After',
+                                                    retry_after))
+                except (TypeError, ValueError):
+                    pass
+                logger.warning(
+                    'lifecycle.dm: ratelimited posting to %s (attempt '
+                    '%d/%d), sleeping %ss then retrying',
+                    routed, attempt + 1, _RATELIMIT_MAX_RETRIES + 1,
+                    retry_after,
+                )
+                time.sleep(retry_after)
+                continue
+            raise
+    # Loop exhausted — should be unreachable (last iteration either
+    # returns or raises) but defend against it anyway.
+    return None
