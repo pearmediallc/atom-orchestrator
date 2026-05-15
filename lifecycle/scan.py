@@ -237,11 +237,22 @@ def _extract_message_coords(resp, recipient_uid, is_tl):
     message), unresolved recipients (_dm.dm returned None), or responses
     missing channel/ts. A None recipient is simply omitted from the
     ledger — there's no card to sync for them.
+
+    Bug fix 2026-05-15: previously checked `isinstance(resp, dict)` but
+    slack_sdk's SlackResponse is NOT a dict subclass — it just exposes
+    .get(). The isinstance check rejected every real send as "failed",
+    nothing landed in the ledger, every fan-out then fell into the
+    "every DM failed" escalation. Now we duck-type on .get() instead.
     """
-    if not resp or not isinstance(resp, dict) or resp.get('dry_run'):
+    if not resp:
         return None
-    channel = resp.get('channel')
-    ts = resp.get('ts')
+    try:
+        if resp.get('dry_run'):
+            return None
+        channel = resp.get('channel')
+        ts = resp.get('ts')
+    except (AttributeError, TypeError):
+        return None
     if not channel or not ts:
         return None
     return {

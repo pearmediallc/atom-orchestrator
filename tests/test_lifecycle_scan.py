@@ -333,3 +333,55 @@ def test_one_row_failure_does_not_abort_scan(tmp_inventory, monkeypatch):
     assert counters['errors'] == 1
     # And good.com still got classified.
     assert tmp_inventory.get_domain('good.com')['lifecycle_state'] == S.ACTIVE
+
+
+# ─── _extract_message_coords regression (2026-05-15) ──────────────────────
+
+class _FakeSlackResponse:
+    """Mimics slack_sdk.web.SlackResponse — exposes .get() but is NOT a
+    dict subclass. Caught a production bug where the previous
+    isinstance(resp, dict) check rejected every real Slack send as
+    "failed", silently dropping ~700 DMs from the ledger."""
+    def __init__(self, channel, ts):
+        self._data = {'ok': True, 'channel': channel, 'ts': ts}
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+def test_extract_message_coords_handles_non_dict_slack_response():
+    """Real chat_postMessage returns SlackResponse (not a dict). The
+    helper must duck-type on .get() so it captures channel+ts and the
+    ledger row gets written. Previously isinstance(resp, dict) rejected
+    it and the fan-out ledger stayed empty even on successful sends."""
+    from lifecycle.scan import _extract_message_coords
+    resp = _FakeSlackResponse(channel='D_REAL', ts='1700000000.000123')
+
+    rec = _extract_message_coords(resp, 'U_MDB', False)
+    assert rec is not None
+    assert rec == {
+        'recipient_slack_id': 'U_MDB',
+        'channel_id': 'D_REAL',
+        'message_ts': '1700000000.000123',
+        'is_tl': False,
+    }
+
+
+def test_extract_message_coords_still_handles_dict_for_tests():
+    """Dry-run + the existing test mocks return plain dicts. Must still
+    work — duck-type covers both."""
+    from lifecycle.scan import _extract_message_coords
+    rec = _extract_message_coords(
+        {'ok': True, 'channel': 'D_X', 'ts': '1.001'}, 'U_X', True,
+    )
+    assert rec is not None
+    assert rec['is_tl'] is True
+
+
+def test_extract_message_coords_returns_none_for_dry_run_sentinel():
+    from lifecycle.scan import _extract_message_coords
+    assert _extract_message_coords({'dry_run': True}, 'U_X', False) is None
+
+
+def test_extract_message_coords_returns_none_for_none_response():
+    from lifecycle.scan import _extract_message_coords
+    assert _extract_message_coords(None, 'U_X', False) is None
