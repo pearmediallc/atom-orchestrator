@@ -28,6 +28,12 @@ from config import Config
 from domain_assistant import namecheap_check
 from inventory import store as inventory_store
 from orchestrator.log_setup import log_event
+from orchestrator.pixel_fire import (
+    PIXEL_FIRE_DOMAIN,
+    PIXEL_FIRE_FILE_KEY,
+    PIXEL_FIRE_LIVE_URL,
+    update_pixel_on_lander,
+)
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
@@ -839,6 +845,117 @@ def _phase7_run_atom_setup(client, channel, message_ts, target_domain,
         )
 
 
+# ─── /pixel-fire worker ────────────────────────────────────────────────────
+# Runs in a daemon thread so the slash command can ack within Slack's 3s
+# window. Calls the pure-logic pixel_fire module, then DMs the operator
+# with a structured proof block (or the failure reason).
+
+def _pixel_fire_worker(client, actor: str, response_channel: str,
+                        event: str, pixel_id: str) -> None:
+    """Background worker: run the pixel update + DM the operator.
+
+    `actor` is the Slack user ID of whoever ran /pixel-fire — used both
+    as the audit-log actor and as the DM recipient.
+    `response_channel` is where to fall back to (ephemeral) if the DM
+    fails (rare — happens when the user has DMs disabled with the bot).
+    """
+    try:
+        result = update_pixel_on_lander(event, pixel_id, actor=actor)
+    except Exception as e:
+        # update_pixel_on_lander is designed to never raise — a bare
+        # except here only catches genuine bugs (import failure, etc).
+        # Log + notify rather than letting the daemon thread die silently.
+        logger.exception('pixel_fire worker crashed (should never happen)')
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=(f':x: `/pixel-fire` crashed unexpectedly: '
+                  f'{type(e).__name__}. Flag to TL — full traceback in '
+                  'Render logs.'),
+        )
+        return
+
+    # Success / no-change: post a structured proof block. Failure: post
+    # the operator-facing message verbatim (already explains why).
+    if result.status == 'updated':
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            blocks=_pixel_fire_proof_blocks(result),
+            text=result.message,
+        )
+    elif result.status == 'no_change':
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=f':information_source: {result.message}',
+        )
+    else:
+        # invalid_input / inventory_error / atom_error / safety_belt
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=f':x: {result.message}',
+        )
+
+
+def _pixel_fire_notify(client, user: str, fallback_channel: str,
+                        *, text: str, blocks: list = None) -> None:
+    """DM the operator with the result; fall back to an ephemeral message
+    in the originating channel if the DM fails (DMs disabled, bot not in
+    the user's DM list, etc.). Last-resort fallback is the log."""
+    try:
+        client.chat_postMessage(channel=user, text=text, blocks=blocks)
+        return
+    except Exception:
+        logger.exception(
+            'pixel_fire: DM to %s failed, falling back to ephemeral', user,
+        )
+    try:
+        client.chat_postEphemeral(
+            channel=fallback_channel, user=user, text=text, blocks=blocks,
+        )
+    except Exception:
+        logger.exception(
+            'pixel_fire: ephemeral fallback to %s in %s also failed',
+            user, fallback_channel,
+        )
+
+
+def _pixel_fire_proof_blocks(result) -> list:
+    """Build the success-DM Block Kit payload — the proof an MDB would
+    have screenshotted from the Pixel Helper extension before this
+    command existed.
+
+    Surfaces: old → new for both ID + event, the live URL to spot-check,
+    and a reminder to use the Pixel Helper extension as the visual
+    sanity check (which the bot can't do server-side without headless
+    Chrome — overkill for v1)."""
+    d = result.details
+    return [
+        {'type': 'header', 'text': {
+            'type': 'plain_text',
+            'text': f':white_check_mark: Pixel updated',
+        }},
+        {'type': 'section', 'text': {
+            'type': 'mrkdwn',
+            'text': (
+                f'*Lander:* `{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}`\n'
+                f'*Pixel ID:* `{d.get("old_pixel_id")}` → '
+                f'`{d.get("new_pixel_id")}`  _(2 spots)_\n'
+                f'*Event:* `{d.get("old_event")}` → '
+                f'`{d.get("new_event")}`  _(3 spots)_'
+            ),
+        }},
+        {'type': 'section', 'text': {
+            'type': 'mrkdwn',
+            'text': (
+                f'*Live URL:* {PIXEL_FIRE_LIVE_URL}\n'
+                '_To verify visually: open the URL → Meta Pixel Helper '
+                'Chrome extension → click the buttons → you should see '
+                f'`{d.get("new_event")}` firing under pixel '
+                f'`{d.get("new_pixel_id")}`._'
+            ),
+        }},
+    ]
+
+
 # ─── Slack command + interaction handlers (registered on the bolt app) ─────
 
 if _bolt_app is not None:
@@ -1402,6 +1519,60 @@ if _bolt_app is not None:
             trigger_id=body['trigger_id'],
             view=_build_new_domain_modal(),
         )
+
+    @_bolt_app.command('/pixel-fire')
+    def handle_pixel_fire_command(ack, body, client):
+        """Replace the Meta Pixel ID + event on the v1 lander.
+
+        Usage: `/pixel-fire {event} {id}`
+                e.g. `/pixel-fire Lead 2714057732308829`
+
+        v1 hardcodes the target to `get-usa-help.com/pixel-fire/index.html`.
+        Authorization is open — anyone in the workspace can run it
+        (matches /reassign-domain). The actor is recorded on the audit
+        row so /domain-history shows who ran it.
+
+        Acks immediately, runs the actual edit in a daemon thread so
+        Slack's 3-second response window isn't blocked by ATOM's S3 read
+        + write (typically 1-3s, but can spike).
+        """
+        ack()
+        actor = body['user']['id']
+        response_channel = body.get('channel_id') or actor
+        raw = (body.get('text') or '').strip()
+
+        # Usage check — bare /pixel-fire or wrong arg count.
+        parts = raw.split()
+        if len(parts) != 2:
+            client.chat_postEphemeral(
+                channel=response_channel, user=actor,
+                text=(
+                    ':information_source: *Usage:* `/pixel-fire {event} {id}`\n'
+                    'Example: `/pixel-fire Lead 2714057732308829`\n'
+                    f'Updates the Meta Pixel on `{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}`.'
+                ),
+            )
+            return
+
+        event_arg, id_arg = parts[0], parts[1]
+
+        # Light pre-feedback so the operator sees something IMMEDIATELY
+        # while the worker thread does the ATOM round-trip. Real result
+        # arrives via DM (or ephemeral fallback) shortly after.
+        client.chat_postEphemeral(
+            channel=response_channel, user=actor,
+            text=(f':hourglass_flowing_sand: Updating pixel on '
+                  f'`{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}` — '
+                  f'event=`{event_arg}`, id=`{id_arg}`. '
+                  'I\'ll DM you the result in a few seconds.'),
+        )
+
+        threading.Thread(
+            target=_pixel_fire_worker,
+            args=(client, actor, response_channel, event_arg, id_arg),
+            daemon=True,
+            name=f'pixel-fire-{actor}',
+        ).start()
 
     @_bolt_app.command('/new-domain-external')
     def handle_new_domain_external_command(ack, body, client):
@@ -3219,6 +3390,12 @@ def slash_new_domain():
 @slack_bp.route('/slash/new-domain-external', methods=['POST'])
 def slash_new_domain_external():
     return _bolt_or_stub('Coming soon: /new-domain-external. '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
+@slack_bp.route('/slash/pixel-fire', methods=['POST'])
+def slash_pixel_fire():
+    return _bolt_or_stub('Coming soon: /pixel-fire. '
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 

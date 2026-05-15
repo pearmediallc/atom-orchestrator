@@ -287,6 +287,48 @@ class AtomClient:
             timeout=300,
         )
 
+    def get_file_content(self, account_key: str, bucket: str,
+                         file_key: str) -> str:
+        """Read a single S3 object's body as UTF-8 text via ATOM.
+
+        Returns the decoded file content. Raises AtomClientError on 404
+        (file missing), AtomServerError on 5xx, AtomConnectionError on
+        transport failures. The /pixel-fire flow uses this to fetch the
+        lander HTML before regex-replacing the pixel ID + event.
+        """
+        # ATOM's GET endpoint takes account / bucket / file_key as path
+        # segments. file_key may contain '/' (folder/file.html); the
+        # endpoint declares <path:file_key> so slashes pass through.
+        path = f'/api/get-file-content/{account_key}/{bucket}/{file_key}'
+        resp = self._get_json(path, timeout=15)
+        content = resp.get('content')
+        if content is None:
+            raise AtomInvalidResponse(
+                f'GET {path} returned 200 but no `content` field. '
+                f'Response keys: {sorted(resp.keys())}'
+            )
+        return content
+
+    def save_file_content(self, account_key: str, bucket: str,
+                          file_key: str, content: str) -> dict:
+        """Write a single S3 object's body via ATOM (PutObject under the
+        hood, content-type text/html).
+
+        Returns ATOM's success dict ({message, modified_file}). Raises
+        AtomClientError on 4xx (bad account / missing param), AtomServerError
+        on 5xx, AtomConnectionError on transport failures.
+        """
+        return self._post_json(
+            '/api/save-file-content',
+            {
+                'account': account_key,
+                'bucket': bucket,
+                'file': file_key,
+                'content': content,
+            },
+            timeout=30,
+        )
+
     def wait_for_setup(self, task_id: str, timeout: int = 1800,
                        poll_interval: int = 5,
                        on_progress=None) -> dict:
