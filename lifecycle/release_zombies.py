@@ -18,12 +18,20 @@ deactivated Slack users. TL (Shubham) approved on 2026-05-14: release
 them to the pool, team does manual RedTrack lookup on Saturday.
 
 Usage:
-    python -m lifecycle.release_zombies            # dry run — counts only
-    python -m lifecycle.release_zombies --apply    # writes
+    python -m lifecycle.release_zombies                       # dry run — counts only
+    python -m lifecycle.release_zombies --apply               # writes (excl. bucket C)
+    python -m lifecycle.release_zombies --include-held        # dry run incl. bucket C
+    python -m lifecycle.release_zombies --include-held --apply  # clears EVERYTHING
 
 Idempotent: only touches rows that are still zombies. Re-running after
 --apply is a no-op. Records a `released_to_inventory` event per domain
 so /domain-history shows what was cleared and why.
+
+--include-held: also clear bucket-C names (Anup, Swayam, parmeet, etc.).
+Default behaviour holds these back pending Utkarsh's alias-confirmation.
+Set this flag once Utkarsh-wait is abandoned in favour of a downstream
+cleanup (e.g. RedTrack-usage review with Manav) that re-assigns owners
+from actual spend data rather than from legacy name strings.
 """
 from __future__ import annotations
 
@@ -106,6 +114,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--apply', action='store_true',
                         help='Actually clear assigned_to. Default is dry run.')
+    parser.add_argument(
+        '--include-held', action='store_true',
+        help=('Also clear bucket-C held names (Anup, Swayam, parmeet, etc.). '
+              'Use this when downstream cleanup will reassign from RedTrack '
+              "spend data, not from the legacy name strings."),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -113,9 +127,20 @@ def main() -> int:
 
     store.init_db()
     zombies, held = _find_zombies()
-    print(f'found {len(zombies) + len(held)} zombie rows total')
-    print(f'  releasing:  {len(zombies)}  (confirmed ex-employee / non-MDB label)')
-    print(f'  HOLDING:    {len(held)}  (bucket C — unverified, awaiting Utkarsh)')
+    if args.include_held:
+        zombies = zombies + held
+        held_remaining = []
+    else:
+        held_remaining = held
+
+    print(f'found {len(zombies) + len(held_remaining)} zombie rows total')
+    print(f'  releasing:  {len(zombies)}  '
+          + ('(everything — bucket C included via --include-held)'
+             if args.include_held else
+             '(confirmed ex-employee / non-MDB label)'))
+    print(f'  HOLDING:    {len(held_remaining)}  '
+          + ('(none — --include-held is set)' if args.include_held
+             else '(bucket C — unverified, awaiting Utkarsh)'))
 
     if not zombies:
         print('\nnothing to release.')
@@ -130,7 +155,7 @@ def main() -> int:
 
     if not args.apply:
         print(f'\nDRY RUN — would clear assigned_to on {len(zombies)} rows '
-              f'({len(held)} held back). Re-run with --apply to commit.')
+              f'({len(held_remaining)} held back). Re-run with --apply to commit.')
         return 0
 
     released = 0
