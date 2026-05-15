@@ -55,9 +55,15 @@ logger = logging.getLogger(__name__)
 # Each prompt message embeds the domain as `xyz.com`. The leading
 # backtick + a TLD-suffix anchor keeps us off random backticked phrases.
 _DOMAIN_RE = re.compile(r'`([a-z0-9][a-z0-9-]*\.[a-z]{2,})`')
-# Phrase that uniquely marks an IDLE prompt (TL Flow 2).
-_IDLE_RE = re.compile(r'had no spend in the last 30 days', re.IGNORECASE)
-# Phrase that uniquely marks an EXPIRING prompt (TL Flow 1).
+# Phrases that uniquely mark an IDLE prompt (TL Flow 2). The first
+# matches the fallback text; the second matches the block-kit card
+# itself, since Slack sometimes returns bot messages with the text
+# field stripped when blocks are present.
+_IDLE_FALLBACK_RE = re.compile(r'had no spend in the last 30 days',
+                               re.IGNORECASE)
+_IDLE_BLOCK_RE = re.compile(r'has gone quiet', re.IGNORECASE)
+# Phrase that uniquely marks an EXPIRING prompt (TL Flow 1) — matches
+# both the fallback text and the block card.
 _EXPIRING_RE = re.compile(r'expires in ~\d+ day', re.IGNORECASE)
 
 
@@ -82,7 +88,7 @@ def _parse_msg(msg: dict):
         return None
     domain = m.group(1).lower()
 
-    if _IDLE_RE.search(text):
+    if _IDLE_FALLBACK_RE.search(text) or _IDLE_BLOCK_RE.search(text):
         return (domain, 'idle')
     if _EXPIRING_RE.search(text):
         return (domain, 'expiring')
