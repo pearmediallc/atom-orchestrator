@@ -52,9 +52,18 @@ from lifecycle import states as S
 
 logger = logging.getLogger(__name__)
 
-# Each prompt message embeds the domain as `xyz.com`. The leading
-# backtick + a TLD-suffix anchor keeps us off random backticked phrases.
-_DOMAIN_RE = re.compile(r'`([a-z0-9][a-z0-9-]*\.[a-z]{2,})`')
+# Slack auto-linkifies plain URLs in mrkdwn — `domain.com` posted by
+# the bot comes back from conversations.history as
+#   `<http://domain.com|domain.com>`
+# (Slack adds the http:// + display text). The regex below extracts the
+# domain from BOTH the linkified form AND the bare-backtick form (e.g.
+# .kitchen / .pro TLDs that Slack doesn't auto-link).
+_DOMAIN_RE = re.compile(
+    r'<https?://([a-z0-9][a-z0-9.-]*\.[a-z]{2,})[/|>]'
+    r'|'
+    r'`([a-z0-9][a-z0-9-]*\.[a-z]{2,})`',
+    re.IGNORECASE,
+)
 # Phrases that uniquely mark an IDLE prompt (TL Flow 2). The first
 # matches the fallback text; the second matches the block-kit card
 # itself, since Slack sometimes returns bot messages with the text
@@ -86,7 +95,8 @@ def _parse_msg(msg: dict):
     m = _DOMAIN_RE.search(text)
     if not m:
         return None
-    domain = m.group(1).lower()
+    # Two alternatives in the regex — whichever matched gives us the domain.
+    domain = (m.group(1) or m.group(2)).lower()
 
     if _IDLE_FALLBACK_RE.search(text) or _IDLE_BLOCK_RE.search(text):
         return (domain, 'idle')
