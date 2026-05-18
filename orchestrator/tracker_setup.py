@@ -218,16 +218,20 @@ def add_tracker(
     # fine (production case 2026-05-18 on diywithryan.com).
 
     # ── 3. Build target + tracker URL ─────────────────────────────────────
+    # The CNAME target uses the SAME subdomain as the source — RedTrack
+    # verifies the CNAME resolves to a target it recognises, and it
+    # expects matching subdomains for tracker domains added via API.
     tracker_url = f'{cname_name}.{domain}'
-    cname_target = Config.REDTRACK_TRACKER_CNAME_TARGET
-    if not cname_target:
+    base = Config.REDTRACK_TRACKER_DOMAIN_BASE
+    if not base:
         return _result(
             status='dns_error',
-            message=('REDTRACK_TRACKER_CNAME_TARGET is not configured. '
+            message=('REDTRACK_TRACKER_DOMAIN_BASE is not configured. '
                      'Set the env var before running /new-tracker.'),
             details={'reason': 'tracker_target_unconfigured'},
             actor=actor, started=started, cname_name=cname_name, domain=domain,
         )
+    cname_target = f'{cname_name}.{base}'
 
     # ── 4. ATOM client (login if we built it ourselves) ──────────────────
     owns_client = atom_client is None

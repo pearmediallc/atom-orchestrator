@@ -227,22 +227,29 @@ class Config:
 
     # /new-tracker — RedTrack tracker domain setup.
     #
-    # Every CNAME we create points at a single FIXED target — RedTrack
-    # identifies our workspace from the incoming HTTP Host header, so the
-    # CNAME target doesn't need to vary per subdomain. This matches what
-    # ATOM already does for the default `track.<domain>` CNAME during
-    # setup-domain (aws_automation.py:2088 hardcodes the same value).
+    # Each tracker CNAME chain is:
+    #   <cname>.<your-domain>  →  <cname>.<REDTRACK_TRACKER_DOMAIN_BASE>
     #
-    # If RedTrack's add-domain UI ever tells you to use a different
-    # target (e.g., one that includes the subdomain), override via env.
-    REDTRACK_TRACKER_CNAME_TARGET = (
-        os.getenv('REDTRACK_TRACKER_CNAME_TARGET',
-                  'bseav.6597822f9284e30001617c1c.click') or ''
+    # The subdomain MATCHES on both sides. RedTrack verifies the CNAME
+    # resolves to a target it recognises for this workspace — and it
+    # expects matching subdomains for tracker domains added via the
+    # POST /domains API. Confirmed in production 2026-05-18 when a
+    # fixed `bseav.<base>` target was rejected with "we can't check
+    # your CNAME record."
+    #
+    # NOT to be confused with ATOM's hardcoded `track.<domain>` →
+    # `bseav.<base>` CNAME (aws_automation.py:2088). That's a special
+    # case using the workspace's primary registered tracker (`bseav`),
+    # not the per-domain pattern needed for additional trackers added
+    # via API.
+    REDTRACK_TRACKER_DOMAIN_BASE = (
+        os.getenv('REDTRACK_TRACKER_DOMAIN_BASE',
+                  '6597822f9284e30001617c1c.click') or ''
     ).strip()
 
     # The workspace ID we pass to RedTrack's POST /domains API
     # (`workspace_ids` field). Same 24-hex workspace id that appears in
-    # the CNAME target above; kept separate so they can diverge cleanly
+    # the CNAME base above; kept separate so they can diverge cleanly
     # if RedTrack ever changes the hostname format.
     REDTRACK_WORKSPACE_ID = (
         os.getenv('REDTRACK_WORKSPACE_ID',

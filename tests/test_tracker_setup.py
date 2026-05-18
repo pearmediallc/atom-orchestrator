@@ -51,7 +51,7 @@ def mock_atom():
     m.add_cname.return_value = {
         'action': 'created',
         'name': f'{VALID_CNAME}.{VALID_DOMAIN}',
-        'value': 'bseav.6597822f9284e30001617c1c.click',
+        'value': f'{VALID_CNAME}.6597822f9284e30001617c1c.click',
         'zone_id': 'ZABCD1234',
         'ttl': 60,
     }
@@ -92,9 +92,9 @@ def test_created_when_dns_and_redtrack_both_fresh(
 def test_dns_called_with_correct_args(
     seeded_inventory, mock_atom, mock_redtrack,
 ):
-    """The CNAME target must be the fixed Config value (not a
-    per-cname-substituted variant) and the account must come from the
-    inventory row."""
+    """The CNAME target must be `<cname>.<REDTRACK_TRACKER_DOMAIN_BASE>`
+    — matching subdomain on both sides of the CNAME chain. The account
+    must come from the inventory row."""
     ts.add_tracker(
         VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
     )
@@ -102,9 +102,9 @@ def test_dns_called_with_correct_args(
     assert kwargs['account_key'] == 'auto-insurance'
     assert kwargs['domain'] == VALID_DOMAIN
     assert kwargs['cname_name'] == VALID_CNAME
-    # Default target: bseav.6597...click (verifies we use the env value
-    # as-is, no per-cname substitution).
-    assert kwargs['value'].startswith('bseav.')
+    # Target must start with the SAME cname label as the source — the
+    # matching-subdomain pattern RedTrack expects.
+    assert kwargs['value'].startswith(f'{VALID_CNAME}.')
     assert kwargs['value'].endswith('.click')
 
 
@@ -140,7 +140,7 @@ def test_already_present_when_dns_and_redtrack_both_existed(
     mock_atom.add_cname.return_value = {
         'action': 'skipped_already_correct',
         'name': f'{VALID_CNAME}.{VALID_DOMAIN}',
-        'value': 'bseav.6597822f9284e30001617c1c.click',
+        'value': f'{VALID_CNAME}.6597822f9284e30001617c1c.click',
         'zone_id': 'ZABCD1234',
     }
     mock_redtrack.return_value = {
@@ -311,7 +311,7 @@ def test_dns_error_atom_connection_error(
 def test_dns_error_when_target_env_unconfigured(
     seeded_inventory, mock_atom, mock_redtrack, monkeypatch,
 ):
-    monkeypatch.setattr('config.Config.REDTRACK_TRACKER_CNAME_TARGET', '')
+    monkeypatch.setattr('config.Config.REDTRACK_TRACKER_DOMAIN_BASE', '')
     res = ts.add_tracker(
         VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
     )
