@@ -123,17 +123,17 @@ def add_tracker_domain(url: str) -> Dict:
             'REDTRACK_WORKSPACE_ID is not configured — cannot add tracker domain'
         )
 
-    # Body fields — kept minimal so RedTrack defaults what it can:
+    # Body fields:
     #   url:                      required, our tracker hostname
+    #   type:                     'track' — confirmed by GET /domains
+    #     2026-05-19: all 1044 existing tracker domains in our workspace
+    #     use exactly this value. `'tracker'` (what we tried first) is
+    #     rejected as "domain type is not defined".
     #   workspace_ids:            required, scope to our workspace
     #   use_auto_generated_ssl:   true so RedTrack provisions Let's Encrypt
-    # NOT sent:
-    #   type — `'tracker'` was rejected with "domain type is not defined"
-    #     (2026-05-19). RedTrack's swagger lists the field as
-    #     "type": "string" but doesn't enumerate valid values; omitting
-    #     it lets RedTrack pick the default based on workspace context.
     body = {
         'url': url,
+        'type': 'track',
         'workspace_ids': [Config.REDTRACK_WORKSPACE_ID],
         'use_auto_generated_ssl': True,
     }

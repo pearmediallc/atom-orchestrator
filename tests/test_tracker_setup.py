@@ -506,14 +506,14 @@ def test_add_tracker_domain_minimal_body(monkeypatch):
 
     rt.add_tracker_domain('trk.example.com')
     body = captured['json']
-    # `type` is intentionally NOT sent — RedTrack rejected 'tracker' as
-    # "domain type is not defined" (2026-05-19). Omitting lets RedTrack
-    # apply its workspace-context default.
+    # `type` MUST be 'track' — confirmed via GET /domains 2026-05-19,
+    # all 1044 existing tracker domains use this exact value. `'tracker'`
+    # was rejected as "domain type is not defined".
     assert set(body.keys()) == {
-        'url', 'workspace_ids', 'use_auto_generated_ssl',
+        'url', 'type', 'workspace_ids', 'use_auto_generated_ssl',
     }
-    assert 'type' not in body
     assert body['url'] == 'trk.example.com'
+    assert body['type'] == 'track'
     assert body['workspace_ids'] == ['WS']
     assert body['use_auto_generated_ssl'] is True
     assert captured['params'] == {'api_key': 'KEY'}
