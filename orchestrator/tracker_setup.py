@@ -207,15 +207,15 @@ def add_tracker(
             actor=actor, started=started, cname_name=cname_name, domain=domain,
         )
 
-    if not row.get('setup_at'):
-        return _result(
-            status='inventory_error',
-            message=(f'`{domain}` has not been deployed yet (no Route 53 '
-                     'zone exists). Run setup-domain first via the deploy '
-                     'flow, then re-run /new-tracker.'),
-            details={'reason': 'not_deployed'},
-            actor=actor, started=started, cname_name=cname_name, domain=domain,
-        )
+    # No setup_at pre-check: it's a metadata proxy that can drift from
+    # AWS reality (a domain may have been set up directly via ATOM's UI
+    # or another path that didn't write setup_at). ATOM's POST
+    # /api/add-cname is the authoritative source — it returns 404
+    # `no_hosted_zone_for_<domain>` when there's actually no R53 zone,
+    # and that's surfaced with a precise message in the ATOM error
+    # handling below. Skipping the metadata check unblocks legacy
+    # domains whose inventory state is stale but whose AWS state is
+    # fine (production case 2026-05-18 on diywithryan.com).
 
     # ── 3. Build target + tracker URL ─────────────────────────────────────
     tracker_url = f'{cname_name}.{domain}'

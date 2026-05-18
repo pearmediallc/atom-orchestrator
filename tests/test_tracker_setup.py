@@ -411,9 +411,17 @@ def test_aws_account_missing(tmp_inventory, mock_atom, mock_redtrack):
     assert res.details['reason'] == 'aws_account_missing'
 
 
-def test_not_deployed_yet(tmp_inventory, mock_atom, mock_redtrack):
-    """setup_at NULL means R53 zone may not exist yet — refuse rather
-    than letting ATOM 404 on us."""
+def test_proceeds_even_when_setup_at_is_null(
+    tmp_inventory, mock_atom, mock_redtrack,
+):
+    """setup_at NULL is NOT a hard reject — it's just a metadata flag
+    that can drift from AWS reality (legacy domains imported from CSV,
+    domains set up via ATOM UI directly, etc.). ATOM's add_cname is the
+    source of truth: if the zone actually exists, the call succeeds;
+    if not, ATOM returns 404 and we surface a precise error.
+
+    Regression for the diywithryan.com case 2026-05-18 where setup_at
+    was NULL but R53 actually had the zone."""
     tmp_inventory.add_domain(
         VALID_DOMAIN, aws_account='auto-insurance', requested_by='U_TEST',
     )
@@ -421,9 +429,10 @@ def test_not_deployed_yet(tmp_inventory, mock_atom, mock_redtrack):
     res = ts.add_tracker(
         VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
     )
-    assert res.status == 'inventory_error'
-    assert res.details['reason'] == 'not_deployed'
-    assert mock_atom.add_cname.call_count == 0
+    # ATOM mock returns 'created' for add_cname — the bot should
+    # proceed to RedTrack and succeed, NOT bail on the metadata check.
+    assert res.status == 'created'
+    assert mock_atom.add_cname.call_count == 1
 
 
 # ─── RedTrack "already exists" shape ──────────────────────────────────────
