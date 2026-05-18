@@ -1617,7 +1617,9 @@ if _bolt_app is not None:
         window and DM the operator with the outcome.
         """
         ack()
-        actor = body['user']['id']
+        # Slash command payload uses flat `user_id` / `channel_id`, NOT
+        # the nested `user.id` shape that button/view interactions have.
+        actor = body.get('user_id') or ''
         response_channel = body.get('channel_id') or actor
         raw = (body.get('text') or '').strip()
 
@@ -1667,7 +1669,9 @@ if _bolt_app is not None:
         + write (typically 1-3s, but can spike).
         """
         ack()
-        actor = body['user']['id']
+        # Slash command payload uses flat `user_id` / `channel_id`, NOT
+        # the nested `user.id` shape that button/view interactions have.
+        actor = body.get('user_id') or ''
         response_channel = body.get('channel_id') or actor
         raw = (body.get('text') or '').strip()
 
