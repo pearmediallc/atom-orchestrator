@@ -489,6 +489,8 @@ def test_add_tracker_domain_minimal_body(monkeypatch):
     captured = {}
     class _Resp:
         status_code = 200
+        ok = True
+        text = '{"id": "x"}'
         content = b'{"id": "x"}'
         def json(self):
             return {'id': 'x'}
@@ -528,6 +530,9 @@ def test_add_tracker_domain_detects_already_exists_via_409(monkeypatch):
 
     class _Resp:
         status_code = 409
+        ok = False
+        text = '{"error": "domain already exists", "id": "rt_existing"}'
+        reason = 'Conflict'
         content = b'{"error": "domain already exists", "id": "rt_existing"}'
         def json(self):
             return {'error': 'domain already exists', 'id': 'rt_existing'}
@@ -544,6 +549,38 @@ def test_add_tracker_domain_detects_already_exists_via_409(monkeypatch):
     assert out['id'] == 'rt_existing'
 
 
+def test_add_tracker_domain_400_includes_response_body_in_error(monkeypatch):
+    """Plain HTTPError loses the response body. Our wrapper must include
+    it so operators can see WHY RedTrack rejected without digging through
+    Render logs (caught 2026-05-18 — got opaque '400 Bad Request' until
+    we surfaced the body)."""
+    from redtrack_client import client as rt
+    monkeypatch.setattr('config.Config.REDTRACK_API_KEY', 'KEY')
+    monkeypatch.setattr('config.Config.REDTRACK_WORKSPACE_ID', 'WS')
+
+    class _Resp:
+        status_code = 400
+        ok = False
+        reason = 'Bad Request'
+        text = '{"error": "invalid type: must be one of redirect|direct"}'
+        content = b'...'
+        def json(self):
+            return {'error': 'invalid type: must be one of redirect|direct'}
+        def raise_for_status(self):
+            raise requests.HTTPError('400')
+
+    monkeypatch.setattr(
+        'redtrack_client.client.requests.post',
+        lambda url, params, json, timeout: _Resp(),
+    )
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        rt.add_tracker_domain('trk.example.com')
+    msg = str(exc_info.value)
+    assert 'invalid type' in msg
+    assert '400' in msg
+
+
 def test_add_tracker_domain_detects_already_exists_via_body_text(monkeypatch):
     """Some RedTrack errors return 4xx with body containing 'already'
     instead of a clean 409. We pattern-match on the body too."""
@@ -553,6 +590,9 @@ def test_add_tracker_domain_detects_already_exists_via_body_text(monkeypatch):
 
     class _Resp:
         status_code = 400
+        ok = False
+        text = '{"error": "Domain already registered to this workspace"}'
+        reason = 'Bad Request'
         content = b'{"error": "Domain already registered to this workspace"}'
         def json(self):
             return {'error': 'Domain already registered to this workspace'}

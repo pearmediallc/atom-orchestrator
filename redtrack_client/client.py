@@ -135,7 +135,21 @@ def add_tracker_domain(url: str) -> Dict:
             return {'_already_exists': True, '_http_status': r.status_code,
                     **resp_body}
 
-    r.raise_for_status()
+    # On non-success, raise with RedTrack's response body included in the
+    # exception message. requests.HTTPError's default str() doesn't carry
+    # the body, so without this we get an opaque "400 Client Error" and
+    # have to dig through Render logs to learn what RedTrack rejected.
+    if not r.ok:
+        body_sniff = (
+            str(resp_body)[:400] if resp_body
+            else (r.text[:400] if r.text else '(empty body)')
+        )
+        raise requests.HTTPError(
+            f'{r.status_code} {r.reason} from RedTrack POST /domains. '
+            f'Body: {body_sniff}',
+            response=r,
+        )
+
     if not isinstance(resp_body, dict):
         # Unexpected: RedTrack returned a 2xx with a non-dict body.
         raise requests.RequestException(

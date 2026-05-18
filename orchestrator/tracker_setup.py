@@ -354,12 +354,15 @@ def add_tracker(
     except requests.RequestException as e:
         logger.exception('RedTrack add-tracker-domain failed for %s',
                          tracker_url)
+        # Bump the truncation to 400 chars so RedTrack's response body
+        # (included in the HTTPError message by add_tracker_domain) is
+        # visible in the Slack DM, not just Render logs.
         return _result(
             status='dns_done_redtrack_failed',
-            message=(f'DNS done. RedTrack registration failed: '
-                     f'{type(e).__name__}: {str(e)[:140]}. The CNAME is in '
-                     'place — re-run /new-tracker; it will skip DNS '
-                     '(idempotent) and retry just RedTrack.'),
+            message=(f'DNS done. RedTrack rejected the domain: '
+                     f'`{type(e).__name__}: {str(e)[:400]}`. The CNAME is '
+                     'in place — once we fix the body shape, re-run '
+                     '/new-tracker (DNS step skips, only RedTrack retries).'),
             details={
                 'reason': 'redtrack_request_failed',
                 'dns_action': dns_action, 'tracker_url': tracker_url,
