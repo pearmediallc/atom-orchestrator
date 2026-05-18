@@ -1605,7 +1605,7 @@ if _bolt_app is not None:
         )
 
     @_bolt_app.command('/new-tracker')
-    def handle_new_tracker_command(ack, body, client):
+    def handle_new_tracker_command(ack, body, client, respond):
         """Add a tracker subdomain CNAME + register with RedTrack.
 
         Usage: `/new-tracker {cname} {domain}`
@@ -1615,6 +1615,12 @@ if _bolt_app is not None:
         /reassign-domain). Validation, R53 call, RedTrack call all
         happen in a daemon thread; ack the slash within Slack's 3s
         window and DM the operator with the outcome.
+
+        Uses `respond()` (Slack's response_url webhook) for the
+        immediate ephemeral feedback so it works from ANY channel —
+        chat_postEphemeral fails with channel_not_found when the bot
+        isn't a member of the channel where the slash was invoked
+        (production bug 2026-05-18).
         """
         ack()
         # Slash command payload uses flat `user_id` / `channel_id`, NOT
@@ -1625,25 +1631,25 @@ if _bolt_app is not None:
 
         parts = raw.split()
         if len(parts) != 2:
-            client.chat_postEphemeral(
-                channel=response_channel, user=actor,
-                text=(
+            respond({
+                'response_type': 'ephemeral',
+                'text': (
                     ':information_source: *Usage:* '
                     '`/new-tracker {cname} {domain}`\n'
                     'Example: `/new-tracker trk neurobloomone.com`\n'
                     'Creates the Route 53 CNAME + registers the tracker '
                     'with RedTrack. Reserved cnames: `track`, `www`.'
                 ),
-            )
+            })
             return
 
         cname_arg, domain_arg = parts[0], parts[1]
-        client.chat_postEphemeral(
-            channel=response_channel, user=actor,
-            text=(f':hourglass_flowing_sand: Setting up tracker '
-                  f'`{cname_arg}.{domain_arg}` — Route 53 + RedTrack. '
-                  'I\'ll DM you the result in a few seconds.'),
-        )
+        respond({
+            'response_type': 'ephemeral',
+            'text': (f':hourglass_flowing_sand: Setting up tracker '
+                     f'`{cname_arg}.{domain_arg}` — Route 53 + RedTrack. '
+                     'I\'ll DM you the result in a few seconds.'),
+        })
 
         threading.Thread(
             target=_new_tracker_worker,
@@ -1653,7 +1659,7 @@ if _bolt_app is not None:
         ).start()
 
     @_bolt_app.command('/pixel-fire')
-    def handle_pixel_fire_command(ack, body, client):
+    def handle_pixel_fire_command(ack, body, client, respond):
         """Replace the Meta Pixel ID + event on the v1 lander.
 
         Usage: `/pixel-fire {event} {id}`
@@ -1667,6 +1673,12 @@ if _bolt_app is not None:
         Acks immediately, runs the actual edit in a daemon thread so
         Slack's 3-second response window isn't blocked by ATOM's S3 read
         + write (typically 1-3s, but can spike).
+
+        Uses `respond()` (Slack's response_url webhook) for the
+        immediate ephemeral feedback so it works from ANY channel —
+        chat_postEphemeral fails with channel_not_found when the bot
+        isn't a member of the channel where the slash was invoked
+        (production bug 2026-05-18).
         """
         ack()
         # Slash command payload uses flat `user_id` / `channel_id`, NOT
@@ -1678,14 +1690,14 @@ if _bolt_app is not None:
         # Usage check — bare /pixel-fire or wrong arg count.
         parts = raw.split()
         if len(parts) != 2:
-            client.chat_postEphemeral(
-                channel=response_channel, user=actor,
-                text=(
+            respond({
+                'response_type': 'ephemeral',
+                'text': (
                     ':information_source: *Usage:* `/pixel-fire {event} {id}`\n'
                     'Example: `/pixel-fire Lead 2714057732308829`\n'
                     f'Updates the Meta Pixel on `{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}`.'
                 ),
-            )
+            })
             return
 
         event_arg, id_arg = parts[0], parts[1]
@@ -1693,13 +1705,13 @@ if _bolt_app is not None:
         # Light pre-feedback so the operator sees something IMMEDIATELY
         # while the worker thread does the ATOM round-trip. Real result
         # arrives via DM (or ephemeral fallback) shortly after.
-        client.chat_postEphemeral(
-            channel=response_channel, user=actor,
-            text=(f':hourglass_flowing_sand: Updating pixel on '
-                  f'`{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}` — '
-                  f'event=`{event_arg}`, id=`{id_arg}`. '
-                  'I\'ll DM you the result in a few seconds.'),
-        )
+        respond({
+            'response_type': 'ephemeral',
+            'text': (f':hourglass_flowing_sand: Updating pixel on '
+                     f'`{PIXEL_FIRE_DOMAIN}/{PIXEL_FIRE_FILE_KEY}` — '
+                     f'event=`{event_arg}`, id=`{id_arg}`. '
+                     'I\'ll DM you the result in a few seconds.'),
+        })
 
         threading.Thread(
             target=_pixel_fire_worker,
