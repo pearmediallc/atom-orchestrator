@@ -259,6 +259,28 @@ def test_dns_error_no_hosted_zone(
     assert mock_redtrack.call_count == 0
 
 
+def test_dns_error_atom_endpoint_missing(
+    seeded_inventory, mock_atom, mock_redtrack,
+):
+    """ATOM returning the bare Flask 404 HTML page means /api/add-cname
+    isn't deployed (PR not merged OR Render didn't redeploy). Must
+    surface a DIFFERENT message than 'no R53 zone' — operator needs to
+    redeploy ATOM, not investigate missing zones (production case
+    2026-05-18 caught the original loose check)."""
+    mock_atom.add_cname.side_effect = AtomClientError(
+        'POST /api/add-cname -> HTTP 404 (client error). Body: '
+        '<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n'
+        '<h1>Not Found</h1>\n<p>The requested URL was not found...</p>'
+    )
+    res = ts.add_tracker(
+        VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
+    )
+    assert res.status == 'dns_error'
+    assert res.details['reason'] == 'atom_endpoint_missing'
+    assert 'redeploy' in res.message.lower()
+    assert mock_redtrack.call_count == 0
+
+
 def test_dns_error_atom_5xx(
     seeded_inventory, mock_atom, mock_redtrack,
 ):

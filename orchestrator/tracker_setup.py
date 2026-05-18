@@ -254,13 +254,41 @@ def add_tracker(
         )
     except AtomClientError as e:
         msg = str(e).lower()
-        if 'no_hosted_zone' in msg or 'http 404' in msg:
+        # Distinguish two flavours of 404:
+        #   • JSON body containing `no_hosted_zone_for_<domain>` — real
+        #     R53 zone missing. Operator should check setup-domain.
+        #   • HTML body ("not found", default Flask 404 page) — the
+        #     /api/add-cname route itself doesn't exist on the running
+        #     ATOM service (PR not merged OR Render hasn't redeployed
+        #     since merge). Operator should redeploy ATOM, not retry.
+        # The HTML-404 case bit us 2026-05-18: PR merged 3h prior but
+        # Render's ATOM service didn't auto-redeploy from main.
+        if 'no_hosted_zone' in msg:
             return _result(
                 status='dns_error',
-                message=(f'ATOM has no R53 zone for `{domain}`. Has the '
-                         'setup-domain pipeline finished? Check '
-                         f'`/domain-history {domain}`.'),
+                message=(f'ATOM has no R53 zone for `{domain}` in account '
+                         f'`{aws_account}`. Has the setup-domain pipeline '
+                         f'finished for this domain? Check '
+                         f'`/domain-history {domain}` — and verify the '
+                         '`aws_account` column matches where the zone '
+                         'actually lives.'),
                 details={'reason': 'no_hosted_zone',
+                         'aws_account': aws_account,
+                         'error': f'{type(e).__name__}: {e}'},
+                actor=actor, started=started,
+                cname_name=cname_name, domain=domain,
+            )
+        if ('http 404' in msg
+                and ('not found</' in msg or '<html' in msg or 'doctype' in msg)):
+            return _result(
+                status='dns_error',
+                message=('ATOM returned a generic 404 (route not found). '
+                         'The `/api/add-cname` endpoint is not deployed on '
+                         'the ATOM service yet — check Render dashboard, '
+                         'redeploy aws-automation from latest main, then '
+                         'retry. (PR may have merged but Render did not '
+                         'auto-redeploy.)'),
+                details={'reason': 'atom_endpoint_missing',
                          'error': f'{type(e).__name__}: {e}'},
                 actor=actor, started=started,
                 cname_name=cname_name, domain=domain,
