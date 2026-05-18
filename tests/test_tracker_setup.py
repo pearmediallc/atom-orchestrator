@@ -51,7 +51,7 @@ def mock_atom():
     m.add_cname.return_value = {
         'action': 'created',
         'name': f'{VALID_CNAME}.{VALID_DOMAIN}',
-        'value': f'{VALID_CNAME}.6597822f9284e30001617c1c.click',
+        'value': 'bseav.6597822f9284e30001617c1c.click',
         'zone_id': 'ZABCD1234',
         'ttl': 60,
     }
@@ -92,9 +92,9 @@ def test_created_when_dns_and_redtrack_both_fresh(
 def test_dns_called_with_correct_args(
     seeded_inventory, mock_atom, mock_redtrack,
 ):
-    """The CNAME target must be `<cname>.<REDTRACK_TRACKER_DOMAIN_BASE>`
-    — matching subdomain on both sides of the CNAME chain. The account
-    must come from the inventory row."""
+    """The CNAME target must be the FIXED Config value (RedTrack uses a
+    single canonical tracker hostname per workspace and routes by Host
+    header). The account must come from the inventory row."""
     ts.add_tracker(
         VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
     )
@@ -102,9 +102,9 @@ def test_dns_called_with_correct_args(
     assert kwargs['account_key'] == 'auto-insurance'
     assert kwargs['domain'] == VALID_DOMAIN
     assert kwargs['cname_name'] == VALID_CNAME
-    # Target must start with the SAME cname label as the source — the
-    # matching-subdomain pattern RedTrack expects.
-    assert kwargs['value'].startswith(f'{VALID_CNAME}.')
+    # FIXED target — same value regardless of cname_name. The default
+    # is 'bseav.6597...click' (workspace primary tracker).
+    assert kwargs['value'].startswith('bseav.')
     assert kwargs['value'].endswith('.click')
 
 
@@ -140,7 +140,7 @@ def test_already_present_when_dns_and_redtrack_both_existed(
     mock_atom.add_cname.return_value = {
         'action': 'skipped_already_correct',
         'name': f'{VALID_CNAME}.{VALID_DOMAIN}',
-        'value': f'{VALID_CNAME}.6597822f9284e30001617c1c.click',
+        'value': 'bseav.6597822f9284e30001617c1c.click',
         'zone_id': 'ZABCD1234',
     }
     mock_redtrack.return_value = {
@@ -311,7 +311,7 @@ def test_dns_error_atom_connection_error(
 def test_dns_error_when_target_env_unconfigured(
     seeded_inventory, mock_atom, mock_redtrack, monkeypatch,
 ):
-    monkeypatch.setattr('config.Config.REDTRACK_TRACKER_DOMAIN_BASE', '')
+    monkeypatch.setattr('config.Config.REDTRACK_TRACKER_CNAME_TARGET', '')
     res = ts.add_tracker(
         VALID_CNAME, VALID_DOMAIN, actor='U_TEST', atom_client=mock_atom,
     )
@@ -579,6 +579,125 @@ def test_add_tracker_domain_400_includes_response_body_in_error(monkeypatch):
     msg = str(exc_info.value)
     assert 'invalid type' in msg
     assert '400' in msg
+
+
+def test_add_tracker_domain_retries_on_dns_propagation_transient(monkeypatch):
+    """The "we can't check your CNAME record" 400 is the DNS-propagation
+    transient — RedTrack's resolver hasn't seen our freshly-created R53
+    CNAME yet. Wrapper should retry up to _CNAME_CHECK_MAX_RETRIES times
+    with backoff before giving up. Regression for diywithryan.com case
+    2026-05-19 where first /new-tracker run got this error then a re-run
+    succeeded; retry makes the first run succeed."""
+    from redtrack_client import client as rt
+    monkeypatch.setattr('config.Config.REDTRACK_API_KEY', 'KEY')
+    monkeypatch.setattr('config.Config.REDTRACK_WORKSPACE_ID', 'WS')
+    # Make sleep a no-op so the test runs fast.
+    monkeypatch.setattr('redtrack_client.client.time.sleep', lambda s: None)
+
+    class _Transient:
+        status_code = 400
+        ok = False
+        reason = 'Bad Request'
+        text = '{"error": "we can\'t check your CNAME record."}'
+        content = b'...'
+        def json(self):
+            return {'error': "we can't check your CNAME record."}
+        def raise_for_status(self):
+            raise requests.HTTPError('400')
+
+    class _Success:
+        status_code = 200
+        ok = True
+        reason = 'OK'
+        text = '{"id": "rt_id"}'
+        content = b'{"id": "rt_id"}'
+        def json(self):
+            return {'id': 'rt_id'}
+        def raise_for_status(self):
+            pass
+
+    # 2 transient failures, then success.
+    responses = [_Transient(), _Transient(), _Success()]
+    call_count = {'n': 0}
+
+    def _post(url, params, json, timeout):
+        i = call_count['n']
+        call_count['n'] += 1
+        return responses[i]
+
+    monkeypatch.setattr('redtrack_client.client.requests.post', _post)
+
+    out = rt.add_tracker_domain('trk.example.com')
+    assert out['id'] == 'rt_id'
+    assert call_count['n'] == 3  # 2 retries + 1 success
+
+
+def test_add_tracker_domain_gives_up_after_max_retries_on_transient(monkeypatch):
+    """When the propagation transient never clears, surface as a clear
+    HTTPError after exhausting retries — caller's dns_done_redtrack_failed
+    branch fires with the right message."""
+    from redtrack_client import client as rt
+    monkeypatch.setattr('config.Config.REDTRACK_API_KEY', 'KEY')
+    monkeypatch.setattr('config.Config.REDTRACK_WORKSPACE_ID', 'WS')
+    monkeypatch.setattr('redtrack_client.client.time.sleep', lambda s: None)
+
+    class _Transient:
+        status_code = 400
+        ok = False
+        reason = 'Bad Request'
+        text = '{"error": "we can\'t check your CNAME record."}'
+        content = b'...'
+        def json(self):
+            return {'error': "we can't check your CNAME record."}
+        def raise_for_status(self):
+            raise requests.HTTPError('400')
+
+    call_count = {'n': 0}
+
+    def _post(url, params, json, timeout):
+        call_count['n'] += 1
+        return _Transient()
+
+    monkeypatch.setattr('redtrack_client.client.requests.post', _post)
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        rt.add_tracker_domain('trk.example.com')
+    # Should have tried _CNAME_CHECK_MAX_RETRIES + 1 times before raising.
+    assert call_count['n'] == rt._CNAME_CHECK_MAX_RETRIES + 1
+    assert "can't check your cname" in str(exc_info.value).lower()
+
+
+def test_add_tracker_domain_does_not_retry_on_non_transient_400(monkeypatch):
+    """A 400 with a DIFFERENT error message (e.g., wrong CNAME target)
+    must fail immediately — retrying wastes API budget on errors that
+    won't self-correct."""
+    from redtrack_client import client as rt
+    monkeypatch.setattr('config.Config.REDTRACK_API_KEY', 'KEY')
+    monkeypatch.setattr('config.Config.REDTRACK_WORKSPACE_ID', 'WS')
+    monkeypatch.setattr('redtrack_client.client.time.sleep', lambda s: None)
+
+    class _WrongTarget:
+        status_code = 400
+        ok = False
+        reason = 'Bad Request'
+        text = '{"error": "cname should point to bseav.xxx, but points to trk.xxx"}'
+        content = b'...'
+        def json(self):
+            return {'error': 'cname should point to bseav.xxx, but points to trk.xxx'}
+        def raise_for_status(self):
+            raise requests.HTTPError('400')
+
+    call_count = {'n': 0}
+
+    def _post(url, params, json, timeout):
+        call_count['n'] += 1
+        return _WrongTarget()
+
+    monkeypatch.setattr('redtrack_client.client.requests.post', _post)
+
+    with pytest.raises(requests.HTTPError):
+        rt.add_tracker_domain('trk.example.com')
+    assert call_count['n'] == 1  # no retries — failed once and gave up
 
 
 def test_add_tracker_domain_detects_already_exists_via_body_text(monkeypatch):

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import time
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -41,6 +42,16 @@ _MAX_PAGES = 50
 
 # Cap an individual HTTP call. /report can be slow on big accounts.
 _HTTP_TIMEOUT_SECONDS = 60
+
+# /new-tracker POST /domains retry tuning for the DNS-propagation
+# transient (RedTrack returns 400 "we can't check your CNAME record"
+# when its resolver hasn't seen our freshly-created R53 CNAME yet).
+# Backoff schedule = first retry after 5s, then 10s, then 20s. Total
+# ~35s max — within Slack's tolerance for the worker thread, and
+# enough for typical DNS propagation. Public R53 records become
+# visible to most resolvers within 30s once created.
+_CNAME_CHECK_MAX_RETRIES = 3
+_CNAME_CHECK_BACKOFFS = (5, 10, 20)  # seconds, indexed by attempt
 
 
 # ─── Public API ────────────────────────────────────────────────────────────
@@ -79,10 +90,19 @@ def add_tracker_domain(url: str) -> Dict:
     'already') and returns it as `{'_already_exists': True, ...body}`
     so callers can treat it as a no-op success.
 
+    Auto-retries on RedTrack's DNS-propagation transient ("we can't
+    check your CNAME record"). When you create an R53 CNAME and POST
+    to /domains within seconds, RedTrack's resolver may not have seen
+    the new record yet — TTL is 60s but caching at the resolver layer
+    can take 1-2 minutes to clear. The wrapper retries up to
+    _CNAME_CHECK_MAX_RETRIES times with exponential backoff before
+    giving up; production case 2026-05-19 on diywithryan.com confirmed
+    this is the right transient class to retry.
+
     Raises:
       RuntimeError when REDTRACK_API_KEY isn't configured. Callers should
         gate on a creds check before calling.
-      requests.HTTPError on any other 4xx/5xx.
+      requests.HTTPError on any other 4xx/5xx (body included in message).
       requests.RequestException on transport failures.
 
     Body sent (minimal — RedTrack's swagger schema lists many more
@@ -109,54 +129,86 @@ def add_tracker_domain(url: str) -> Dict:
         'workspace_ids': [Config.REDTRACK_WORKSPACE_ID],
         'use_auto_generated_ssl': True,
     }
-    r = requests.post(
-        f'{_base_url()}/domains',
-        params={'api_key': Config.REDTRACK_API_KEY},
-        json=body,
-        timeout=_HTTP_TIMEOUT_SECONDS,
-    )
 
-    # Best-effort body parse so callers can read error details even on 4xx.
-    try:
-        resp_body = r.json() if r.content else {}
-    except ValueError:
-        resp_body = {'_raw_body': r.text[:500]}
+    # Retry loop: RedTrack's CNAME-check is a separate DNS resolution
+    # that lags behind our R53 CREATE. We retry on the specific
+    # "we can't check your CNAME record" 400 with exponential backoff
+    # (_CNAME_CHECK_BACKOFFS seconds). Other 4xx/5xx errors fail
+    # immediately — retrying a wrong-target error wastes API budget.
+    for attempt in range(_CNAME_CHECK_MAX_RETRIES + 1):
+        r = requests.post(
+            f'{_base_url()}/domains',
+            params={'api_key': Config.REDTRACK_API_KEY},
+            json=body,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
 
-    # RedTrack hasn't publicly documented the exact "already exists" shape,
-    # so we recognise BOTH a 409 status AND a 200/4xx body whose error
-    # field contains 'already'. Treat both as "this is fine, the domain
-    # is already on RedTrack" — caller's idempotent re-run.
-    if r.status_code == 409:
-        return {'_already_exists': True, '_http_status': r.status_code,
-                **(resp_body if isinstance(resp_body, dict) else {})}
-    if isinstance(resp_body, dict):
-        err_text = (resp_body.get('error') or resp_body.get('message') or '')
-        if isinstance(err_text, str) and 'already' in err_text.lower():
+        # Best-effort body parse so callers see error details even on 4xx.
+        try:
+            resp_body = r.json() if r.content else {}
+        except ValueError:
+            resp_body = {'_raw_body': r.text[:500]}
+
+        # "Already exists" is treated as success (idempotent re-run).
+        # Detected via 409 status OR a 4xx body with 'already' in error.
+        if r.status_code == 409:
             return {'_already_exists': True, '_http_status': r.status_code,
-                    **resp_body}
+                    **(resp_body if isinstance(resp_body, dict) else {})}
+        err_text = ''
+        if isinstance(resp_body, dict):
+            err_text = (resp_body.get('error')
+                        or resp_body.get('message') or '')
+            if isinstance(err_text, str) and 'already' in err_text.lower():
+                return {'_already_exists': True,
+                        '_http_status': r.status_code, **resp_body}
 
-    # On non-success, raise with RedTrack's response body included in the
-    # exception message. requests.HTTPError's default str() doesn't carry
-    # the body, so without this we get an opaque "400 Client Error" and
-    # have to dig through Render logs to learn what RedTrack rejected.
-    if not r.ok:
-        body_sniff = (
-            str(resp_body)[:400] if resp_body
-            else (r.text[:400] if r.text else '(empty body)')
+        # Retryable transient: RedTrack hasn't seen the CNAME yet.
+        is_propagation_error = (
+            r.status_code == 400
+            and isinstance(err_text, str)
+            and "can't check your cname" in err_text.lower()
         )
-        raise requests.HTTPError(
-            f'{r.status_code} {r.reason} from RedTrack POST /domains. '
-            f'Body: {body_sniff}',
-            response=r,
-        )
+        if is_propagation_error and attempt < _CNAME_CHECK_MAX_RETRIES:
+            sleep_for = _CNAME_CHECK_BACKOFFS[attempt]
+            logger.info(
+                'RedTrack POST /domains: DNS propagation transient '
+                '(attempt %d/%d), sleeping %ds then retrying',
+                attempt + 1, _CNAME_CHECK_MAX_RETRIES + 1, sleep_for,
+            )
+            time.sleep(sleep_for)
+            continue
 
-    if not isinstance(resp_body, dict):
-        # Unexpected: RedTrack returned a 2xx with a non-dict body.
-        raise requests.RequestException(
-            f'RedTrack POST /domains returned unexpected shape: '
-            f'{type(resp_body).__name__} (body sniff: {str(resp_body)[:200]!r})'
-        )
-    return resp_body
+        # Non-success, non-retryable → raise with body in the exception
+        # message. Default HTTPError str() drops the body; without this
+        # we'd get an opaque '400 Client Error' and have to dig logs.
+        if not r.ok:
+            body_sniff = (
+                str(resp_body)[:400] if resp_body
+                else (r.text[:400] if r.text else '(empty body)')
+            )
+            raise requests.HTTPError(
+                f'{r.status_code} {r.reason} from RedTrack POST /domains. '
+                f'Body: {body_sniff}',
+                response=r,
+            )
+
+        if not isinstance(resp_body, dict):
+            raise requests.RequestException(
+                f'RedTrack POST /domains returned unexpected shape: '
+                f'{type(resp_body).__name__} '
+                f'(body sniff: {str(resp_body)[:200]!r})'
+            )
+        return resp_body
+
+    # Loop exhausted on the propagation transient — surface as a clear
+    # HTTPError so the caller's dns_done_redtrack_failed path fires
+    # with the right message.
+    raise requests.HTTPError(
+        f'{r.status_code} {r.reason} from RedTrack POST /domains after '
+        f'{_CNAME_CHECK_MAX_RETRIES + 1} attempts (DNS propagation '
+        f"transient never cleared). Body: {str(resp_body)[:400]}",
+        response=r,
+    )
 
 
 def extract_host(url: Optional[str]) -> Optional[str]:

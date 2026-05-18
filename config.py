@@ -227,24 +227,21 @@ class Config:
 
     # /new-tracker — RedTrack tracker domain setup.
     #
-    # Each tracker CNAME chain is:
-    #   <cname>.<your-domain>  →  <cname>.<REDTRACK_TRACKER_DOMAIN_BASE>
+    # Every CNAME we create points at this single FIXED target.
+    # RedTrack uses the workspace's PRIMARY registered tracker
+    # (`bseav.<workspace-id>.click`) as the canonical CNAME target;
+    # incoming requests are routed by the HTTP Host header to the right
+    # tracker domain regardless of source subdomain. Confirmed by
+    # RedTrack's own 400 message 2026-05-19: "cname should point to
+    # bseav.6597822f9284e30001617c1c.click. or bseav.ttrk.io."
     #
-    # The subdomain MATCHES on both sides. RedTrack verifies the CNAME
-    # resolves to a target it recognises for this workspace — and it
-    # expects matching subdomains for tracker domains added via the
-    # POST /domains API. Confirmed in production 2026-05-18 when a
-    # fixed `bseav.<base>` target was rejected with "we can't check
-    # your CNAME record."
+    # This matches what ATOM hardcodes for the default `track.<domain>`
+    # CNAME during setup-domain (aws_automation.py:2088).
     #
-    # NOT to be confused with ATOM's hardcoded `track.<domain>` →
-    # `bseav.<base>` CNAME (aws_automation.py:2088). That's a special
-    # case using the workspace's primary registered tracker (`bseav`),
-    # not the per-domain pattern needed for additional trackers added
-    # via API.
-    REDTRACK_TRACKER_DOMAIN_BASE = (
-        os.getenv('REDTRACK_TRACKER_DOMAIN_BASE',
-                  '6597822f9284e30001617c1c.click') or ''
+    # Override via env if your workspace primary changes (rare).
+    REDTRACK_TRACKER_CNAME_TARGET = (
+        os.getenv('REDTRACK_TRACKER_CNAME_TARGET',
+                  'bseav.6597822f9284e30001617c1c.click') or ''
     ).strip()
 
     # The workspace ID we pass to RedTrack's POST /domains API
