@@ -225,6 +225,30 @@ class Config:
         os.getenv('REDTRACK_BASE_URL', 'https://api.redtrack.io') or ''
     ).strip()
 
+    # /new-tracker — RedTrack tracker domain setup.
+    #
+    # Every CNAME we create points at a single FIXED target — RedTrack
+    # identifies our workspace from the incoming HTTP Host header, so the
+    # CNAME target doesn't need to vary per subdomain. This matches what
+    # ATOM already does for the default `track.<domain>` CNAME during
+    # setup-domain (aws_automation.py:2088 hardcodes the same value).
+    #
+    # If RedTrack's add-domain UI ever tells you to use a different
+    # target (e.g., one that includes the subdomain), override via env.
+    REDTRACK_TRACKER_CNAME_TARGET = (
+        os.getenv('REDTRACK_TRACKER_CNAME_TARGET',
+                  'bseav.6597822f9284e30001617c1c.click') or ''
+    ).strip()
+
+    # The workspace ID we pass to RedTrack's POST /domains API
+    # (`workspace_ids` field). Same 24-hex workspace id that appears in
+    # the CNAME target above; kept separate so they can diverge cleanly
+    # if RedTrack ever changes the hostname format.
+    REDTRACK_WORKSPACE_ID = (
+        os.getenv('REDTRACK_WORKSPACE_ID',
+                  '6597822f9284e30001617c1c') or ''
+    ).strip()
+
     # TL Slack ID — escalation target when an MDB ghosts a prompt or
     # contradiction guard fires. Reuses the same DEV_REROUTE_DMS_TO seam
     # via Config.route_recipient(), so dev/test never spams the real TL.

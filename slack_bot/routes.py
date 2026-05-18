@@ -34,6 +34,7 @@ from orchestrator.pixel_fire import (
     PIXEL_FIRE_LIVE_URL,
     update_pixel_on_lander,
 )
+from orchestrator.tracker_setup import add_tracker
 from orchestrator.workflow import (
     ExistingDomainRequest,
     run_existing_domain_workflow,
@@ -956,6 +957,89 @@ def _pixel_fire_proof_blocks(result) -> list:
     ]
 
 
+# ─── /new-tracker worker ───────────────────────────────────────────────────
+# Mirrors _pixel_fire_worker: daemon thread so the slash command can ack
+# within Slack's 3s window. Calls the pure-logic tracker_setup module,
+# then DMs the operator with the result (success block or failure line).
+
+def _new_tracker_worker(client, actor: str, response_channel: str,
+                         cname_name: str, domain: str) -> None:
+    """Background worker: run add_tracker + DM the operator."""
+    try:
+        result = add_tracker(cname_name, domain, actor=actor)
+    except Exception as e:
+        logger.exception('new-tracker worker crashed (should never happen)')
+        _pixel_fire_notify(  # reuse the DM/ephemeral-fallback helper
+            client, actor, response_channel,
+            text=(f':x: `/new-tracker` crashed unexpectedly: '
+                  f'{type(e).__name__}. Flag to TL — traceback in '
+                  'Render logs.'),
+        )
+        return
+
+    if result.status == 'created':
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            blocks=_new_tracker_proof_blocks(result),
+            text=result.message,
+        )
+    elif result.status == 'already_present':
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=f':information_source: {result.message}',
+        )
+    elif result.status == 'dns_done_redtrack_failed':
+        # Partial — tell the user clearly that DNS is in place but
+        # RedTrack didn't take. Re-run is the recovery path.
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=f':warning: {result.message}',
+        )
+    else:
+        # safety_belt / invalid_input / inventory_error / dns_error
+        _pixel_fire_notify(
+            client, actor, response_channel,
+            text=f':x: {result.message}',
+        )
+
+
+def _new_tracker_proof_blocks(result) -> list:
+    """Block Kit payload for the success DM — what got created, the live
+    URL, the SSL-provisioning caveat."""
+    d = result.details
+    tracker_url = d.get('tracker_url', '')
+    cname_target = d.get('cname_target', '')
+    dns_action = d.get('dns_action', '')
+    rt_id = d.get('redtrack_id') or '(unknown)'
+    rt_already = d.get('redtrack_already_existed')
+
+    dns_line = (
+        f'Route 53 CNAME `{tracker_url}` → `{cname_target}` '
+        + ('_(already correct)_' if dns_action == 'skipped_already_correct'
+           else '_(created)_')
+    )
+    rt_line = (
+        f'RedTrack domain id: `{rt_id}` '
+        + ('_(already registered)_' if rt_already else '_(registered fresh)_')
+    )
+    return [
+        {'type': 'header', 'text': {
+            'type': 'plain_text',
+            'text': ':white_check_mark: Tracker domain set up',
+        }},
+        {'type': 'section', 'text': {
+            'type': 'mrkdwn',
+            'text': f'*Tracker:* `https://{tracker_url}/`\n{dns_line}\n{rt_line}',
+        }},
+        {'type': 'context', 'elements': [{
+            'type': 'mrkdwn',
+            'text': ('_SSL cert via Let\'s Encrypt may take 2-5 min to '
+                     'provision. If you see an SSL error on first hit, '
+                     'wait a few minutes and reload._'),
+        }]},
+    ]
+
+
 # ─── Slack command + interaction handlers (registered on the bolt app) ─────
 
 if _bolt_app is not None:
@@ -1519,6 +1603,52 @@ if _bolt_app is not None:
             trigger_id=body['trigger_id'],
             view=_build_new_domain_modal(),
         )
+
+    @_bolt_app.command('/new-tracker')
+    def handle_new_tracker_command(ack, body, client):
+        """Add a tracker subdomain CNAME + register with RedTrack.
+
+        Usage: `/new-tracker {cname} {domain}`
+                e.g. `/new-tracker trk neurobloomone.com`
+
+        Open to anyone in the workspace (matches /pixel-fire /
+        /reassign-domain). Validation, R53 call, RedTrack call all
+        happen in a daemon thread; ack the slash within Slack's 3s
+        window and DM the operator with the outcome.
+        """
+        ack()
+        actor = body['user']['id']
+        response_channel = body.get('channel_id') or actor
+        raw = (body.get('text') or '').strip()
+
+        parts = raw.split()
+        if len(parts) != 2:
+            client.chat_postEphemeral(
+                channel=response_channel, user=actor,
+                text=(
+                    ':information_source: *Usage:* '
+                    '`/new-tracker {cname} {domain}`\n'
+                    'Example: `/new-tracker trk neurobloomone.com`\n'
+                    'Creates the Route 53 CNAME + registers the tracker '
+                    'with RedTrack. Reserved cnames: `track`, `www`.'
+                ),
+            )
+            return
+
+        cname_arg, domain_arg = parts[0], parts[1]
+        client.chat_postEphemeral(
+            channel=response_channel, user=actor,
+            text=(f':hourglass_flowing_sand: Setting up tracker '
+                  f'`{cname_arg}.{domain_arg}` — Route 53 + RedTrack. '
+                  'I\'ll DM you the result in a few seconds.'),
+        )
+
+        threading.Thread(
+            target=_new_tracker_worker,
+            args=(client, actor, response_channel, cname_arg, domain_arg),
+            daemon=True,
+            name=f'new-tracker-{actor}',
+        ).start()
 
     @_bolt_app.command('/pixel-fire')
     def handle_pixel_fire_command(ack, body, client):
@@ -3396,6 +3526,12 @@ def slash_new_domain_external():
 @slack_bp.route('/slash/pixel-fire', methods=['POST'])
 def slash_pixel_fire():
     return _bolt_or_stub('Coming soon: /pixel-fire. '
+                         'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
+
+
+@slack_bp.route('/slash/new-tracker', methods=['POST'])
+def slash_new_tracker():
+    return _bolt_or_stub('Coming soon: /new-tracker. '
                          'Set SLACK_BOT_TOKEN + SLACK_SIGNING_SECRET to enable.')
 
 

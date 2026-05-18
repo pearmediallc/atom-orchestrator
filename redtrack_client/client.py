@@ -71,6 +71,80 @@ def get_domain_spend_revenue_30d() -> Dict[str, Dict[str, float]]:
     return _join_and_aggregate(landings, report_rows)
 
 
+def add_tracker_domain(url: str) -> Dict:
+    """Register a new tracker domain with RedTrack via POST /domains.
+
+    Returns the parsed response dict on success. Detects the "domain
+    already registered" case (409 status OR error body containing
+    'already') and returns it as `{'_already_exists': True, ...body}`
+    so callers can treat it as a no-op success.
+
+    Raises:
+      RuntimeError when REDTRACK_API_KEY isn't configured. Callers should
+        gate on a creds check before calling.
+      requests.HTTPError on any other 4xx/5xx.
+      requests.RequestException on transport failures.
+
+    Body sent (minimal — RedTrack's swagger schema lists many more
+    optional fields like acme/ssl/fallback_url, but for our v1 we only
+    need url + type + workspace_ids + auto-SSL):
+
+      {url: 'trk.neurobloomone.com',
+       type: 'tracker',
+       workspace_ids: ['6597822f9284e30001617c1c'],
+       use_auto_generated_ssl: true}
+    """
+    if not _has_redtrack_creds():
+        raise RuntimeError(
+            'REDTRACK_API_KEY is not configured — cannot add tracker domain'
+        )
+    if not Config.REDTRACK_WORKSPACE_ID:
+        raise RuntimeError(
+            'REDTRACK_WORKSPACE_ID is not configured — cannot add tracker domain'
+        )
+
+    body = {
+        'url': url,
+        'type': 'tracker',
+        'workspace_ids': [Config.REDTRACK_WORKSPACE_ID],
+        'use_auto_generated_ssl': True,
+    }
+    r = requests.post(
+        f'{_base_url()}/domains',
+        params={'api_key': Config.REDTRACK_API_KEY},
+        json=body,
+        timeout=_HTTP_TIMEOUT_SECONDS,
+    )
+
+    # Best-effort body parse so callers can read error details even on 4xx.
+    try:
+        resp_body = r.json() if r.content else {}
+    except ValueError:
+        resp_body = {'_raw_body': r.text[:500]}
+
+    # RedTrack hasn't publicly documented the exact "already exists" shape,
+    # so we recognise BOTH a 409 status AND a 200/4xx body whose error
+    # field contains 'already'. Treat both as "this is fine, the domain
+    # is already on RedTrack" — caller's idempotent re-run.
+    if r.status_code == 409:
+        return {'_already_exists': True, '_http_status': r.status_code,
+                **(resp_body if isinstance(resp_body, dict) else {})}
+    if isinstance(resp_body, dict):
+        err_text = (resp_body.get('error') or resp_body.get('message') or '')
+        if isinstance(err_text, str) and 'already' in err_text.lower():
+            return {'_already_exists': True, '_http_status': r.status_code,
+                    **resp_body}
+
+    r.raise_for_status()
+    if not isinstance(resp_body, dict):
+        # Unexpected: RedTrack returned a 2xx with a non-dict body.
+        raise requests.RequestException(
+            f'RedTrack POST /domains returned unexpected shape: '
+            f'{type(resp_body).__name__} (body sniff: {str(resp_body)[:200]!r})'
+        )
+    return resp_body
+
+
 def extract_host(url: Optional[str]) -> Optional[str]:
     """Pull the host from a landing URL, normalised for matching against
     our `domains.domain` column.

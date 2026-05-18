@@ -287,6 +287,32 @@ class AtomClient:
             timeout=300,
         )
 
+    def add_cname(self, account_key: str, domain: str,
+                  cname_name: str, value: str, ttl: int = 60) -> dict:
+        """Create a single CNAME record in Route 53 via ATOM.
+
+        ATOM endpoint: POST /api/add-cname. Used by /new-tracker to add
+        additional tracker subdomains beyond the default `track.<domain>`
+        ATOM creates during setup-domain.
+
+        Returns ATOM's success dict — caller must inspect `action`:
+          {'action': 'created', 'name', 'value', 'zone_id', 'ttl'}
+          {'action': 'skipped_already_correct', 'name', 'value', 'zone_id'}
+
+        Raises:
+          AtomClientError on 4xx — caller should string-check the
+            message for 'exists_with_different_value' (409 — race or
+            wrong-value collision) or 'no_hosted_zone' (404 — domain
+            not set up in ATOM yet).
+          AtomServerError on 5xx, AtomConnectionError on transport.
+        """
+        return self._post_json(
+            '/api/add-cname',
+            {'account': account_key, 'domain': domain,
+             'cname_name': cname_name, 'value': value, 'ttl': ttl},
+            timeout=30,
+        )
+
     def get_file_content(self, account_key: str, bucket: str,
                          file_key: str) -> str:
         """Read a single S3 object's body as UTF-8 text via ATOM.
